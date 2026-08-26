@@ -1,0 +1,17 @@
+鲸鱼娘形象素材（whale-girl 插件资源）
+=====================================
+
+来源：GitHub 用户 vlln 的 whale-girl 插件（MIT 许可证）
+      路径（本地）：E:\aitest\dsh-whale\data\profiles\web\node_modules\whale-girl\
+      本目录文件由该插件 lib/assets/characters/whale-girl/ 复制而来。
+
+角色版权（重要）：
+  鲸鱼娘形象（溟月）原始角色设计 © 上善无形（CC BY-NC-SA 4.0，署名·非商用·相同方式共享）。
+  当前"女仆鲸鱼娘"二创形象 by ZipZipPipe（声明遵守 CC BY-NC-SA 4.0，禁止商用）。
+  插件代码本身为 MIT，但其中的美术素材沿用上述角色的 CC BY-NC-SA 授权。
+
+使用范围：仅限个人桌面陪伴用途，非商用。
+如对外分发本桌宠（含鲸鱼娘形象），须保留本署名说明，并遵守 CC BY-NC-SA 4.0
+（署名、非商用、相同方式共享）。
+
+切换回原版「大肥鱼」：右键托盘 → 切换形象（鱼/鲸鱼娘）。
