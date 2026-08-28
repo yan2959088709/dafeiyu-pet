@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QToolButton, QLabel, QTextBrowser, QSlider,
                                QScrollArea, QStyle, QSizePolicy, QDoubleSpinBox,
                                QGridLayout, QStackedWidget)
+from skins import load_skin, SKIN_ORDER, SKIN_DISPLAY   # 皮肤注册表：每套皮肤独立模块
 
 
 # ===== 自定义输入对话框：消除 QInputDialog 回车后输入框的白色 focus 描边 =====
@@ -143,7 +144,6 @@ else:
     BUNDLE_DIR = APP_DIR
     PYTHONW = os.path.join(APP_DIR, ".venv", "Scripts", "pythonw.exe")
 SPRITE_DIR = os.path.join(BUNDLE_DIR, "sprites")
-WG_DIR = os.path.join(BUNDLE_DIR, "sprites", "whale-girl")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 MEMORY_PATH = os.path.join(APP_DIR, "pet_memory.json")
 LEDGER_PATH = os.path.join(APP_DIR, "usage_ledger.json")   # 今日已用账本（跨天归档）
@@ -209,14 +209,31 @@ def _ensure_stickers():
 # 表情使用规范提示词模板（注入 _build_system_prompt 末尾）
 STICKER_PROMPT_TEMPLATE = (
     "\n\n【表情使用规范】\n"
-    "你可以在回复末尾追加一个 ` <sticker:标签>` 标记来表达情绪，客户端会自动把对应表情图贴到这条消息气泡下方。\n"
+    "你可以在回复的【最后一行】追加一个表情标记来表达当下的情绪，客户端会自动把对应表情图贴到这条消息下方，"
+    "不需要你在正文里解释或提及这个标记。\n"
+    "写法示例（标点收尾后另起一行）：\n"
+    "`.我这儿有办法啦 <sticker:开心>`\n"
+    "`.别难过嘛，抱抱你 <sticker:抱抱>`\n"
     "参考「情绪→推荐标签」：\n{groups}\n"
-    "约束：\n"
-    "1. 不强制每轮都发，只在确实想表达对应情绪时才加；\n"
-    "2. 每轮最多 1 个标记；\n"
-    "3. 标记必须放在整条回复的最末尾、另起一行，格式为 ` <sticker:标签>`；\n"
-    "4. 标签只能在上面的推荐列表里选取，不要发明不存在的标签。"
+    "使用要点：\n"
+    "1. 这是你自带的能力，多数回复都值得在结尾配一个表情来贴合当下情绪（但别每句都刷），每轮最多 1 个；\n"
+    "2. 标记必须放在整条回复的【最末尾】、另起一行，格式为 ` <sticker:标签>`，前面不要有其他正文文字；\n"
+    "3. 只在确无合适情绪或对方明确不要时才省略；标签只能在上面的推荐列表里选取，不要发明不存在的标签。"
 )
+
+
+def _split_sticker(text):
+    """把文本中的 <sticker:标签> 标记拆出，返回 (纯文字, 标签或None)。
+
+    取第一个命中本地映射的标签作为表情；未命中映射的标记一律剔除。"""
+    raw = str(text)
+    tag = None
+    for cand in re.findall(r"<sticker:([^>]+)>", raw):
+        if cand.strip() in _STICKER_MAP:
+            tag = cand.strip()
+            break
+    clean = re.sub(r"<sticker:[^>]*>", "", raw).strip()
+    return clean, tag
 
 
 def _strip_sticker_marks(text):
@@ -290,16 +307,6 @@ MARGIN = 4
 SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
 SPEED = 380.0
 TICK = 20
-
-# 鲸鱼娘精灵图：状态名 + 各状态动画帧率（素材为横向多帧，自动切片）
-WG_STATES = ["idle", "walk", "think", "drag", "eat", "sleep", "celebrate",
-             "joy", "play", "error", "welcome", "wait", "wake",
-             "disappointed", "working"]
-# 帧率：整体调低 1~2fps，缓解“动作/跳帧太快像抽搐”的问题
-WG_FPS = {"idle": 4, "walk": 5, "think": 4, "drag": 5, "eat": 6, "sleep": 3,
-          "celebrate": 6, "joy": 6, "play": 6, "error": 5, "welcome": 5,
-          "wait": 4, "wake": 5, "disappointed": 4, "working": 5}
-WG_DEFAULT_FPS = 7
 
 # 气泡排版：自适应字号、限行数、超长截断，保证气泡不越过桌宠头顶安全区（避免遮挡桌宠素材）
 BUBBLE_MAX_LINES = 2
@@ -438,75 +445,7 @@ def make_boing_wav(f0=760.0, dur=0.22, rate=22050, vol=0.5):
     return buf.getvalue()
 
 
-# ---------- 鲸鱼娘精灵图切片 ----------
-def slice_sheet(img):
-    """把横向多帧精灵图按"全透明列"切成单帧，返回帧矩形 [(x,y,w,h), ...]。
-
-    每帧保留整幅画布高度（帧内角色大小关系不变），缩放时按统一比例。
-    若切不开但宽高比异常（帧贴在一起），按等分兜底。
-    """
-    if img.isNull() or img.width() <= 0 or img.height() <= 0:
-        return []
-    if img.format() != QImage.Format_ARGB32:
-        img = img.convertToFormat(QImage.Format_ARGB32)
-    w, h = img.width(), img.height()
-    bpl = img.bytesPerLine()
-    try:
-        data = bytes(img.constBits())
-        if len(data) < bpl * h:
-            return [(0, 0, w, h)]
-        rows = [data[y * bpl + 3: y * bpl + w * 4: 4] for y in range(h)]
-        alphas = b"".join(rows)  # 长度 w*h，行优先，stride = w
-    except Exception:
-        return [(0, 0, w, h)]
-
-    frames = []
-    x = 0
-    while x < w:
-        if any(alphas[x::w]):           # 该列存在非透明像素 → 属于某帧
-            x1 = x
-            while x1 < w and any(alphas[x1::w]):
-                x1 += 1
-            frames.append((x, 0, x1 - x, h))
-            x = x1
-        else:
-            x += 1
-
-    # 兜底：切不出多帧但异常宽 → 等分
-    if len(frames) <= 1 and w > h * 1.6:
-        n = max(2, round(w / h))
-        fw = w / n
-        frames = [(int(i * fw), 0, max(1, int(fw)), h) for i in range(n)]
-    if not frames:
-        frames = [(0, 0, w, h)]
-    return frames
-
-
-def load_wg_frames():
-    """加载鲸鱼娘全部精灵图并切片缩放。返回 {(state, h): [QPixmap, ...]}"""
-    frames_map = {}
-    if not os.path.isdir(WG_DIR):
-        return frames_map
-    heights = sorted({int(340 * m) for m in SIZE_LEVELS.values()})
-    for st in WG_STATES:
-        path = os.path.join(WG_DIR, f"{st}.png")
-        if not os.path.exists(path):
-            continue
-        img = QImage(path)
-        if img.isNull():
-            continue
-        rects = slice_sheet(img)
-        for h in heights:
-            scale = h / img.height()          # 统一比例，帧间角色大小一致
-            lst = []
-            for (rx, ry, rw, rh) in rects:
-                pm = QPixmap.fromImage(img.copy(rx, ry, rw, rh))
-                pm = pm.scaledToHeight(max(1, int(rh * scale)),
-                                       Qt.TransformationMode.SmoothTransformation)
-                lst.append(pm)
-            if lst:
-                frames_map[(st, h)] = lst
-    return frames_map
+# 鲸鱼娘精灵图切片（slice_sheet）与帧加载（load_wg_frames）已迁移至 skins/whale_girl.py
 
 
 class _EnterCatcher(QObject):
@@ -1090,15 +1029,15 @@ class ChatPanel(QDialog):
         sb = self.view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _sticker_html(self, sticker):
+    def _sticker_html(self, sticker, align="left"):
         """把表情文件名转成聊天气泡下方的 <img> HTML（命中映射则显示，否则空串）。"""
         if not sticker:
             return ""
         path = os.path.join(STICKERS_DIR, sticker)
         if not os.path.exists(path):
             return ""
-        return ('<div align="left"><img src="file:///{0}" width="{1}"></div><br>'
-                .format(path.replace("\\", "/"), STICKER_THUMB_W))
+        return ('<div align="{1}"><img src="file:///{0}" width="{2}"></div><br>'
+                .format(path.replace("\\", "/"), align, STICKER_THUMB_W))
 
     def append_msg(self, who, text, sticker=None):
         safe = html.escape(str(text).strip()).replace("\n", "<br>")
@@ -1109,8 +1048,8 @@ class ChatPanel(QDialog):
             blk = ('<div align="left"><span style="background-color:#eef1f8;'
                    'color:#333a45;font-size:14px;">&nbsp;{0}&nbsp;</span></div><br>')
         blk = blk.format(safe)
-        if who != "user":
-            blk += self._sticker_html(sticker)
+        if sticker:
+            blk += self._sticker_html(sticker, align="right" if who == "user" else "left")
         self._msg_blocks.append(blk)
         self._render_view()
 
@@ -1302,34 +1241,10 @@ class PetWindow(QWidget):
         super().__init__(None, flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.pet_name = str(self.cfg.get("pet_name", "")).strip()   # 可编辑名字（未配置回退默认）
-        self.setWindowTitle(f"{self._pet_display_name()}桌宠")
 
-        # ---- 精灵加载：大肥鱼三视图 ----
-        self.sprites = {}
-        for label, mult in SIZE_LEVELS.items():
-            h = int(340 * mult)
-            for name in ["正面", "侧面", "背面"]:
-                sized = os.path.join(SPRITE_DIR, f"{name}_{h}.png")
-                if os.path.exists(sized):
-                    pix = QPixmap(sized)
-                else:
-                    pix = QPixmap(os.path.join(SPRITE_DIR, f"{name}.png")).scaledToHeight(
-                        h, Qt.TransformationMode.SmoothTransformation)
-                self.sprites[(name, h)] = pix
-
-        # ---- 鲸鱼娘：多帧精灵图自动切片（CC BY-NC-SA，见 sprites/whale-girl/ATTRIBUTION.txt）----
-        self.wg_frames = load_wg_frames()
-
-        # ---- DSH 小鲸鱼：单帧 cut-out PNG（DeepSeek-Balance-Whale-Widget 素材，透明背景）----
-        for label, mult in SIZE_LEVELS.items():
-            h = int(340 * mult)
-            sized = os.path.join(SPRITE_DIR, f"dsh-whale_{h}.png")
-            if os.path.exists(sized):
-                pix = QPixmap(sized)
-            else:
-                pix = QPixmap(os.path.join(SPRITE_DIR, "dsh-whale.png")).scaledToHeight(
-                    h, Qt.TransformationMode.SmoothTransformation)
-            self.sprites[("dsh-whale", h)] = pix
+        # ---- 精灵加载：委托皮肤注册表（每套皮肤独立模块实现帧加载）----
+        self._bind_skin(self.character)
+        self.setWindowTitle(f"{self._pet_display_name()}桌宠")   # 需在绑定皮肤后取 display_name
 
         self.cur_h = int(340 * self.cfg["size"])
         self.win_mx = int(self.cur_h * 0.062) + 6
@@ -1366,9 +1281,6 @@ class PetWindow(QWidget):
         self.squash_v = 0.0
 
         # ---- DSH 小鲸鱼吸附挂件模式（dsh-whale 形态专属）----
-        self._dsh_anchor = {"h": None, "v": None}   # 吸附锚点：h/v ∈ None|left|right|top|bottom
-        self._dsh_anim = None                        # 吸附平滑动画：dict(t0,fx,fy,tx,ty)
-        self._dsh_pressed = False                    # 按压 Q 弹中（scaleY0.88/scaleX1.05）
         self._dsh_bubble_until = 0.0                 # DSH 挂件气泡截止时刻（time.time，秒）
         self._dsh_bubble_kind = None                 # None / "info"(余额+今日已用) / "line"(随机台词)
         self._dsh_bubble_alpha = 0.0                 # 气泡透明度 0~1（淡入淡出）
@@ -1486,8 +1398,8 @@ class PetWindow(QWidget):
         self.move(int(x), int(y))
         self.show()
         self.snap_into_screen()
-        if self.character == "dsh-whale":
-            self._dsh_settle(animate=False)   # 挂件模式启动即吸附到边缘
+        if self.skin.kind == "gadget":
+            self.skin.on_resize(self)   # 挂件模式启动即吸附到边缘
         if self.cfg.get("passthrough", False):
             self._apply_passthrough(True)
         # Token 统计悬浮窗：配置开启时启动即显示
@@ -1497,6 +1409,20 @@ class PetWindow(QWidget):
             self.token_window.show()
 
         QTimer.singleShot(3500, self._startup_greet)
+
+    def _bind_skin(self, name):
+        """绑定皮肤：实例化皮肤注册表皮肤模块并加载素材；维护兼容引用 sprites/wg_frames。
+
+        皮肤协议见 skins/base.py；后续新增皮肤（deepseek-girl）只需注册并保持协议即可。
+        """
+        self.character = name
+        self.skin = load_skin(name)
+        self.skin.load(sorted({int(340 * m) for m in SIZE_LEVELS.values()}))
+        self.sprites = self.skin.sprites      # 兼容引用：单帧型（fish / dsh-whale）
+        self.wg_frames = self.skin.frames     # 兼容引用：多帧型（whale-girl）
+        self.MARGIN = MARGIN                  # 供皮肤模块访问（吸附几何对齐）
+        self._LINES = LINES                   # 供皮肤模块访问（fish 随机台词）
+        self._INNER_LINES = INNER_LINES
 
     # ---------- 配置 / 记忆 ----------
     def _save_cfg(self):
@@ -1659,9 +1585,11 @@ class PetWindow(QWidget):
             is_user = m.get("role") == "user"
             content = m.get("content", "")
             if is_user:
-                content = _strip_sticker_marks(content)   # 用户侧只显示文字，不渲染表情图
-            self.chat_panel.append_msg("user" if is_user else "pet", content,
-                                       sticker=None if is_user else m.get("sticker"))
+                content = _strip_sticker_marks(content)   # 用户侧只显示文字，不渲染标记明文
+            st = m.get("sticker")
+            if is_user and not st and m.get("sticker_tag"):
+                st = _STICKER_MAP.get(m.get("sticker_tag"))   # 用户历史表情：标签→文件
+            self.chat_panel.append_msg("user" if is_user else "pet", content, sticker=st)
 
     def _startup_greet(self):
         try:
@@ -1718,8 +1646,7 @@ class PetWindow(QWidget):
         if self.pet_name:
             self.chat_panel.set_title(self.pet_name)
         else:
-            title_map = {"whale-girl": "🐋 鲸鱼娘", "fish": "🐟 大肥鱼", "dsh-whale": "DSH 小鲸鱼"}
-            self.chat_panel.set_title(title_map.get(self.character, "大肥鱼桌宠"))
+            self.chat_panel.set_title(self.skin.chat_title)
         self._reload_panel()
         self._refresh_session_bar()
         self.chat_panel.popup_at(self.x() + self.width() / 2, self.y() + self._dsh_top_h())
@@ -1727,21 +1654,28 @@ class PetWindow(QWidget):
     def _send_chat(self, text):
         if not text:
             return
-        clean = _strip_sticker_marks(text)   # 用户侧 <sticker:…> 标记不显示、不发给 AI
-        self.chat_panel.append_msg("user", clean)
-        local = self._local_skill(text)
+        clean, tag = _split_sticker(text)   # 拆分纯文字与用户选的表情标签（命中映射才保留）
+        # 用户气泡：文字 + 表情缩略图（右对齐）
+        self.chat_panel.append_msg("user", clean,
+                                   sticker=_STICKER_MAP.get(tag) if tag else None)
+        local = self._local_skill(clean)
         if local is not None:
-            self._chat_out(local, user_text=clean)
+            self._chat_out(local, user_text=clean, user_sticker=tag)
             return
-        self._call_ds(clean)
+        self._call_ds(clean, user_sticker=tag)
 
-    def _chat_out(self, text, save=True, user_text=None, streamed=False, sticker=None):
+    def _chat_out(self, text, save=True, user_text=None, streamed=False, sticker=None,
+                  user_sticker=None):
         """主线程：鲸鱼娘回复 → 面板 + 气泡 (+ 历史/记忆)
         streamed=True 表示回复已在面板上流式逐字显示过，此处不再重复追加。
-        sticker=表情文件名：写入历史条目并在聊天气泡下方渲染缩略图。"""
+        sticker=表情文件名：写入历史条目并在聊天气泡下方渲染缩略图。
+        user_sticker=用户消息的表情标签：随 user 历史条目保存，供重渲染与 AI 上下文感知。"""
         if user_text:
             with self._mem_lock:
-                self.chat_history.append({"role": "user", "content": user_text})
+                item = {"role": "user", "content": user_text}
+                if user_sticker:
+                    item["sticker_tag"] = user_sticker
+                self.chat_history.append(item)
                 self.chat_history = self.chat_history[-self.max_history:]
         if save:
             with self._mem_lock:
@@ -1782,7 +1716,18 @@ class PetWindow(QWidget):
             return
         self._start_emote(name, dur=dur, loops=loops)
 
-    def _call_ds(self, user_msg):
+    def _ai_user_content(self, msg):
+        """把历史 user 消息转成发给 AI 的内容：纯文字 + 用户表情的语义提示。
+
+        让 AI 能感知到用户本条消息配了表情（已对齐当前使用的标签），
+        便于它顺着用户的情绪在回复末尾也回一个表情。"""
+        c = str(msg.get("content", "")).strip()
+        tag = msg.get("sticker_tag") or ""
+        if tag and tag in _STICKER_MAP:
+            c = (c + f"\n【本条消息用户配了表情：{tag}，请顺着这个情绪回应】").strip()
+        return c
+
+    def _call_ds(self, user_msg, user_sticker=None):
         if self.ds_busy:
             self._chat_out("等等，上一句还没回完呢", save=False)
             return
@@ -1795,8 +1740,16 @@ class PetWindow(QWidget):
         with self._mem_lock:
             hist = [dict(m) for m in self.chat_history[-12:]]
         messages = [{"role": "system", "content": self._build_system_prompt()}]
-        messages.extend(hist)
-        messages.append({"role": "user", "content": user_msg})
+        for m in hist:
+            role = m.get("role")
+            if role == "user":
+                messages.append({"role": "user", "content": self._ai_user_content(m)})
+            elif role == "assistant":
+                messages.append({"role": "assistant", "content": m.get("content", "")})
+        messages.append({"role": "user",
+                         "content": self._ai_user_content(
+                             {"role": "user", "content": user_msg,
+                              "sticker_tag": user_sticker})})
 
         def worker():
             url = f"{DS_BASE_URL}/chat/completions"
@@ -1840,19 +1793,23 @@ class PetWindow(QWidget):
                             # 入队增量，主线程 tick 逐段刷新面板 → 打字机效果
                             self._stream_queue.append(piece)
                     reply = "".join(reply_parts).strip()
+                    # 先解析表情标记，再统一收尾：优先取【最末尾】的 <sticker:标签>，
+                    # 避免后续文本截断把末尾标记切掉导致表情丢失
+                    sticker = None
+                    m = re.search(r"<sticker:([^>]+)>\s*$", reply)
+                    if m and m.group(1).strip() in _STICKER_MAP:
+                        sticker = _STICKER_MAP[m.group(1).strip()]
+                    reply = re.sub(r"<sticker:[^>]+>", "", reply).strip()  # 剥离全部标记，避免明文
                     reply = re.sub(r"\s+", " ", reply)
                     if len(reply) > 90:
                         reply = reply[:88] + "…"
-                    # 解析末尾表情标记：命中本地映射才渲染，并把标记从文本中剔除
-                    sticker = None
-                    m = re.search(r"<sticker:([^>]+)>", reply)
-                    if m and m.group(1).strip() in _STICKER_MAP:
-                        sticker = _STICKER_MAP[m.group(1).strip()]
-                        reply = re.sub(r"<sticker:[^>]+>", "", reply).strip()
                     if not reply:
                         reply = "（刚刚走神了…再说一次嘛）"
                     with self._mem_lock:
-                        self.chat_history.append({"role": "user", "content": user_msg})
+                        uitem = {"role": "user", "content": user_msg}
+                        if user_sticker:
+                            uitem["sticker_tag"] = user_sticker
+                        self.chat_history.append(uitem)
                         item = {"role": "assistant", "content": reply}
                         if sticker:
                             item["sticker"] = sticker
@@ -2328,7 +2285,7 @@ class PetWindow(QWidget):
             act_sy = 0.06 * math.sin(self.action_t * 3.14159)
             act_sx = -0.03 * math.sin(self.action_t * 3.14159)
 
-        if self.character == "dsh-whale" and self._dsh_pressed:
+        if self.skin.kind == "gadget" and self.skin.pressed:
             sy, sx = 0.88, 1.05      # 按压 Q 弹：scaleY(0.88) scaleX(1.05)，底部坐标不变
         else:
             sy = self.squash
@@ -2337,17 +2294,18 @@ class PetWindow(QWidget):
         def draw_one(key, opacity):
             if key is None:
                 return
-            if self.character == "whale-girl" and self.wg_frames and len(key) == 2:
+            if len(key) == 2:
                 frames = self.wg_frames.get(key) or self.wg_frames.get(("idle", key[1]))
                 if not frames:
                     return
-                fps = WG_FPS.get(key[0], WG_DEFAULT_FPS)
+                fps = self.skin.fps(key[0])
                 if key[0] == "idle":
-                    pix = frames[self._idle_frame_index(frames)]
+                    pix = frames[self.skin.pick_idle_frame(self, frames)]
                 else:
                     pix = frames[int(self.frame_t * fps) % len(frames)]
-                # 鲸鱼娘素材基准朝左：跟随移动方向（向右走时水平镜像）
-                facing = self.facing
+                # 素材基准朝向由皮肤声明：鲸鱼娘基准朝左（向右走时水平镜像）；
+                # deepseek-girl 已分左右两套帧集（mirror_follows_facing=False）不镜像
+                facing = self.facing if self.skin.mirror_follows_facing else 1
             elif len(key) == 3:
                 name, h, facing = key
                 pix = self.sprites.get((name, h))
@@ -2385,27 +2343,6 @@ class PetWindow(QWidget):
                 and self._dsh_bubble_alpha > 0.01):
             self._dsh_draw_bubble(p)
 
-    def _idle_frame_index(self, frames):
-        """待机眨眼调度：平时定格睁眼帧，每隔几秒播一次完整眨眼序列。
-
-        idle 素材共 3 帧（睁眼→闭眼→半闭眼），原逻辑按 4fps 循环，
-        每约 0.75s 完整眨一次眼、过于频繁。改为事件式触发：
-        默认返回第 0 帧（睁眼）；到达随机间隔后依次播放闭眼→半闭→
-        回睁眼，一次眨眼约 0.36s，随后再随机等待 3.5~7s。
-        """
-        n = len(frames)
-        if n < 2:
-            return 0
-        now = self.frame_t
-        if now < self._blink_next:
-            return 0
-        step = 0.12                       # 每帧停留 0.12s（约 8fps 播放眨眼）
-        idx = int((now - self._blink_next) / step)
-        if idx < n:
-            return idx                    # 按 睁→闭→半闭 顺序播完
-        self._blink_next = now + random.uniform(3.5, 7.0)   # 眨完随机等待再眨
-        return 0
-
     def _pet_state(self):
         if self.dragging:
             return "drag"
@@ -2418,13 +2355,8 @@ class PetWindow(QWidget):
         return "idle"
 
     def _sprite_key(self):
-        if self.character == "whale-girl" and self.wg_frames:
-            return (self._pet_state(), self.cur_h)
-        if self.character == "dsh-whale":
-            # 单帧 cut-out：所有方向共用同一张图，facing 镜像跟随移动方向
-            return ("dsh-whale", self.cur_h, self.facing)
-        name = {"left": "侧面", "right": "侧面", "up": "背面", "down": "正面"}[self.dir]
-        return (name, self.cur_h, self.facing if self.dir in ("left", "right") else 1)
+        # 状态→帧映射由皮肤模块实现（每套皮肤独立规则），主程序只透传
+        return self.skin.state_key(self._pet_state(), self.dir, self.facing, self.cur_h)
 
     def _set_dir(self, d, facing=None):
         if d != self.dir:
@@ -2467,7 +2399,8 @@ class PetWindow(QWidget):
                     self._stream_accum = ""
                     self.chat_panel.stream_begin()
                 self._stream_accum += piece
-                self.chat_panel.stream_delta(self._stream_accum)
+                # 打字机期间不显示 <sticker:…> 明文，收尾时会统一渲染表情缩略图
+                self.chat_panel.stream_delta(_strip_sticker_marks(self._stream_accum))
 
         # 后台线程 → 主线程：聊天回复
         if self._chat_queue:
@@ -2551,9 +2484,9 @@ class PetWindow(QWidget):
             if self.action_t == 0:
                 self.action = None
 
-        if self.character == "dsh-whale":
-            # 吸附挂件模式：不走动、不触发随机待机动作，只做吸附动画与挂件气泡
-            self._dsh_tick()
+        if self.skin.kind == "gadget":
+            # 吸附挂件模式：不走动、不触发随机待机动作，只做吸附动画（气泡已在上方统一处理）
+            self.skin.on_tick(self)
             self.update()
             return
 
@@ -2624,37 +2557,26 @@ class PetWindow(QWidget):
         if (self._dsh_bubble_until > 0 and self._dsh_bubble_until > time.time()
                 and self._dsh_prio >= 1):
             return
-        if self.character == "whale-girl" and self.wg_frames:
+        if self.skin.kind == "gadget":
+            return   # 吸附挂件不走随机待机动作
+        if self.skin.name == "whale-girl":
             # 长时间无人互动 → 自动去睡觉
             if (self.t - self._last_interact_t) > 11000 and random.random() < 0.03:
                 self._enter_sleep()
                 return
             if random.random() < 0.02:   # 降低待机动作触发频率（原 0.05）
-                self._whale_idle_pick()
+                self.skin.idle_pick(self)
                 self._idle_cd = random.randint(280, 760)   # 冷却拉长：5.6s~15.2s
         else:
-            # 鱼：保留原有小动作
+            # 鱼等普通皮肤：保留原有小动作
             if random.random() < 0.01:
-                pick = random.random()
-                if pick < 0.35:
-                    self.jump_t = 1.0
-                elif pick < 0.6:
-                    self.action, self.action_t = "sway", 1.0
-                elif pick < 0.8:
-                    self.action, self.action_t = "stretch", 1.0
-                elif pick < 0.9:
-                    if self.t - self.last_speak_tick >= 1500:
-                        self.last_speak_tick = self.t
-                        if pick < 0.82:
-                            self.say(random.choice(INNER_LINES), inner=True)
-                        else:
-                            self.say(random.choice(LINES))
+                self.skin.idle_pick(self)
 
     # ---------- 鲸鱼娘表情/动作系统 ----------
     def _start_emote(self, name, dur=2.0, loops=1, say=None):
         """触发一个表情/动作（name 须对应 WG_STATES）；loops 保证至少播放 N 个完整精灵循环。"""
         if loops > 1 and (name, self.cur_h) in self.wg_frames:
-            fps = WG_FPS.get(name, WG_DEFAULT_FPS)
+            fps = self.skin.fps(name)
             cyc = max(0.2, len(self.wg_frames[(name, self.cur_h)]) / fps)
             dur = max(dur, cyc * loops)
         self.emote = name
@@ -2699,21 +2621,6 @@ class PetWindow(QWidget):
             self._startle()
             return True
         return False
-
-    def _whale_idle_pick(self):
-        r = random.random()
-        if r < 0.30:
-            self._start_emote("play", dur=2.6, loops=3, say="看我丢球！")        # 丢球
-        elif r < 0.50:
-            self._start_emote("working", dur=3.2, loops=2, say="搬砖中…")         # 工作
-        elif r < 0.70:
-            self._start_emote("think", dur=2.6, loops=2)                         # 思考
-        elif r < 0.82:
-            self._start_emote("celebrate", dur=1.8, loops=2, say="耶！")          # 庆祝
-        elif r < 0.92:
-            self._start_emote("joy", dur=1.8, loops=2)                           # 开心
-        else:
-            self._start_emote("disappointed", dur=1.8, loops=1)                 # 失落
 
     def _queue_say(self, text):
         """后台线程调用：只入队，由主线程 tick 统一弹出显示（线程安全）"""
@@ -2874,7 +2781,7 @@ class PetWindow(QWidget):
                 and time.time() - self.balance_time < 25):
             if self._balance_reply_pending:
                 self._chat_queue.append((f"数好啦～余额还有 {self._fmt_balance()}（缓存）", True))
-            if self.character == "dsh-whale":
+            if self.skin.kind == "gadget":
                 self._dsh_show_info_bubble()
             self._finish_balance_call()
             return
@@ -2989,8 +2896,7 @@ class PetWindow(QWidget):
         if self.pet_name:
             base = f"{self.pet_name}桌宠"
         else:
-            base_map = {"whale-girl": "鲸鱼娘桌宠", "fish": "大肥鱼桌宠", "dsh-whale": "DSH 小鲸鱼桌宠"}
-            base = base_map.get(self.character, "大肥鱼桌宠")
+            base = f"{self.skin.display_name}桌宠"
         if self.balance is not None:
             tip = f"{base} | 余额 ¥{self.balance:.2f}"
         elif self.balance_error:
@@ -3020,11 +2926,11 @@ class PetWindow(QWidget):
 
     # ---------- 形象切换 ----------
     def _toggle_character(self):
-        # 三态循环切换：whale-girl → fish → dsh-whale → whale-girl
-        order = ["whale-girl", "fish", "dsh-whale"]
-        idx = order.index(self.character) if self.character in order else 0
-        self.character = order[(idx + 1) % len(order)]
-        self.cfg["character"] = self.character
+        # 循环切换：按皮肤注册表 SKIN_ORDER（whale-girl → fish → dsh-whale → …）
+        idx = SKIN_ORDER.index(self.character) if self.character in SKIN_ORDER else 0
+        new = SKIN_ORDER[(idx + 1) % len(SKIN_ORDER)]
+        self._bind_skin(new)
+        self.cfg["character"] = new
         # 防止新旧 key 结构不同导致 crossfade 解包出错
         self.prev_key = None
         self.cross_t = 0.0
@@ -3033,35 +2939,20 @@ class PetWindow(QWidget):
         self._save_cfg()
         self.snap_into_screen()
         self._do_squash(0.72)
-        say_map = {"whale-girl": "变成鲸鱼娘啦～", "fish": "还是做条鱼吧",
-                   "dsh-whale": "DSH 小鲸鱼来啦～"}
-        if self.pet_name:
-            say_map = {"whale-girl": f"变成{self.pet_name}啦～", "fish": f"还是做条{self.pet_name}吧",
-                       "dsh-whale": f"{self.pet_name}来啦～"}
-        self.say(say_map.get(self.character, "换了个形象～"))
-        if self.character == "dsh-whale":
-            self._dsh_enter()   # 进入吸附挂件模式
-        self._sync_menu_checks()   # 切肤后立即刷新菜单（dsh-whale 隐藏走动玩法专属项）
+        self.say(self.skin.switch_line(self.pet_name))
+        if self.skin.kind == "gadget":
+            self.skin.on_enter(self)   # 进入吸附挂件模式
+        self._sync_menu_checks()   # 切肤后立即刷新菜单（挂件皮肤隐藏走动玩法专属项）
 
     def _apply_icon(self):
-        if self.character == "whale-girl" and self.wg_frames:
-            fr = self.wg_frames.get(("idle", self.cur_h))
-            self.icon = QIcon(fr[0]) if fr else QIcon(os.path.join(SPRITE_DIR, "dsh-whale.png"))
-        elif self.character == "dsh-whale":
-            pm = self.sprites.get(("dsh-whale", self.cur_h))
-            self.icon = QIcon(pm) if pm else QIcon(os.path.join(SPRITE_DIR, "dsh-whale.png"))
-        else:
-            self.icon = QIcon(os.path.join(SPRITE_DIR, "dsh-whale.png"))
+        pm = self.skin.icon_pixmap(self.cur_h)
+        self.icon = QIcon(pm) if pm else QIcon(os.path.join(SPRITE_DIR, "dsh-whale.png"))
         if hasattr(self, "tray"):
             self.tray.setIcon(self.icon)
             self._update_tray_tooltip()
 
     def _recompute_width(self):
-        if self.character == "whale-girl" and self.wg_frames:
-            widths = [pm.width() for (st, h), fr in self.wg_frames.items()
-                      if h == self.cur_h for pm in fr]
-        else:
-            widths = [p.width() for k, p in self.sprites.items() if k[1] == self.cur_h]
+        widths = self.skin.width_for(self.cur_h)
         if not widths:
             widths = [self.cur_h]
         self.win_w = max(widths) + self.win_mx * 2
@@ -3099,15 +2990,16 @@ class PetWindow(QWidget):
             self.dragging = False
             self.drag_start_pos = e.globalPosition().toPoint()
             self.food_panel.hide()
-            if self.character == "dsh-whale":
-                self._dsh_anim = None      # 拖拽/点击开始即取消吸附动画，避免动画与拖拽竞争
-                self._dsh_pressed = True   # 按压 Q 弹（拖拽/点击期间保持压缩）
+            if self.skin.kind == "gadget":
+                self.skin.on_press(self, e)   # 按压 Q 弹（拖拽/点击期间保持压缩）
 
     def mouseMoveEvent(self, e):
         if e.buttons() & Qt.MouseButton.LeftButton and self.drag_start_pos is not None:
             delta = e.globalPosition().toPoint() - self.drag_start_pos
-            dsh = self.character == "dsh-whale"
-            thr = 3 if dsh else 6          # 挂件模式：位移>3px 判拖动，否则视为点击
+            if self.skin.kind == "gadget":
+                self.skin.on_move(self, e, delta)   # 挂件：位移>3px 判拖动，否则视为点击
+                return
+            thr = 6
             if not self.dragging and delta.manhattanLength() > thr:
                 if self._maybe_startle():
                     return
@@ -3116,7 +3008,7 @@ class PetWindow(QWidget):
             if self.dragging and self.drag_offset is not None:
                 pos = e.globalPosition().toPoint() - self.drag_offset
                 self.move(pos)
-                if not dsh and abs(delta.x()) > 10:
+                if abs(delta.x()) > 10:
                     self._set_dir("left" if delta.x() < 0 else "right", 1 if delta.x() < 0 else -1)
                 self.update()
 
@@ -3126,10 +3018,8 @@ class PetWindow(QWidget):
                 self.dragging = False
                 self.drag_offset = None
                 self.drag_start_pos = None
-                if self.character == "dsh-whale":
-                    self._dsh_pressed = False        # 松手回弹
-                    self._dsh_release_squash()
-                    self._dsh_settle(animate=True)   # ~0.3s 平滑滑向吸附位
+                if self.skin.kind == "gadget":
+                    self.skin.on_release(self, e)   # 回弹 → 按区域判定吸附
                 else:
                     self._set_dir("down", 1)
                     self.target = None
@@ -3138,10 +3028,10 @@ class PetWindow(QWidget):
                     if random.random() < 0.5:
                         self.say(random.choice(DRAG_LINES))
             else:
-                if self.character == "dsh-whale":
-                    self._dsh_pressed = False        # 点击松手回弹
-                    self._dsh_release_squash()
-                self._click_timer.start(260)  # 等双击判定
+                if self.skin.kind == "gadget":
+                    self.skin.on_release(self, e)   # 内部含回弹并启动双击判定
+                else:
+                    self._click_timer.start(260)  # 等双击判定
             self.drag_start_pos = None
 
     def mouseDoubleClickEvent(self, e):
@@ -3168,9 +3058,9 @@ class PetWindow(QWidget):
         self._hover_cd = 700   # 约 14s 内不再因悬停触发
 
     def _on_single_click(self):
-        """单击：whale-girl/fish 保持 Q弹+搭话；dsh-whale 走挂件点击交互（气泡切换/关闭）"""
-        if self.character == "dsh-whale":
-            self._dsh_single_click()
+        """单击：whale-girl/fish 保持 Q弹+搭话；挂件皮肤走皮肤点击交互（气泡切换/关闭）"""
+        if self.skin.kind == "gadget":
+            self.skin.on_click(self)
             return
         if self._maybe_startle():
             return
@@ -3283,19 +3173,8 @@ class PetWindow(QWidget):
             self._save_cfg()
 
     # ================= DSH 小鲸鱼吸附挂件模式 =================
-    def _dsh_tick(self):
-        """挂件模式 tick：吸附平滑动画。气泡计时/淡入淡出统一走 _bubble_tick。"""
-        now = time.time()
-        # 吸附平滑动画（~0.3s ease-out 滑向吸附位）
-        if self._dsh_anim is not None:
-            a = self._dsh_anim
-            t = min(1.0, (now - a["t0"]) / 0.3)
-            e = 1.0 - (1.0 - t) ** 3
-            self.move(int(a["fx"] + (a["tx"] - a["fx"]) * e),
-                      int(a["fy"] + (a["ty"] - a["fy"]) * e))
-            if t >= 1.0:
-                self._dsh_anim = None
-                self._dsh_ensure_visible()   # 吸附完成兜底：素材完全出屏时拉回屏内
+    # 挂件吸附动画（_dsh_tick/_dsh_settle/_dsh_enter/_dsh_single_click/_dsh_visual_rect/
+    # _dsh_ensure_visible）已迁移至 skins/dsh_whale.py（Skin.on_tick/on_press/on_release/on_click）
 
     def _bubble_tick(self):
         """官方气泡状态机（所有皮肤通用）：淡出切换 → 淡入新内容 / 超时自动收起。"""
@@ -3331,105 +3210,6 @@ class PetWindow(QWidget):
         """素材顶部偏移（所有皮肤统一）：按官方布局（鲸鱼顶约 40.55% 画布高）让素材顶
         落在主椭圆底部之下，官方气泡自然罩住素材头顶、小气泡压在素材身上。"""
         return 0.4055 * self.win_w - MARGIN
-
-    def _dsh_visual_rect(self):
-        """素材在屏幕坐标中的视觉矩形（基准：无缩放、无弹跳、未按压）。
-
-        与 paintEvent 绘制公式对齐：素材水平居中（左缘窗口内偏移 dx）、
-        底边对齐 bottom = BUBBLE_H+MARGIN+cur_h（顶缘窗口内偏移 dy）。
-        """
-        vw = self.cur_h
-        vh = self.cur_h
-        dx = self.width() / 2.0 - vw / 2.0
-        dy = (self._dsh_top_h() + MARGIN + self.cur_h) - vh
-        return self.x() + dx, self.y() + dy, vw, vh
-
-    def _dsh_ensure_visible(self):
-        """吸附完成后的兜底：素材视觉矩形与所有屏幕工作区均无交集（完全出屏=消失）时，
-        直接拉回主屏右下角并贴壁。"""
-        vx, vy, vw, vh = self._dsh_visual_rect()
-        for s in QApplication.screens():
-            g = s.availableGeometry()
-            if vx < g.right() and vx + vw > g.left() and vy < g.bottom() and vy + vh > g.top():
-                return
-        geo = QApplication.primaryScreen().availableGeometry()
-        self.move(geo.right() - self.width(), geo.bottom() - self.height())
-        self._dsh_anim = None
-
-    def _dsh_settle(self, animate=True):
-        """松手后按四分之一区域判定吸附（横纵两轴独立），按素材视觉边缘贴壁；
-        左吸附镜像翻转。平滑滑向吸附位。"""
-        geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-        cx = self.x() + self.width() / 2.0
-        cy = self.y() + self.height() / 2.0
-        gw, gh = geo.width(), geo.height()
-        if cx < geo.left() + gw / 4.0:
-            h = "left"
-        elif cx > geo.left() + 3.0 * gw / 4.0:
-            h = "right"
-        else:
-            h = None
-        if cy < geo.top() + gh / 4.0:
-            v = "top"
-        elif cy > geo.top() + 3.0 * gh / 4.0:
-            v = "bottom"
-        else:
-            v = None
-        self._dsh_anchor = {"h": h, "v": v}
-        vx, vy, vw, vh = self._dsh_visual_rect()
-        dx = vx - self.x()           # 素材左缘在窗口内的偏移
-        dy = vy - self.y()           # 素材顶缘在窗口内的偏移
-        tx, ty = self.x(), self.y()  # 未锚定轴保持拖放点坐标
-        if h == "left":
-            tx = geo.left() - dx
-        elif h == "right":
-            tx = geo.right() - dx - vw
-        if v == "top":
-            ty = geo.top() - dy
-        elif v == "bottom":
-            ty = geo.bottom() - dy - vh
-        # 左吸附 → 水平镜像翻转（facing=-1）；气泡文字仍保持正向（气泡绘制不镜像）
-        self.facing = -1 if h == "left" else 1
-        if animate:
-            self._dsh_anim = {"t0": time.time(), "fx": self.x(), "fy": self.y(),
-                              "tx": tx, "ty": ty}
-        else:
-            self.move(int(tx), int(ty))
-        self.update()
-
-    def _dsh_enter(self):
-        """进入吸附挂件模式：清状态并立即吸附到位。"""
-        self._dsh_anim = None
-        self._dsh_pressed = False
-        self._dsh_settle(animate=True)
-        self._dsh_ensure_visible()
-
-    def _dsh_single_click(self):
-        """点击鲸鱼：打开气泡(余额+今日已用)→首次点击淡切随机台词→再点关闭；总 5 秒自动收起。"""
-        self._last_interact_t = self.t
-        self._play_boing()
-        now = time.time()
-        if self._dsh_bubble_until > 0 and now < self._dsh_bubble_until:
-            if self._dsh_bubble_kind == "info":
-                # 首次点击：淡切随机台词（不延长总时长）
-                self._dsh_line_pick = self._dsh_pick_line()
-                self._dsh_pending_kind = "line"
-                self._dsh_bubble_switching = True
-            else:
-                # 再次点击：关闭（不延长总时长）
-                self._dsh_bubble_until = 0.0
-                self._dsh_bubble_kind = None
-                self._dsh_bubble_alpha = 0.0
-                self._dsh_bubble_switching = False
-                self._dsh_pending_kind = None
-                self._dsh_line_pick = None
-                self._dsh_custom_text = None
-                self._dsh_prio = 0
-        else:
-            # 打开气泡：余额 + 今日已用，总 5 秒自动收起；顺带手动刷新余额
-            self._dsh_show_info_bubble()
-            self._dsh_manual_refresh()
-        self.update()
 
     def _dsh_show_text(self, text, dur=2.8, prio=0):
         """官方气泡台词统一入口（say 调用）：显示任意文本，支持优先级保护。"""
@@ -3468,11 +3248,6 @@ class PetWindow(QWidget):
             self._balance_busy = True
             threading.Thread(target=self._refresh_balance, args=(key,),
                              daemon=True).start()
-
-    def _dsh_release_squash(self):
-        """松手回弹（带过冲）：从按压压缩态经弹簧弹回 1.0（0.22s cubic-bezier 近似的过冲）。"""
-        self.squash = 0.88
-        self.squash_v = 0.0
 
     def _dsh_pick_line(self):
         """随机台词按官方 buildRandomGroups 权重抽样（20/7/7/3/1/1 + gif 9，总数 48）。"""
@@ -3664,7 +3439,7 @@ class PetWindow(QWidget):
 
     def _on_rua_frame(self, _):
         """rua.gif 帧更新：仅当气泡正在显示 GIF 台词时才重绘，省资源。"""
-        if (self.character == "dsh-whale" and self._dsh_bubble_until > 0
+        if (self.skin.kind == "gadget" and self._dsh_bubble_until > 0
                 and self._dsh_bubble_kind == "line"
                 and self._dsh_line_pick and self._dsh_line_pick[0][0] == "GIF"):
             self.update()
@@ -3733,7 +3508,8 @@ class PetWindow(QWidget):
         um_menu.addSeparator()
         um_menu.addAction("设置 Platform Token…", self._set_platform_token_dialog)
         m.addAction("气泡自动关闭秒数…", self._set_bubble_close_dialog)
-        ca = m.addAction("切换形象（鲸鱼娘/鱼/DSH小鲸鱼）")
+        # 切换形象：按注册表 SKIN_ORDER 动态生成文案（新增皮肤自动纳入）
+        ca = m.addAction("切换形象（" + "/".join(SKIN_DISPLAY[n] for n in SKIN_ORDER) + "）")
         ca.triggered.connect(self._toggle_character)
         self._cost_act = m.addAction("每轮对话消耗统计")
         self._cost_act.setCheckable(True)
@@ -3806,13 +3582,14 @@ class PetWindow(QWidget):
         if hasattr(self, "_token_act"):
             self._token_act.setChecked(bool(self.cfg.get("show_token_stats", False)))
         # ---- 按皮肤过滤不可用菜单项（动态生效）----
-        dsh = self.character == "dsh-whale"
-        # dsh-whale 吸附挂件不走动：隐藏“模式”走动玩法菜单
+        dsh = self.skin.kind == "gadget"
+        # 吸附挂件皮肤不走动：隐藏“模式”走动玩法菜单
         if hasattr(self, "_mode_menu"):
             self._mode_menu.menuAction().setVisible(not dsh)
         if hasattr(self, "_sleep_act"):
-            # dsh-whale 无“睡觉”动作分支，睡会儿对其无意义，一并隐藏
-            self._sleep_act.setVisible(not dsh)
+            # dsh-whale 无"睡觉"动作分支，deepseek-girl 无 sleep 动画 → 一并隐藏
+            self._sleep_act.setVisible(
+                not dsh and "sleep" not in self.skin.menu_filter())
         # 会话切换子菜单：按当前会话列表动态重建
         if hasattr(self, "_sess_list_menu") and hasattr(self, "_sessions"):
             self._sess_list_menu.clear()
@@ -3850,8 +3627,7 @@ class PetWindow(QWidget):
         """未配置自定义名字时按当前皮肤回退默认显示名。"""
         if self.pet_name:
             return self.pet_name
-        return {"whale-girl": "鲸鱼娘", "fish": "大肥鱼", "dsh-whale": "DSH 小鲸鱼"}.get(
-            self.character, "大肥鱼")
+        return self.skin.display_name
 
     def _toggle_cost(self, on):
         self.cfg["show_turn_cost"] = bool(on)
@@ -3901,8 +3677,8 @@ class PetWindow(QWidget):
         self.win_mx = int(self.cur_h * 0.062) + 6
         self._recompute_width()
         self._apply_icon()
-        if self.character == "dsh-whale":
-            self._dsh_settle(animate=False)   # 挂件：尺寸变化后按素材视觉边缘重新贴壁
+        if self.skin.kind == "gadget":
+            self.skin.on_resize(self)   # 挂件：尺寸变化后按素材视觉边缘重新贴壁
         else:
             self.snap_into_screen()
         self._save_cfg()
