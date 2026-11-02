@@ -1,13 +1,22 @@
 # 运行时生成
 config.json
+api-runtime.json
+
+# 界面布局（编辑器微调后的结果，随机器不同）
+ui_layout.json
+ui_layout_pending.json
+
+# 动作绑定（交互事件→动作，随使用者习惯）
+action_binding.json
 
 # 虚拟环境
 .venv/
 
-# 打包产物
+# 打包产物（桌宠.spec 是构建入口，不是产物，需入库）
 build/
 dist/
 *.spec
+!桌宠.spec
 
 # Python 缓存
 __pycache__/
@@ -17,14 +26,18 @@ __pycache__/
 pet_memory.json
 pet_sessions.json
 usage_ledger.json
+attachments/
 
 # 历史备份
 桌宠_backup_*.py
+*.bak
 
 # 素材源与大文件
 stickers_20260523_193056.zip
-爱语_*.apk*
+*.rar
+*.apk*
 stickers/
 
 # 日志
 *.log
+logs.txt
