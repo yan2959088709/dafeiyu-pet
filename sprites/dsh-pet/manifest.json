@@ -1,0 +1,1576 @@
+{
+ "version": 1,
+ "fps": 10,
+ "baseHeight": 280,
+ "scale": 0.9722222222222222,
+ "reference": "待机呼吸休闲",
+ "animations": {
+  "idle": [
+   "待机呼吸休闲"
+  ],
+  "turn": [
+   "东张西望"
+  ],
+  "drag": [
+   "被鼠标拖拽悬空反馈"
+  ],
+  "clicks": [
+   "点击回应-开心跃动",
+   "点击回应-害羞惊讶",
+   "点击回应-傲娇生气",
+   "点击回应-挠痒咯咯笑",
+   "点击回应-元气挥手"
+  ],
+  "moves": {
+   "default": {
+    "minDist": 60,
+    "maxDist": 240,
+    "margin": 20,
+    "leadSec": 2,
+    "tailSec": 2
+   },
+   "actions": [
+    {
+     "name": "螃蟹走路"
+    },
+    {
+     "name": "原地漂浮踏步",
+     "params": {
+      "minDist": 40,
+      "maxDist": 120
+     }
+    },
+    {
+     "name": "原地左转奔跑",
+     "params": {
+      "minDist": 120,
+      "maxDist": 320,
+      "leadSec": 1.75,
+      "tailSec": 4.8
+     }
+    }
+   ]
+  },
+  "categories": [
+   {
+    "id": "小动作",
+    "weight": 20,
+    "actions": [
+     "悠闲哼歌",
+     "超大伸懒腰",
+     "原地敲击桌面互动",
+     "原地重力下蹲压缩",
+     "哈欠连天",
+     "原地小憩沉眠",
+     "女仆屈膝礼仪",
+     "被吓一跳",
+     "小幅度原地360度旋转展示",
+     "偷吃零食被抓住",
+     "用鲸鱼尾巴拍打地面",
+     "打瞌睡被惊醒",
+     "照镜子",
+     "整体换装试色",
+     "轻快记录",
+     "写代码",
+     "摇扇纳凉",
+     "晨间刷牙"
+    ]
+   },
+   {
+    "id": "玩耍",
+    "weight": 20,
+    "actions": [
+     "原地专心玩魔方",
+     "原地蹲下玩玩具汽车",
+     "鲸鱼吐泡泡特效",
+     "原地跳跃抓碎头顶物品",
+     "玩游戏气急败坏",
+     "玩水枪",
+     "小提琴演奏",
+     "蓝鲸现世",
+     "优雅女仆舞",
+     "轻快摇摆舞",
+     "可爱宅舞",
+     "吹气球",
+     "动物环绕",
+     "放风筝",
+     "拆礼物",
+     "变鸽子",
+     "扑克魔术",
+     "抽陀螺",
+     "吹笛子",
+     "蝴蝶蜜蜂环绕头顶开花",
+     "撸猫",
+     "凭空生花",
+     "骑木马",
+     "三球抛接",
+     "踢毽子",
+     "下五子棋",
+     "荡秋千"
+    ]
+   },
+   {
+    "id": "吃什么",
+    "weight": 16,
+    "actions": [
+     "吃白饭",
+     "大口吃零食",
+     "吃Token",
+     "吃早餐",
+     "吃午餐",
+     "吃晚餐",
+     "吃冰淇淋融化",
+     "吃大闸蟹",
+     "吃糖葫芦",
+     "吃长寿面",
+     "吃西瓜",
+     "涮火锅"
+    ]
+   },
+   {
+    "id": "时节",
+    "weight": 14,
+    "actions": [
+     "被落叶淹没",
+     "中秋赏月吃月饼",
+     "堆雪人",
+     "放烟花",
+     "吃粽子",
+     "吃年糕",
+     "吃青团",
+     "吃腊八粥",
+     "吃重阳糕",
+     "收红包",
+     "写福字",
+     "穿针乞巧",
+     "舞狮头",
+     "讨糖南瓜灯",
+     "插茱萸赏菊",
+     "放河灯",
+     "萌化小幽灵",
+     "装点圣诞树",
+     "放孔明灯",
+     "吃汤圆",
+     "吃饺子"
+    ]
+   },
+   {
+    "id": "文字",
+    "weight": 10,
+    "noMirror": true,
+    "actions": [
+     "是啊，吃什么",
+     "深度思考碎碎念"
+    ]
+   }
+  ],
+  "events": {
+   "balance": [
+    "余额-钱袋满溢",
+    "余额-金袋叮当",
+    "余额-钱袋如常",
+    "余额-数金皱眉",
+    "余额-袋空如洗",
+    "余额-分文不剩"
+   ],
+   "whisper": [
+    "碎碎念-擦桌碎碎念",
+    "碎碎念-发呆碎碎念",
+    "碎碎念-对屏碎碎念"
+   ],
+   "workStatus": [
+    "工作状态-思考冒泡",
+    "工作状态-忙碌点按",
+    "工作状态-清点归档",
+    "工作状态-原地踱步张望",
+    "工作状态-雀跃庆祝",
+    "工作状态-垂头叹气冒汗"
+   ]
+  }
+ },
+ "weights": {
+  "idle": 10,
+  "turn": 5,
+  "move": 5
+ },
+ "actions": [
+  {
+   "name": "三球抛接",
+   "slug": "sanqiu-paojie",
+   "file": "anim/sanqiu-paojie.webp",
+   "preview": "preview/sanqiu-paojie.png",
+   "frames": 100,
+   "width": 237,
+   "height": 303,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "下五子棋",
+   "slug": "xiawuziqi",
+   "file": "anim/xiawuziqi.webp",
+   "preview": "preview/xiawuziqi.png",
+   "frames": 100,
+   "width": 248,
+   "height": 303,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "东张西望",
+   "slug": "dongzhangxiwang",
+   "file": "anim/dongzhangxiwang.webp",
+   "preview": "preview/dongzhangxiwang.png",
+   "frames": 100,
+   "width": 244,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "turn"
+   ]
+  },
+  {
+   "name": "中秋赏月吃月饼",
+   "slug": "zhongqiu-shangyue-chi-yuebing",
+   "file": "anim/zhongqiu-shangyue-chi-yuebing.webp",
+   "preview": "preview/zhongqiu-shangyue-chi-yuebing.png",
+   "frames": 100,
+   "width": 388,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "优雅女仆舞",
+   "slug": "youya-nvpuwu",
+   "file": "anim/youya-nvpuwu.webp",
+   "preview": "preview/youya-nvpuwu.png",
+   "frames": 100,
+   "width": 268,
+   "height": 291,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "余额-分文不剩",
+   "slug": "fen-wen-bu-sheng",
+   "file": "anim/fen-wen-bu-sheng.webp",
+   "preview": "preview/fen-wen-bu-sheng.png",
+   "frames": 100,
+   "width": 474,
+   "height": 291,
+   "fps": 10,
+   "tags": [
+    "event:balance:5"
+   ]
+  },
+  {
+   "name": "余额-数金皱眉",
+   "slug": "shu-jin-zhou-mei",
+   "file": "anim/shu-jin-zhou-mei.webp",
+   "preview": "preview/shu-jin-zhou-mei.png",
+   "frames": 100,
+   "width": 233,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "event:balance:3"
+   ]
+  },
+  {
+   "name": "余额-袋空如洗",
+   "slug": "dai-kong-ru-xi",
+   "file": "anim/dai-kong-ru-xi.webp",
+   "preview": "preview/dai-kong-ru-xi.png",
+   "frames": 100,
+   "width": 451,
+   "height": 320,
+   "fps": 10,
+   "tags": [
+    "event:balance:4"
+   ]
+  },
+  {
+   "name": "余额-金袋叮当",
+   "slug": "jin-dai-ding-dang",
+   "file": "anim/jin-dai-ding-dang.webp",
+   "preview": "preview/jin-dai-ding-dang.png",
+   "frames": 100,
+   "width": 470,
+   "height": 328,
+   "fps": 10,
+   "tags": [
+    "event:balance:1"
+   ]
+  },
+  {
+   "name": "余额-钱袋如常",
+   "slug": "qian-dai-ru-chang",
+   "file": "anim/qian-dai-ru-chang.webp",
+   "preview": "preview/qian-dai-ru-chang.png",
+   "frames": 100,
+   "width": 439,
+   "height": 299,
+   "fps": 10,
+   "tags": [
+    "event:balance:2"
+   ]
+  },
+  {
+   "name": "余额-钱袋满溢",
+   "slug": "qian-dai-man-yi",
+   "file": "anim/qian-dai-man-yi.webp",
+   "preview": "preview/qian-dai-man-yi.png",
+   "frames": 100,
+   "width": 501,
+   "height": 326,
+   "fps": 10,
+   "tags": [
+    "event:balance:0"
+   ]
+  },
+  {
+   "name": "偷吃零食被抓住",
+   "slug": "touchi-lingshi-bei-zhuazhu",
+   "file": "anim/touchi-lingshi-bei-zhuazhu.webp",
+   "preview": "preview/touchi-lingshi-bei-zhuazhu.png",
+   "frames": 100,
+   "width": 237,
+   "height": 303,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "写代码",
+   "slug": "xie-daima",
+   "file": "anim/xie-daima.webp",
+   "preview": "preview/xie-daima.png",
+   "frames": 100,
+   "width": 229,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "写福字",
+   "slug": "xie-fuzi",
+   "file": "anim/xie-fuzi.webp",
+   "preview": "preview/xie-fuzi.png",
+   "frames": 100,
+   "width": 272,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "凭空生花",
+   "slug": "pingkong-shenghua",
+   "file": "anim/pingkong-shenghua.webp",
+   "preview": "preview/pingkong-shenghua.png",
+   "frames": 100,
+   "width": 431,
+   "height": 326,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "动物环绕",
+   "slug": "dongwu-huanrao",
+   "file": "anim/dongwu-huanrao.webp",
+   "preview": "preview/dongwu-huanrao.png",
+   "frames": 100,
+   "width": 470,
+   "height": 322,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "原地专心玩魔方",
+   "slug": "yuandi-zhuanxin-wan-mofang",
+   "file": "anim/yuandi-zhuanxin-wan-mofang.webp",
+   "preview": "preview/yuandi-zhuanxin-wan-mofang.png",
+   "frames": 100,
+   "width": 272,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "原地小憩沉眠",
+   "slug": "yuandi-xiaoqi-chenmian",
+   "file": "anim/yuandi-xiaoqi-chenmian.webp",
+   "preview": "preview/yuandi-xiaoqi-chenmian.png",
+   "frames": 100,
+   "width": 233,
+   "height": 311,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "原地左转奔跑",
+   "slug": "yuandi-zuozhuan-benpao",
+   "file": "anim/yuandi-zuozhuan-benpao.webp",
+   "preview": "preview/yuandi-zuozhuan-benpao.png",
+   "frames": 100,
+   "width": 353,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "move"
+   ]
+  },
+  {
+   "name": "原地敲击桌面互动",
+   "slug": "yuandi-qiaoji-zhuomian-hudong",
+   "file": "anim/yuandi-qiaoji-zhuomian-hudong.webp",
+   "preview": "preview/yuandi-qiaoji-zhuomian-hudong.png",
+   "frames": 100,
+   "width": 237,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "原地漂浮踏步",
+   "slug": "yuandi-piaofu-tabu",
+   "file": "anim/yuandi-piaofu-tabu.webp",
+   "preview": "preview/yuandi-piaofu-tabu.png",
+   "frames": 100,
+   "width": 233,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "move"
+   ]
+  },
+  {
+   "name": "原地跳跃抓碎头顶物品",
+   "slug": "yuandi-tiaoyue-zhuasui-touding-wupin",
+   "file": "anim/yuandi-tiaoyue-zhuasui-touding-wupin.webp",
+   "preview": "preview/yuandi-tiaoyue-zhuasui-touding-wupin.png",
+   "frames": 100,
+   "width": 416,
+   "height": 332,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "原地蹲下玩玩具汽车",
+   "slug": "yuandi-dunxia-wan-wanju-qiche",
+   "file": "anim/yuandi-dunxia-wan-wanju-qiche.webp",
+   "preview": "preview/yuandi-dunxia-wan-wanju-qiche.png",
+   "frames": 100,
+   "width": 474,
+   "height": 299,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "原地重力下蹲压缩",
+   "slug": "yuandi-zhongli-xiadun-yasuo",
+   "file": "anim/yuandi-zhongli-xiadun-yasuo.webp",
+   "preview": "preview/yuandi-zhongli-xiadun-yasuo.png",
+   "frames": 100,
+   "width": 256,
+   "height": 299,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "变鸽子",
+   "slug": "bian-gezi",
+   "file": "anim/bian-gezi.webp",
+   "preview": "preview/bian-gezi.png",
+   "frames": 100,
+   "width": 408,
+   "height": 318,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "可爱宅舞",
+   "slug": "keai-zhaiwu",
+   "file": "anim/keai-zhaiwu.webp",
+   "preview": "preview/keai-zhaiwu.png",
+   "frames": 100,
+   "width": 244,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "吃Token",
+   "slug": "chi-token",
+   "file": "anim/chi-token.webp",
+   "preview": "preview/chi-token.png",
+   "frames": 100,
+   "width": 361,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃冰淇淋融化",
+   "slug": "chi-bingqilin-ronghua",
+   "file": "anim/chi-bingqilin-ronghua.webp",
+   "preview": "preview/chi-bingqilin-ronghua.png",
+   "frames": 100,
+   "width": 233,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃午餐",
+   "slug": "chi-wucan",
+   "file": "anim/chi-wucan.webp",
+   "preview": "preview/chi-wucan.png",
+   "frames": 100,
+   "width": 237,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃大闸蟹",
+   "slug": "chi-dazhaxie",
+   "file": "anim/chi-dazhaxie.webp",
+   "preview": "preview/chi-dazhaxie.png",
+   "frames": 100,
+   "width": 260,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃年糕",
+   "slug": "chi-niangao",
+   "file": "anim/chi-niangao.webp",
+   "preview": "preview/chi-niangao.png",
+   "frames": 100,
+   "width": 241,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "吃早餐",
+   "slug": "chi-zaocan",
+   "file": "anim/chi-zaocan.webp",
+   "preview": "preview/chi-zaocan.png",
+   "frames": 100,
+   "width": 229,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃晚餐",
+   "slug": "chi-wancan",
+   "file": "anim/chi-wancan.webp",
+   "preview": "preview/chi-wancan.png",
+   "frames": 100,
+   "width": 443,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃汤圆",
+   "slug": "chitangyuan",
+   "file": "anim/chitangyuan.webp",
+   "preview": "preview/chitangyuan.png",
+   "frames": 100,
+   "width": 233,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "吃白饭",
+   "slug": "chi-baifan",
+   "file": "anim/chi-baifan.webp",
+   "preview": "preview/chi-baifan.png",
+   "frames": 100,
+   "width": 244,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃粽子",
+   "slug": "chi-zongzi",
+   "file": "anim/chi-zongzi.webp",
+   "preview": "preview/chi-zongzi.png",
+   "frames": 100,
+   "width": 237,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "吃糖葫芦",
+   "slug": "chi-tanghulu",
+   "file": "anim/chi-tanghulu.webp",
+   "preview": "preview/chi-tanghulu.png",
+   "frames": 100,
+   "width": 244,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃腊八粥",
+   "slug": "chi-labazhou",
+   "file": "anim/chi-labazhou.webp",
+   "preview": "preview/chi-labazhou.png",
+   "frames": 100,
+   "width": 237,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "吃西瓜",
+   "slug": "chi-xigua",
+   "file": "anim/chi-xigua.webp",
+   "preview": "preview/chi-xigua.png",
+   "frames": 100,
+   "width": 237,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃重阳糕",
+   "slug": "chi-chongyanggao",
+   "file": "anim/chi-chongyanggao.webp",
+   "preview": "preview/chi-chongyanggao.png",
+   "frames": 100,
+   "width": 233,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "吃长寿面",
+   "slug": "chi-changshoumian",
+   "file": "anim/chi-changshoumian.webp",
+   "preview": "preview/chi-changshoumian.png",
+   "frames": 100,
+   "width": 318,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "吃青团",
+   "slug": "chi-qingtuan",
+   "file": "anim/chi-qingtuan.webp",
+   "preview": "preview/chi-qingtuan.png",
+   "frames": 100,
+   "width": 237,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "吃饺子",
+   "slug": "chijiaozi",
+   "file": "anim/chijiaozi.webp",
+   "preview": "preview/chijiaozi.png",
+   "frames": 100,
+   "width": 268,
+   "height": 314,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "吹气球",
+   "slug": "chui-qiqiu",
+   "file": "anim/chui-qiqiu.webp",
+   "preview": "preview/chui-qiqiu.png",
+   "frames": 100,
+   "width": 587,
+   "height": 328,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "吹笛子",
+   "slug": "chui-dizi",
+   "file": "anim/chui-dizi.webp",
+   "preview": "preview/chui-dizi.png",
+   "frames": 100,
+   "width": 478,
+   "height": 314,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "哈欠连天",
+   "slug": "haqian-liantian",
+   "file": "anim/haqian-liantian.webp",
+   "preview": "preview/haqian-liantian.png",
+   "frames": 100,
+   "width": 237,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "堆雪人",
+   "slug": "duixueren",
+   "file": "anim/duixueren.webp",
+   "preview": "preview/duixueren.png",
+   "frames": 100,
+   "width": 295,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "大口吃零食",
+   "slug": "dakou-chi-lingshi",
+   "file": "anim/dakou-chi-lingshi.webp",
+   "preview": "preview/dakou-chi-lingshi.png",
+   "frames": 100,
+   "width": 556,
+   "height": 316,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "女仆屈膝礼仪",
+   "slug": "nvpu-quxi-liyi",
+   "file": "anim/nvpu-quxi-liyi.webp",
+   "preview": "preview/nvpu-quxi-liyi.png",
+   "frames": 100,
+   "width": 229,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "小幅度原地360度旋转展示",
+   "slug": "xiaofudu-yuandi-360du-xuanzhuan-zhanshi",
+   "file": "anim/xiaofudu-yuandi-360du-xuanzhuan-zhanshi.webp",
+   "preview": "preview/xiaofudu-yuandi-360du-xuanzhuan-zhanshi.png",
+   "frames": 100,
+   "width": 283,
+   "height": 291,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "小提琴演奏",
+   "slug": "xiaotiqin-yanzou",
+   "file": "anim/xiaotiqin-yanzou.webp",
+   "preview": "preview/xiaotiqin-yanzou.png",
+   "frames": 100,
+   "width": 342,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "工作状态-原地踱步张望",
+   "slug": "gongzuozhuangtai-yuandi-duobu-zhangwang",
+   "file": "anim/gongzuozhuangtai-yuandi-duobu-zhangwang.webp",
+   "preview": "preview/gongzuozhuangtai-yuandi-duobu-zhangwang.png",
+   "frames": 100,
+   "width": 264,
+   "height": 295,
+   "fps": 10,
+   "tags": [
+    "event:workStatus:3"
+   ]
+  },
+  {
+   "name": "工作状态-垂头叹气冒汗",
+   "slug": "gongzuozhuangtai-chuitou-tanqi-maohan",
+   "file": "anim/gongzuozhuangtai-chuitou-tanqi-maohan.webp",
+   "preview": "preview/gongzuozhuangtai-chuitou-tanqi-maohan.png",
+   "frames": 49,
+   "width": 276,
+   "height": 291,
+   "fps": 10,
+   "tags": [
+    "event:workStatus:5"
+   ]
+  },
+  {
+   "name": "工作状态-忙碌点按",
+   "slug": "gongzuozhuangtai-manglu-dianan",
+   "file": "anim/gongzuozhuangtai-manglu-dianan.webp",
+   "preview": "preview/gongzuozhuangtai-manglu-dianan.png",
+   "frames": 100,
+   "width": 276,
+   "height": 328,
+   "fps": 10,
+   "tags": [
+    "event:workStatus:1"
+   ]
+  },
+  {
+   "name": "工作状态-思考冒泡",
+   "slug": "gongzuozhuangtai-sikao-maopao",
+   "file": "anim/gongzuozhuangtai-sikao-maopao.webp",
+   "preview": "preview/gongzuozhuangtai-sikao-maopao.png",
+   "frames": 100,
+   "width": 260,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "event:workStatus:0"
+   ]
+  },
+  {
+   "name": "工作状态-清点归档",
+   "slug": "gongzuozhuangtai-qingdian-guidang",
+   "file": "anim/gongzuozhuangtai-qingdian-guidang.webp",
+   "preview": "preview/gongzuozhuangtai-qingdian-guidang.png",
+   "frames": 100,
+   "width": 229,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "event:workStatus:2"
+   ]
+  },
+  {
+   "name": "工作状态-雀跃庆祝",
+   "slug": "gongzuozhuangtai-queyue-qingzhu",
+   "file": "anim/gongzuozhuangtai-queyue-qingzhu.webp",
+   "preview": "preview/gongzuozhuangtai-queyue-qingzhu.png",
+   "frames": 100,
+   "width": 303,
+   "height": 318,
+   "fps": 10,
+   "tags": [
+    "event:workStatus:4"
+   ]
+  },
+  {
+   "name": "待机呼吸休闲",
+   "slug": "daiji-huxi-xiuxian",
+   "file": "anim/daiji-huxi-xiuxian.webp",
+   "preview": "preview/daiji-huxi-xiuxian.png",
+   "frames": 100,
+   "width": 252,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "idle"
+   ]
+  },
+  {
+   "name": "悠闲哼歌",
+   "slug": "youxian-hengga",
+   "file": "anim/youxian-hengga.webp",
+   "preview": "preview/youxian-hengga.png",
+   "frames": 100,
+   "width": 353,
+   "height": 328,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "扑克魔术",
+   "slug": "puke-moshu",
+   "file": "anim/puke-moshu.webp",
+   "preview": "preview/puke-moshu.png",
+   "frames": 100,
+   "width": 268,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "打瞌睡被惊醒",
+   "slug": "da-keshui-bei-jingxing",
+   "file": "anim/da-keshui-bei-jingxing.webp",
+   "preview": "preview/da-keshui-bei-jingxing.png",
+   "frames": 100,
+   "width": 256,
+   "height": 318,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "抽陀螺",
+   "slug": "chou-tuoluo",
+   "file": "anim/chou-tuoluo.webp",
+   "preview": "preview/chou-tuoluo.png",
+   "frames": 100,
+   "width": 279,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "拆礼物",
+   "slug": "chai-liwu",
+   "file": "anim/chai-liwu.webp",
+   "preview": "preview/chai-liwu.png",
+   "frames": 100,
+   "width": 318,
+   "height": 299,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "插茱萸赏菊",
+   "slug": "cha-zhuyu-shangju",
+   "file": "anim/cha-zhuyu-shangju.webp",
+   "preview": "preview/cha-zhuyu-shangju.png",
+   "frames": 100,
+   "width": 241,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "摇扇纳凉",
+   "slug": "yaoshan-naliang",
+   "file": "anim/yaoshan-naliang.webp",
+   "preview": "preview/yaoshan-naliang.png",
+   "frames": 100,
+   "width": 322,
+   "height": 291,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "撸猫",
+   "slug": "lu-mao",
+   "file": "anim/lu-mao.webp",
+   "preview": "preview/lu-mao.png",
+   "frames": 100,
+   "width": 229,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "收红包",
+   "slug": "shou-hongbao",
+   "file": "anim/shou-hongbao.webp",
+   "preview": "preview/shou-hongbao.png",
+   "frames": 100,
+   "width": 241,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "放孔明灯",
+   "slug": "fang-kongmingdeng",
+   "file": "anim/fang-kongmingdeng.webp",
+   "preview": "preview/fang-kongmingdeng.png",
+   "frames": 100,
+   "width": 279,
+   "height": 348,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "放河灯",
+   "slug": "fanghedeng",
+   "file": "anim/fanghedeng.webp",
+   "preview": "preview/fanghedeng.png",
+   "frames": 100,
+   "width": 237,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "放烟花",
+   "slug": "fang-yanhua",
+   "file": "anim/fang-yanhua.webp",
+   "preview": "preview/fang-yanhua.png",
+   "frames": 100,
+   "width": 591,
+   "height": 349,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "放风筝",
+   "slug": "fang-fengzheng",
+   "file": "anim/fang-fengzheng.webp",
+   "preview": "preview/fang-fengzheng.png",
+   "frames": 100,
+   "width": 412,
+   "height": 332,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "整体换装试色",
+   "slug": "zhengti-huanzhuang-shise",
+   "file": "anim/zhengti-huanzhuang-shise.webp",
+   "preview": "preview/zhengti-huanzhuang-shise.png",
+   "frames": 100,
+   "width": 291,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "是啊，吃什么",
+   "slug": "shia-chishenme",
+   "file": "anim/shia-chishenme.webp",
+   "preview": "preview/shia-chishenme.png",
+   "frames": 100,
+   "width": 552,
+   "height": 295,
+   "fps": 10,
+   "tags": [
+    "action:文字"
+   ]
+  },
+  {
+   "name": "晨间刷牙",
+   "slug": "chenjian-shuaya",
+   "file": "anim/chenjian-shuaya.webp",
+   "preview": "preview/chenjian-shuaya.png",
+   "frames": 100,
+   "width": 252,
+   "height": 291,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "涮火锅",
+   "slug": "shuan-huoguo",
+   "file": "anim/shuan-huoguo.webp",
+   "preview": "preview/shuan-huoguo.png",
+   "frames": 100,
+   "width": 244,
+   "height": 291,
+   "fps": 10,
+   "tags": [
+    "action:吃什么"
+   ]
+  },
+  {
+   "name": "深度思考碎碎念",
+   "slug": "shendu-sikao-suisuinian",
+   "file": "anim/shendu-sikao-suisuinian.webp",
+   "preview": "preview/shendu-sikao-suisuinian.png",
+   "frames": 100,
+   "width": 458,
+   "height": 291,
+   "fps": 10,
+   "tags": [
+    "action:文字"
+   ]
+  },
+  {
+   "name": "点击回应-傲娇生气",
+   "slug": "dianji-huiying-aojiao-shengqi-ceshen-zhanshi",
+   "file": "anim/dianji-huiying-aojiao-shengqi-ceshen-zhanshi.webp",
+   "preview": "preview/dianji-huiying-aojiao-shengqi-ceshen-zhanshi.png",
+   "frames": 100,
+   "width": 237,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "click"
+   ]
+  },
+  {
+   "name": "点击回应-元气挥手",
+   "slug": "dianji-huiying-yuanqi-huishou",
+   "file": "anim/dianji-huiying-yuanqi-huishou.webp",
+   "preview": "preview/dianji-huiying-yuanqi-huishou.png",
+   "frames": 100,
+   "width": 233,
+   "height": 299,
+   "fps": 10,
+   "tags": [
+    "click"
+   ]
+  },
+  {
+   "name": "点击回应-害羞惊讶",
+   "slug": "dianji-huiying-haixiu-jingya",
+   "file": "anim/dianji-huiying-haixiu-jingya.webp",
+   "preview": "preview/dianji-huiying-haixiu-jingya.png",
+   "frames": 100,
+   "width": 241,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "click"
+   ]
+  },
+  {
+   "name": "点击回应-开心跃动",
+   "slug": "dianji-huiying-kaixin-yuedong",
+   "file": "anim/dianji-huiying-kaixin-yuedong.webp",
+   "preview": "preview/dianji-huiying-kaixin-yuedong.png",
+   "frames": 100,
+   "width": 283,
+   "height": 322,
+   "fps": 10,
+   "tags": [
+    "click"
+   ]
+  },
+  {
+   "name": "点击回应-挠痒咯咯笑",
+   "slug": "dianji-huiying-naoyang-gegexiao",
+   "file": "anim/dianji-huiying-naoyang-gegexiao.webp",
+   "preview": "preview/dianji-huiying-naoyang-gegexiao.png",
+   "frames": 100,
+   "width": 244,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "click"
+   ]
+  },
+  {
+   "name": "照镜子",
+   "slug": "zhao-jingzi",
+   "file": "anim/zhao-jingzi.webp",
+   "preview": "preview/zhao-jingzi.png",
+   "frames": 100,
+   "width": 268,
+   "height": 283,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "玩水枪",
+   "slug": "wan-shuiqiang",
+   "file": "anim/wan-shuiqiang.webp",
+   "preview": "preview/wan-shuiqiang.png",
+   "frames": 100,
+   "width": 559,
+   "height": 297,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "玩游戏气急败坏",
+   "slug": "wan-youxi-qijibaituai",
+   "file": "anim/wan-youxi-qijibaituai.webp",
+   "preview": "preview/wan-youxi-qijibaituai.png",
+   "frames": 100,
+   "width": 291,
+   "height": 295,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "用鲸鱼尾巴拍打地面",
+   "slug": "yong-jingyu-weiba-paidadi",
+   "file": "anim/yong-jingyu-weiba-paidadi.webp",
+   "preview": "preview/yong-jingyu-weiba-paidadi.png",
+   "frames": 100,
+   "width": 268,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "碎碎念-发呆碎碎念",
+   "slug": "suisuinian-fadai-suisuinian",
+   "file": "anim/suisuinian-fadai-suisuinian.webp",
+   "preview": "preview/suisuinian-fadai-suisuinian.png",
+   "frames": 100,
+   "width": 233,
+   "height": 287,
+   "fps": 10,
+   "tags": [
+    "event:whisper:1"
+   ]
+  },
+  {
+   "name": "碎碎念-对屏碎碎念",
+   "slug": "suisuinian-duiping-suisuinian",
+   "file": "anim/suisuinian-duiping-suisuinian.webp",
+   "preview": "preview/suisuinian-duiping-suisuinian.png",
+   "frames": 100,
+   "width": 229,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "event:whisper:2"
+   ]
+  },
+  {
+   "name": "碎碎念-擦桌碎碎念",
+   "slug": "suisuinian-cazhuo-suisuinian",
+   "file": "anim/suisuinian-cazhuo-suisuinian.webp",
+   "preview": "preview/suisuinian-cazhuo-suisuinian.png",
+   "frames": 100,
+   "width": 244,
+   "height": 276,
+   "fps": 10,
+   "tags": [
+    "event:whisper:0"
+   ]
+  },
+  {
+   "name": "穿针乞巧",
+   "slug": "chuanzhenqiqiao",
+   "file": "anim/chuanzhenqiqiao.webp",
+   "preview": "preview/chuanzhenqiqiao.png",
+   "frames": 100,
+   "width": 361,
+   "height": 295,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "舞狮头",
+   "slug": "wu-shitou",
+   "file": "anim/wu-shitou.webp",
+   "preview": "preview/wu-shitou.png",
+   "frames": 100,
+   "width": 248,
+   "height": 307,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "荡秋千",
+   "slug": "dangqiuqian",
+   "file": "anim/dangqiuqian.webp",
+   "preview": "preview/dangqiuqian.png",
+   "frames": 100,
+   "width": 299,
+   "height": 322,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "萌化小幽灵",
+   "slug": "menghua-xiaoyouling",
+   "file": "anim/menghua-xiaoyouling.webp",
+   "preview": "preview/menghua-xiaoyouling.png",
+   "frames": 100,
+   "width": 338,
+   "height": 295,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "蓝鲸现世",
+   "slug": "lanjing-xianshi",
+   "file": "anim/lanjing-xianshi.webp",
+   "preview": "preview/lanjing-xianshi.png",
+   "frames": 100,
+   "width": 361,
+   "height": 303,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "蝴蝶蜜蜂环绕头顶开花",
+   "slug": "hudie-mifeng-huanrao-touding-kaihua",
+   "file": "anim/hudie-mifeng-huanrao-touding-kaihua.webp",
+   "preview": "preview/hudie-mifeng-huanrao-touding-kaihua.png",
+   "frames": 100,
+   "width": 620,
+   "height": 336,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "螃蟹走路",
+   "slug": "pangxie-zoulu",
+   "file": "anim/pangxie-zoulu.webp",
+   "preview": "preview/pangxie-zoulu.png",
+   "frames": 100,
+   "width": 272,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "move"
+   ]
+  },
+  {
+   "name": "被吓一跳",
+   "slug": "beixiayitiao-zhamao",
+   "file": "anim/beixiayitiao-zhamao.webp",
+   "preview": "preview/beixiayitiao-zhamao.png",
+   "frames": 100,
+   "width": 237,
+   "height": 307,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "被落叶淹没",
+   "slug": "beiluoye-yanmo",
+   "file": "anim/beiluoye-yanmo.webp",
+   "preview": "preview/beiluoye-yanmo.png",
+   "frames": 100,
+   "width": 579,
+   "height": 328,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "被鼠标拖拽悬空反馈",
+   "slug": "beishubiao-tuozhuai-xuankong-fankui",
+   "file": "anim/beishubiao-tuozhuai-xuankong-fankui.webp",
+   "preview": "preview/beishubiao-tuozhuai-xuankong-fankui.png",
+   "frames": 100,
+   "width": 256,
+   "height": 311,
+   "fps": 10,
+   "tags": [
+    "drag"
+   ]
+  },
+  {
+   "name": "装点圣诞树",
+   "slug": "zhuangdian-shengdanshu",
+   "file": "anim/zhuangdian-shengdanshu.webp",
+   "preview": "preview/zhuangdian-shengdanshu.png",
+   "frames": 100,
+   "width": 423,
+   "height": 316,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "讨糖南瓜灯",
+   "slug": "taotang-nanguadeng",
+   "file": "anim/taotang-nanguadeng.webp",
+   "preview": "preview/taotang-nanguadeng.png",
+   "frames": 100,
+   "width": 252,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:时节"
+   ]
+  },
+  {
+   "name": "超大伸懒腰",
+   "slug": "chaoda-shenlanyao",
+   "file": "anim/chaoda-shenlanyao.webp",
+   "preview": "preview/chaoda-shenlanyao.png",
+   "frames": 100,
+   "width": 229,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "踢毽子",
+   "slug": "ti-jianzi",
+   "file": "anim/ti-jianzi.webp",
+   "preview": "preview/ti-jianzi.png",
+   "frames": 100,
+   "width": 264,
+   "height": 314,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "轻快摇摆舞",
+   "slug": "qingkuai-yaobaiwu",
+   "file": "anim/qingkuai-yaobaiwu.webp",
+   "preview": "preview/qingkuai-yaobaiwu.png",
+   "frames": 100,
+   "width": 287,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "轻快记录",
+   "slug": "qingkuai-jilu",
+   "file": "anim/qingkuai-jilu.webp",
+   "preview": "preview/qingkuai-jilu.png",
+   "frames": 100,
+   "width": 248,
+   "height": 279,
+   "fps": 10,
+   "tags": [
+    "action:小动作"
+   ]
+  },
+  {
+   "name": "骑木马",
+   "slug": "qi-muma",
+   "file": "anim/qi-muma.webp",
+   "preview": "preview/qi-muma.png",
+   "frames": 100,
+   "width": 346,
+   "height": 344,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  },
+  {
+   "name": "鲸鱼吐泡泡特效",
+   "slug": "jingyu-tu-paopao-texiao",
+   "file": "anim/jingyu-tu-paopao-texiao.webp",
+   "preview": "preview/jingyu-tu-paopao-texiao.png",
+   "frames": 100,
+   "width": 322,
+   "height": 303,
+   "fps": 10,
+   "tags": [
+    "action:玩耍"
+   ]
+  }
+ ]
+}

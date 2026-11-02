@@ -1,0 +1,20 @@
+{
+ "source": "PC2005-cloud/dsh-pet @ 4a222e2",
+ "note": "上游静态素材归档。动作素材已转动画 WebP（anim/），点击音已接入，光标已接入；其余为宿主级素材，逐项说明见 uses。",
+ "files": {
+  "anim": 106,
+  "preview": 106,
+  "memes": 27,
+  "pic": 8,
+  "sound": 1,
+  "logo": 1
+ },
+ "uses": {
+  "cursor-grab.png": "已用：悬停抓手光标（cursors/，热点 16,16）",
+  "cursor-grabbing.png": "已用：拖拽中抓手光标（cursors/，热点 16,16）",
+  "click-duck.wav": "已用：音效音源 dsh-duck（固定 0.5 音量，缺失回落合成音）",
+  "notify-*.png": "归档：Qt 托盘 showMessage 只接受系统图标枚举，自定义 PNG 无法渲染；通知文本链路已等价",
+  "memes/*.png": "归档：上游表情包 27 张。本项目已有自己的表情包/梗图体系与全局 memes 配置，合并会改动现有提示词与素材池，故不并入",
+  "logo.png": "归档：本项目使用自有 icon.ico 与 sprites logo"
+ }
+}
