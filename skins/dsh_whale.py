@@ -188,7 +188,10 @@ class DshWhaleSkin(SkinBase):
         now = time.time()
         if win._dsh_bubble_until > 0 and now < win._dsh_bubble_until:
             if win._dsh_bubble_kind == "info":
-                # 首次点击：淡切随机台词（不延长总时长）
+                # 多页余额：先翻页；只有一页时才淡切台词
+                if win._balance_next_page():
+                    win.update()
+                    return
                 win._dsh_line_pick = win._dsh_pick_line()
                 win._dsh_pending_kind = "line"
                 win._dsh_bubble_switching = True

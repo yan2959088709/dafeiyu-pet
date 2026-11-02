@@ -74,20 +74,51 @@ pyinstaller --noconfirm --onefile --windowed --name 大肥鱼桌宠 --add-data "
 把新的三视图（白底）放到程序目录：
 
 1. 正面.png / 侧面.png / 背面.png（原图）
-2. 运行 `python preprocess.py` —— 白底抠图 + 统一高度
-3. 运行 `python preprocess2.py` —— 边缘去污 + 预乘 alpha 缩放出各尺寸精灵
+2. 运行 `python tools/legacy/preprocess.py` —— 白底抠图 + 统一高度（脚本内 SRC/OUT 写死旧开发机路径，先改成你的路径）
+3. 运行 `python tools/legacy/preprocess2.py` —— 边缘去污 + 预乘 alpha 缩放出各尺寸精灵（同上）
 
 ## 文件说明
 
 | 文件 | 说明 |
 |------|------|
-| 桌宠.py | 主程序（全部逻辑） |
-| preprocess.py | 白底三视图抠图脚本 |
-| preprocess2.py | 精灵边缘去污 + 多尺寸生成脚本 |
-| sprites/ | 精灵图（正面/侧面/背面 各尺寸 + 图标） |
+| 桌宠.py | 主程序：窗口装配、Qt 事件胶水、跨域调度（tick 编排） |
+| pet/ | 功能模块（下表）；每模块一个 Mixin 或一组函数，主程序不感知其内部实现 |
+| tools/smoke_check.py | 冒烟检查与行为指纹（22 项，双平台可跑） |
+| tools/smoke_baseline.json | 动画/渲染行为指纹基线（重构前后逐帧对比用） |
+| tools/build_exe.py | 打包 exe 与便携 zip |
+| tools/import_dsh_skin.py | dsh-pet 素材导入（webm → 动画 WebP + manifest） |
+| tools/legacy/ | 已归档的一次性脚本（仍依赖旧开发机路径，仅作参考，不可直接运行） |
+| docs/ | 开发资料（移植功能对照清单） |
+| sprites/ | 精灵图（三视图 各尺寸 + 图标 + dsh-pet 动作素材与预览图） |
 | 启动桌宠.bat | 启动脚本（自动选择 venv 或系统 Python） |
 | requirements.txt | 依赖 |
 | 桌宠.spec | PyInstaller 打包配置（含新依赖收集） |
+
+### pet/ 模块职责
+
+| 模块 | 职责 |
+|------|------|
+| storage.py | 运行期路径表 `P` + JSON 落盘（损坏文件先备份再回落） |
+| credentials.py | API Key / Platform Token 的 DPAPI 加密存储（绑定当前 Windows 用户） |
+| pricing.py | 峰谷定价表、时段判定、单轮成本换算 |
+| stickers.py | 表情标签映射、首次解压、标记解析 |
+| ledger.py | 用量台账、跨天归档、Token 统计窗 |
+| memory.py | 事实抽取、去重、同主题极性冲突消解 |
+| sessions.py | 多会话数据层与旧版历史迁移 |
+| chat.py | 系统提示词、SSE 流式调用、回复落库 |
+| motion.py | 逐帧调度、移动/动画状态机、气泡排版、paintEvent |
+| gadget.py | DSH 挂件气泡绘制与贴壁 |
+| balance.py | 余额查询、天气、系统监控、本地技能分流 |
+| menus.py | 右键菜单构建、勾选同步、窗口属性操作 |
+| facts_ui.py | 记忆管理对话框 |
+| sound.py | Q弹音效合成与播放 |
+| inputs.py | 通用输入弹窗（消除默认按钮误触） |
+
+### 修改约定
+
+- 新功能优先放进 `pet/` 下对应模块，并实现为 Mixin 或纯函数；主程序只负责装配。
+- `pet/` 内禁止 `from 桌宠 import ...`（会循环导入）；共享常量在子模块定义，主程序反向导入。
+- 改动涉及 `tick` / `paintEvent` / 动画后，务必先跑 `tools/smoke_check.py`；若为有意的行为变更，再加 `--update-baseline` 重生指纹。
 
 ## 贡献与致谢
 
