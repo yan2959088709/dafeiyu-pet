@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""打源码分享 zip（排除 venv/打包产物/配置）"""
+"""打源码分享 zip（排除 venv/打包产物/配置）
+
+已归档：BASE/OUT 写死为旧开发机路径，现行打包用 tools/build_exe.py，本脚本不可直接运行。
+"""
 import os
 import zipfile
 

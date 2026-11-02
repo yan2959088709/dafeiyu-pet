@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""三视图抠图+规格化：白底 → 透明 PNG，统一高度，裁掉空白边。"""
+"""三视图抠图+规格化：白底 → 透明 PNG，统一高度，裁掉空白边。
+
+已归档：SRC/OUT 写死为旧开发机路径，仅作素材处理流程参考，不可直接运行。
+"""
 from PIL import Image, ImageDraw
 import os
 

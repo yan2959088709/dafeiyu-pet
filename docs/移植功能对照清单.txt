@@ -1,0 +1,983 @@
+dsh-pet → 大肥鱼桌宠 移植功能对照清单
+======================================================================
+生成时间：2026-10-28
+上游基准：PC2005-cloud/dsh-pet  main = 4a222e2（2026-10-28）
+          说明：任务书指定的 d8ffa51 已被上游 force push 抹除；
+          d8ffa51 = 4a222e2 + voiceOn 字段 + 其 Revert，净差为零。
+          voiceOn 归属字段在当前 main 中【不存在】，故不作为移植项。
+上游规模：src 418 文件（非测试约 250）+ runtime 30 + standalone 28
+本地规模：Python 约 4400 行（桌宠.py 1471 + pet/ 16 模块 + skins/ 5 文件）
+判定口径：可触发入口 + 可观察结果 + 关键参数一致；宿主侧能力须有进程内等价物。
+
+======================================================================
+一、保留面（移植过程中不得破坏）
+======================================================================
+R1 config.json 现有 21 键（mode/size/topmost/passthrough/autostart/x/y/ds_api_key/
+   city/character/show_balance_badge/show_turn_cost/show_token_stats/sfx_enabled/
+   sfx_vol/sound_set/peak_mode/usage_mode/ds_platform_token/bubble_close_sec/pet_name）
+   新增键一律以默认值追加，旧文件缺键回落默认，不重写已有键。
+R2 pet_memory.json（facts/hist）、pet_sessions.json（current_id/sessions[]）、
+   usage_ledger.json（today/date/days/today_tokens/days_tokens）结构与迁移逻辑。
+R3 DPAPI 链路：SECRET_FIELDS=(ds_api_key, ds_platform_token)、"dpapi:" 前缀、
+   .pre-dpapi.bak 备份、损坏先备份再回落（.corrupt）。
+R4 tools/smoke_check.py 现有 22 项全部保持通过；新增能力另加检查项。
+R5 skins/base.py 协议（name/display_name/chat_title/kind/default_fps/
+   mirror_follows_facing + load/fps/state_key/width_for/icon_pixmap/menu_filter/
+   switch_line/idle_pick/pick_idle_frame + 8 个钩子）与 4 套皮肤。
+R6 单实例互斥量、开机自启、Win32 穿透样式、托盘共用菜单。
+
+======================================================================
+二、域清单（上游功能 → 本地现状 → 缺口 → 落地方案 → 涉及文件）
+======================================================================
+[A] 配置系统
+  A1 JSONC 容忍读（剥 // 与 /* */，字符串内不剥，块注释未闭合抛错）
+     本地：无，只读纯 JSON。 缺口：注释文件读不了。
+     方案：新 pet/config.py 实现 read_jsonc + user_config_unparsable 判据。
+     文件：pet/config.py、pet/storage.py
+  A2 三层合并（内置默认 ← 用户 main-config.jsonc ← pet/<名>-config.jsonc；
+     同 id 后者跳过并告警；字段缺失静默取默认，显式非法告警且同键只报一次）
+     本地：单文件 config.json。 缺口：无多级覆盖、无 pet pack。
+     方案：pet/config.py 合并器 + 21 顶层键默认表（见第四节）。
+  A3 保存白名单重建（只写白名单字段，未带的白名单字段与全部非白名单字段
+     从磁盘原值透传；非法整包拒绝）
+     本地：_save_cfg 全量写回。 缺口：手改字段会被覆盖丢失。
+     方案：pet/config.py save_whitelist()，白名单 15 字段同上游。
+  A4 单队列串行写 + 并发防覆盖；保存失败/非法 JSON/业务非法三类区分
+     本地：无并发保护，异常统一静默。 缺口：并发写互相覆盖。
+     方案：pet/config.py 写入串行锁 + 结果实体（bad-request / generate-error）。
+  A5 JSONC 注释保留的「同步默认」（POST 整份复制包内默认原文，不序列化）
+     本地：无。 方案：pet/config.py sync_default() 读原文复制。
+  A6 宠物 id 校验（非空、≤64、禁 \ / : 与控制字符、禁 . 与 ..）
+     本地：无 id 概念（单宠）。 方案：随 A2 提供 validate_pet_id()。
+  A7 配置元信息（GET /config/meta：用户/默认/动画/梗/日志/存储/profile 路径）
+     本地：无。 方案：pet/config.py meta()；UI 走设置页「路径卡」「存储卡」。
+  A8 旧扩展名迁移（main-config.json → .jsonc，内容一字不动，新文件存在则不动）
+     本地：无。 方案：pet/config.py migrate_legacy_name()。
+
+[B] 状态与长轮询
+  B1 版本号单调递增快照 + 5 section + 每宠 5 叶子（say/anim/position/throw/lock）
+     本地：无统一状态模型，各模块直接改自身字段。 缺口：缺数据单一出口。
+     方案：新 pet/state.py（StateStore：counter、write_leaf、snapshot、wait）。
+  B2 since/timeout 成对长轮询，上限 10000ms，首拉只记基线
+     本地：无。 方案：pet/state.py wait_version()；Qt 用 QTimer 轮询等价。
+  B3 写入即广播 + 读端消费，状态禁缓存
+     本地：无。 方案：pet/state.py 观察者回调。
+
+[C] 工作状态机（六档）
+  C1 六档 thinking/working/result/waiting/success/error；事件压缩
+     （turn/start→thinking、tool/call→working、tool/result→result、
+       approval/asked→waiting、update_goal 收尾轮、turn/end 原因映射）
+     本地：无（只有 AI 对话时的临时动作）。 缺口：整机缺失。
+     方案：新 pet/workstatus.py（WorkStatusMachine，六档 + 事件压缩 + 终局判定）。
+  C2 忙碌档滞回：WORK_STATE_GAP_MS=5000，只压 working→result 单向，终态不参与
+     本地：无。 方案：pet/workstatus.py 写入桥 + 单次补写定时器。
+  C3 多会话优先级取档：waiting 60 > error 50 > working 40 > thinking 30 >
+     result 25 > success 20，同优先级比 seq
+     本地：无。 方案：pet/workstatus.py priority_pick()。
+  C4 任务文案 40 码点截断 + 「…」；todo 取词（末个 in_progress → 首个 pending）
+     本地：无。 方案：pet/workstatus.py clamp_task()。
+  C5 终态 60s 自动清理；外部写入槽 api；下载槽 12s 自动清槽
+     本地：无。 方案：pet/workstatus.py 定时清理；下载槽在打包/依赖下载时复用。
+  C6 占用锁生效收气泡、解冻不补亮、回空闲 reset
+     本地：无锁概念。 方案：pet/workstatus.py 与 pet/bubble.py 联动。
+
+[D] 气泡详情（tool-detail）
+  D1 工具调用 → 一句中文详情；静默工具 6 个（todo_write / ask_user_question /
+     create_goal / get_goal / update_goal / exit_plan_mode）
+     本地：无工具层。 缺口：整机缺失（依赖 C 的事件源）。
+     方案：新 pet/tooldetail.py（文案表 + 静默集）。
+  D2 目标裁剪：TARGET_MAX=22、TARGET_DISPLAY_MAX=20、MAX_ARGS_CHARS=64KiB
+     方案：pet/tooldetail.py 路径压缩与截断。
+  D3 未知工具固定文案「这工具是干嘛的」；pwsh 命令识别（复合命令不猜，
+     兜底 3 句「跑一下 {cmd} 咯」「{cmd} 跑起来了」「让 {cmd} 干点活」，
+     命令名超 20 码点用「跑一个命令咯」）
+     方案：pet/tooldetail.py 命令表 + 正则。
+  D4 并行工具记账：每会话在途表，call 入表、result 按 id 删除、剩余取最后一条
+     方案：pet/workstatus.py 内 pending 表。
+
+[E] 余额
+  E1 服务商注册表 + 4 内置（顺序 opencode-go → commandcode → deepseek-official →
+     deepseek-account；禁止覆盖内置、禁止重复 id）
+     本地：仅 DeepSeek 官方余额（pet/balance.py）。 缺口：3 个服务商缺失。
+     方案：新 pet/balance_providers.py（registry + 4 provider）。
+  E2 取数超时/重试：内置单次 20s、最多 3 次、间隔 800ms；插件级 20s
+     文案「余额查询超时（20 秒），请稍后重试」
+     本地：timeout=10、2 次、0.5s。 缺口：参数不一致。
+     方案：pet/balance_providers.py 统一超时策略。
+  E3 失败三态 unsupported / credential-missing / fetch-error，绝不伪造 0；
+     凭证缺失文案「缺少凭证 <ref>」
+     本地：失败保留旧值、无原因分类。 方案：pet/balance_providers.py 返回实体。
+  E4 展示形态四选 windows / money / points / custom；custom 多页契约
+     （views 1~4、首项初始页、点击循环、单页不可点、percent 0-100 驱动档位、
+       views 优先于 rows）
+     本地：单页金额。 缺口：多页与自定义树缺失。
+     方案：新 pet/balance_view.py（parse + 页模型）+ pet/bubble.py 翻页。
+  E5 余额配色 70% 警告 / 90% 危险；金额两位小数、按分求和；
+     满额基准 CNY 20 / USD 5
+     本地：无。 方案：pet/balance_view.py。
+  E6 周期轮询 1800s（最小 1s），启动即拉一次，有任一宠物开启才刷
+     本地：25s 缓存、手动触发。 缺口：周期参数不一致。
+     方案：pet/balance.py 改为可配置周期。
+  E7 峰谷计价（北京时间工作日 9-12、14-18 为峰，周末全谷）
+     本地：已有 pet/pricing.py（含周末谷起点）。 状态：已对等，仅需补文案来源。
+
+[F] 语音合成（TTS）
+  F1 音色列表 4 个：晓晓(女·通用)/晓伊(女·活泼，默认 zh-CN-XiaoyiNeural)/
+     云希(男·年轻)/云健(男·沉稳)
+     本地：无 TTS，仅点击音效。 缺口：整机缺失。
+     方案：新 pet/tts.py；音色表硬编码 4 项，与上游 id 一致。
+  F2 合成接口：文本上限 500 字、队列上限 3、rate 形如 +0%/-10%（-50%~+100%）、
+     失败三态 bad-request / voice-busy / generate-error
+     方案：pet/tts.py 参数校验 + 队列计数。
+  F3 缓存：sha1(voice\nrate\ntext)、落 <userRoot>/voice-cache/<key>.mp3、
+     淘汰 20MB 或 200 文件按最旧
+     方案：pet/tts.py 缓存层。
+  F4 合成超时 15s、原子落盘（.part → rename）
+     方案：pet/tts.py。
+  F5 配置 voiceEnabled（默认 false）/ voiceName（默认晓伊）
+     方案：pet/config.py 新键 + 设置页语音卡。
+  * 依赖声明：Python 无内置对等 TTS。需新增 edge-tts（与上游同源 Azure Neural
+    音色，可完全对等）；若拒绝新依赖，退化为 Windows SAPI5（pyttsx3 或 ctypes
+    SAPI），音色与听感不对等。见第六节待确认项 Q3。
+
+[G] 碎碎念（whisper）
+  G1 周期调度：全仓不存在概率门控；默认 300s、最小 60s；逐宠比对上次发言时间
+     本地：无碎碎念，只有随机台词。 缺口：整机缺失（含 LLM 生成）。
+     方案：新 pet/whisper.py（调度 + 生成 + 失败文案）。
+  G2 生成提示词「随便说一句日常碎碎念，一句就好，20 字以内。」；超时 30s；
+     temperature=1；不传 maxTokens
+     方案：pet/whisper.py。
+  G3 模型候选链：配置模型优先 → 当前对话模型，去重；失败文案
+     「当前对话未配置模型」「LLM 服务不可用」
+     方案：pet/whisper.py + pet/model_select.py。
+  G4 占用锁跳过且不推进上次发言时间；每拍日志
+     「[dsh-pet] 碎碎念调度：检查 N 只 → 到点 N、未到点 N、跳过 N（…）；下一拍 Ns」
+     方案：pet/whisper.py + pet/log.py。
+  G5 手动触发（POST /whisper 等价）；斜杠命令留空回执「已让桌宠碎碎念一句」
+     本地：无。 方案：菜单项 + 内部 API。
+
+[H] 对话与记忆
+  H1 记忆文件 rounds 默认 5（0 = 不带历史）；读窗口 rounds×2 条；0-200 校验
+     本地：sessions + hist[-12:] 上下文。 缺口：轮次参数化缺失。
+     方案：pet/chat_memory.py。
+  H2 按轮删除（ts 可重复，缺省清空）；孤儿记忆列出/清理
+     本地：仅「清空当前会话」。 缺口：按轮删除与孤儿清理缺失。
+     方案：pet/chat_memory.py + pet/chat_ui.py。
+  H3 图片附件：4 MIME（png/jpeg/webp/gif）、base64 ≤900000 字符、
+     五条拒绝文案、GET /attachment（sha256: + 64 hex，按魔数定类型）
+     本地：无。 缺口：整机缺失。 方案：pet/chat_attach.py。
+  H4 配图标记：结尾 [图:名称] 正则、池内才采纳并剥离；chatImageLimit 默认 10
+     本地：有 <sticker:标签> 体系（不同机制）。 缺口：梗图机制缺失。
+     方案：pet/memes.py + pet/chat.py 提示词注入。
+  H5 对话超时 60s；消息上限 2000 字；候选链回落留痕
+     本地：timeout=25、截断 90、max_tokens=120。 缺口：参数不一致。
+     方案：pet/chat.py 参数化（保留本地模型名与截断策略，超时对齐 60s）。
+  H6 记忆结构异常防护（messages 非数组按空历史 + 记日志，不让接口崩）
+     本地：损坏整文件备份回落。 缺口：细粒度防护缺失。
+     方案：pet/chat_memory.py 字段级容错。
+
+[I] 人设与时间背景
+  I1 人设优先级：实例 whisperPrompt → 条目 → 空；系统提示 =
+     人设 + 「你的名字是“<name>”。」 + 时间背景
+     本地：人设固定 + 宠物名 + 事实 + 城市 + 表情规范。
+     方案：新 pet/persona.py（分层人设）+ pet/chat.py 接入。
+  I2 时间背景：九档时段（凌晨/清晨/早上/上午/中午/下午/傍晚/晚上/深夜）、
+     工作日/周末、节日窗口 ahead 3 / span 1 / after 3、七种节日句式、六种季节句式
+     本地：无。 缺口：整机缺失。 方案：pet/time_context.py（表驱动）。
+
+[J] 梗库
+  J1 memes 目录链（pet/<根>-memes/ 优先，否则用户目录 → 包内）；描述为空或
+     缺 <name>.png 剔除；均匀随机
+     本地：表情包系统（标签映射 + 161 张 PNG），机制不同。 缺口：梗库缺失。
+     方案：pet/memes.py（读取 + 抽图 + 注入清单）。
+  J2 梗清单注入格式「- 名称：描述」；池按 chatImageLimit 截断
+     方案：pet/memes.py。
+
+[K] 运动与物理
+  K1 舞台几何：CANVAS_H=360、FEET_Y=330、HIT_BOX(200,50,440,335)、
+     PET_REF_WIDTH=462、窗口高 = size×9/16、bottomPad = size×9/16×30/360
+     本地：cur_h=340×size、win_mx=cur_h×0.062+6（自有几何）。
+     缺口：几何契约不同（这是气泡/命中/穿透的共同基准）。
+     方案：新 pet/geometry.py（1:1 常量表）+ 皮肤 width_for 适配。
+  K2 可达区钳制 MIN_REACHABLE_PX=24（四边、角、极窄视口居中）
+     本地：ensure_visible 直接拉回主屏右下（粗暴但覆盖同类风险）。
+     缺口：无 24px 规则、无 customPos。 方案：pet/geometry.py clamp_reachable_box()。
+  K3 自主走位 planMove：distScale=size/462、距离区间、lead/tail 三段插值、
+     兜底时长 10.09s、世代号中断、负距离语义
+     本地：随机目标点 + 恒速 380px/s + 到达重选 + 休息 8-18s。
+     缺口：驱动模型完全不同（本地是位置驱动，上游是时长驱动）。
+     方案：新 pet/motion_engine.py（三驱动并存：walk / follow / flight）。
+  K4 拖拽：起手阈值 5px、跟手弹簧 K=200/C=30、dt≤1/30、
+     弹弓（双击 200ms、参考拉距 0.6、力度不夹取）、
+     松手三态 place/sling/throw（估速窗 150ms、MIN_SPAN 20ms、死区 500、
+     软钳 1200→3600）、轨迹保留 200ms
+     本地：直接跟手（无弹簧、无弹弓、无抛掷）。
+     缺口：整个抛掷手感缺失。 方案：新 pet/physics.py + pet/drag.py。
+  K5 抛掷积分：重力 1400、弹性 0.78、地面摩擦 2.5、顶部反弹、
+     静止阈值 vy<40 / vx<15、MAX_STEP_DT 0.05、细分 8px/64 步、
+     多宠碰撞恢复 0.995
+     本地：无。 方案：pet/physics.py。
+  K6 落地 Q 弹：SQ_SQUASH 0.55、220ms、软速 300、硬速 1500、上限 0.55、仅空中→地面
+     本地：挤压插值 30/70、clamp 0.40-1.50（点击/落地共用）。参数不同。
+     方案：pet/physics.py squash() + 现有挤压动画对接。
+  K7 外部位置跟随三模式 instant/spring/line + 收敛 0.5px/1px/s + 拖拽整拍丢弃
+     本地：无。 方案：pet/motion_engine.py position_follow()。
+  K8 长按 LONG_PRESS_MS=500 / SLOP_PX=8（mouse/pen 不起表）
+     本地：无。 方案：pet/drag.py。
+
+[L] 动画
+  L1 动画池结构（idle/turn/drag/clicks/moves{default,actions}/categories/events）
+     + 播放权重 idle/turn/move（默认 80/0/0）+ 去重抽取 + 异常回退 idle
+     本地：皮肤 fps_map + 加权待机动作（机制不同）。
+     缺口：动画池与权重体系缺失。 方案：新 pet/animation_pool.py。
+  L2 A/B 双 video 交叉播放、is-front、切换防重、旧片先 pause、
+     ASSET_FETCH_TIMEOUT_MS=10000、ended 只认 front、once/loop
+     本地：QPainter 逐帧贴 PNG（含 spritesheet 切片）。
+     缺口：载体不同（上游 webm VP9-alpha / mov HEVC-alpha）。
+     方案：见第六节待确认项 Q4（载体选择决定实现）。
+  L3 工作状态动画（task 优先、terminal 判定、rotating 语义）；
+     碎碎念缺池报错「配置缺少 animations.events.whisper，无法播放碎碎念动画」
+     方案：pet/animation_pool.py + pet/workstatus.py。
+  L4 平台判定 prefersMov（iOS WebKit→mov，Chromium→webm）、动画扩展 .webm、
+     缩略图扩展缓存
+     本地：不适用（无视频）。 方案：随 Q4 决定。
+  L5 冻结/解冻（冻结即 cancel，回 cancelled frozen）
+     方案：pet/animation_pool.py + 锁联动。
+
+[M] 气泡
+  M1 单槽互斥 + 优先级 work-terminal > whisper > balance > work > none；
+     终态不让位但只活 10s；非终态 work 常驻不计时
+     本地：_dsh_prio 数值比较（0/1/2），info/line/custom 三类，无 work 类。
+     缺口：优先级维度与常驻语义缺失。 方案：新 pet/bubble.py（单槽 + 4 类源）。
+  M2 余额气泡页数：custom→views 长度、windows→2、其余→1；点击循环翻页并重计时；
+     翻页淡出 250ms；展开态（字号×0.6、宽度 min(f×21,100%)，仅非 custom）
+     本地：单页 + 无展开。 方案：pet/bubble.py + pet/balance_view.py。
+  M3 气泡几何：bottom = size×0.108、min-width f×5.7143、max-width min(f×16,100%)、
+     padding f×0.4835/0.6593、radius f×0.7692、--f0 = size×0.0455、
+     尾巴 f×0.3736、碎碎念字号 f×0.7473、阴影/毛玻璃 6px/.25s 淡入
+     本地：viewBox 1026×700 等比映射（自有实现，气泡绘制在 pet/gadget.py）。
+     缺口：几何契约不同。 方案：pet/bubble.py 按上游比例重算，
+     保留 gadget 皮肤的现有绘制作为外观，不改观感。
+  M4 气泡自动关闭：余额/碎碎念默认 10s；work 终态 10s
+     本地：bubble_close_sec 默认 5、台词 2.8s。 缺口：时长不一致。
+     方案：pet/bubble.py 常量对齐（BUBBLE_DURATION_MS=10000）。
+
+[N] 多宠
+  N1 多实例（每宠 id/size/balanceEnabled/display/position/whisperEnabled/
+     workStatusEnabled/fixedEnabled/whisperPrompt）
+     本地：单窗口单宠 + 4 皮肤切换。 缺口：多宠容器缺失。
+     方案：新 pet/multipet.py（窗口池）；见待确认项 Q2。
+  N2 display 四态 web/desktop/both/none；仅 desktop|both 建桌面窗
+     本地：无（只有一个窗口）。 方案：pet/multipet.py。
+  N3 多宠碰撞（PET_BOUNCE_E=0.995，被撞方由宿主转发再起飞）
+     方案：pet/physics.py。
+
+[O] 窗口与桌面集成
+  O1 透明无边框置顶 + 跳过任务栏
+     本地：已有（FramelessWindowHint|Tool + WA_TranslucentBackground）。状态：已对等。
+  O2 托盘 trayEnabled 配置开关（默认开，仅显式 false 才关；读配置失败按开）
+     本地：托盘常驻不可关。 缺口：缺开关。 方案：pet/menus.py + 配置键。
+  O3 置顶看门狗（1s tick / 5s 重申、默认关、mac floating / 其它 screen-saver）
+     置顶：本地只在启动设置一次。 方案：pet/desktop.py watchdog。
+  O4 任务栏看门狗（3s、仅 win32、默认开、env 仅 '0'/'false' 关）
+     本地：无。 方案：pet/desktop.py。
+  O5 指针穿透租约（60ms 轮询、身体命中可交互、余量区 400ms 后恢复穿透、
+     busy 期绝不穿透）
+     本地：整窗 WS_EX_TRANSPARENT 一刀切（菜单开关）。
+     缺口：无命中区级穿透。 方案：pet/desktop.py（Qt 用 hit-test 遮罩 +
+     按控件矩形重算可交互区，等价替代 setIgnoreMouseEvents(forward)）。
+  O6 多屏几何（hull/areas/workAreas/panels/primaryIndex/topInsetRatio 仅 darwin）
+     本地：ensure_visible/snap_into_screen 已有多屏感知。 【等价】pet/geometry.py
+     按「最近屏的工作区」夹取，效果与并集拉回一致；未建模异形屏缝隙/空洞，
+     极窄缝隙处可能贴边（影响、风险均低）。
+  O7 DPI 线性化（非 darwin 探测主屏缩放后锁 1、失败不补偿、
+     DSH_PET_FORCE_DSF=0 可关）
+     本地：Qt 高 DPI 默认缩放。 缺口：无显式线性化补偿。
+     方案：pet/desktop.py dpi_guard()。
+  O8 显示器拓扑变化重算 + 300ms 去抖 + 位置漂移修复
+     本地：无（重启后按 x/y 恢复）。 【完成】pet/desktop.py：监听
+     screenAdded / screenRemoved / primaryScreenChanged 与各屏 geometryChanged，
+     300ms 单次定时器去抖后 ensure_on_screens（即 clampReachableBox 语义）；
+     新增屏自动补绑信号，窗口销毁自动断连。回归：desktop 专项断言去抖与回位。
+  O9 拖出视口松手后不失联（clampReachableBox 24px、只夹提交点不夹拖拽过程、
+     resize 自愈、corner/margin 变化清 customPos、只改 size 不清位置）
+     本地：ensure_visible 拉回主屏右下。 缺口：语义不同（会丢失用户摆放）。
+     方案：pet/geometry.py + pet/drag.py。
+  O10 Helper 生命周期替代（2s 宿主探活、重启退避 750×2^n 封顶 30s、熔断 12 次、
+     稳定 180s 清零、SIGTERM 3s → SIGKILL 1s）
+     本地：单进程无 Helper。 缺口：不适用（无子进程）。
+     方案：等价物 = 崩溃自恢复/单实例守护，非必要项。
+
+[P] 菜单
+  P1 菜单树：显示位置四选 / 「动作」组（待机·转向·拖拽·点击回应·移动）/
+     「更多」（第三方项按 owner 分组，0 项不出现，单条平铺）/ 事件标签
+     （余额档位·碎碎念·工作状态）
+     本地：29 项扁平菜单（模式/大小/Key/天气/余额/峰谷/用量/形象/音效/会话/
+     记忆/Token/显隐/穿透/置顶/自启/改名/退出）。 缺口：分组与动作点播缺失。
+     方案：pet/menu_tree.py 重构菜单（保留现有全部项，新增分组与动作组）。
+  P2 第三方菜单注册/事件/点击（owner ≤64、label ≤32、items ≤20、owners ≤32；
+     读取即消费；点击闩锁）
+     本地：无。 方案：pet/menu_tree.py + 状态叶子。
+  P3 菜单动作派发：show-balance / whisper / chat / home / reload / set-display /
+     third-party；文字类朝右先强制朝左；移动失败退化播放
+     本地：部分有（余额/聊天/退出）。 方案：pet/menu_tree.py + pet/menus.py。
+  P4 「重载配置」（不写配置文件，只重启渲染）+ 「打开 AI 设置」
+     本地：无。 方案：pet/menu_tree.py + 设置页。
+
+[Q] 对话 UI
+  Q1 右侧栏 tab（DSH 宿主 UI）→ 本地等价物：宠物旁弹窗（x=命中区右+6、
+     y=顶+6，越界回退左上）+ T 键热键 + 全局 Ctrl/Cmd+Shift+P
+     本地：ChatPanel（模态对话框，菜单首项打开）。 缺口：定位/热键/非模态缺失。
+     方案：pet/chat_ui.py。
+  Q2 分页 10 轮/次、上限 200 轮、三种空态、到底提示（两版）、记忆线分割
+     「以下 N 轮进入桌宠的记忆」、孤儿条「有 N 只已删除宠物的历史（M 条）」+清理
+     本地：回填最近 14 条。 方案：pet/chat_ui.py。
+  Q3 多选模式 + 按轮删除（问+答一起删）+ 清空二次确认（三条文案 + Modal）
+     本地：清空按钮 + 确认框。 缺口：多选按轮删除缺失。
+     方案：pet/chat_ui.py。
+  Q4 消息渲染：头像/文本/图片/时间戳（今天 HH:mm:ss / 昨天 / M月D日 / YYYY年M月D日）、
+     图片灯箱「点开看大图」、附件按钮「上传图片」/拖拽/粘贴/截屏/预览条/
+     移除/尺寸 W×H/处理中提示「图片还在处理，稍等一下」
+     本地：文本 + 表情标签 + 贴图。 缺口：图片附件 UI 缺失。
+     方案：pet/chat_ui.py + pet/chat_attach.py。
+  Q5 输入：Enter 发送/Shift+Enter 换行、占位「说点什么…（Enter 发送，Shift+Enter 换行）」、
+     maxLength 2000、忙时「生成中」、发送超时 60s、失败前缀「对话失败：」/「对话异常：」
+     本地：QLineEdit 风格（多行输入）。 方案：pet/chat_ui.py。
+  Q6 图片预算：原图 ≤640KiB 且长边 ≤2048 原样发，超限压 JPEG
+     质量档 0.85/0.75/0.65/0.55、预览 96px
+     方案：pet/chat_attach.py。
+
+[R] 设置页
+  R1 卡片结构：全局卡（六开关 + chatMemory + chatImageLimit）/语音卡/模型卡/
+     物理卡/字体卡/宠物卡/路径卡/存储卡 + 保存·同步·测试通知
+     默认值：notify true、clickSound false、whisperImage false、chatImage false、
+     confine false、tray true、chatMemory 5、chatImageLimit 10、voiceEnabled false、
+     voiceName 晓伊
+     本地：无设置页（全靠菜单 + 手改 config.json）。 缺口：整机缺失。
+     方案：新 pet/settings_ui.py（QDialog + 分卡）。
+  R2 校验顺序 invalid → physics → model → chatMemory → chatImageLimit → font；
+     模型对必须两空或两填；size>0；margin 允许负
+     方案：pet/settings_ui.py 校验链。
+  R3 保存契约：main 层 PUT + 种类层 POST /pet-config；损坏→needConfirm 弹窗；
+     部分失败列出名字（「、」连接）
+     方案：pet/settings_ui.py + pet/config.py。
+  R4 添加/删除宠物：id 前缀 pet-/kind-、序号从 2 起、每种至少留一只、保留选中
+     方案：pet/settings_ui.py + pet/multipet.py。
+  R5 测试通知标题「测试通知」正文「【dsh-pet】系统通知已就绪。」
+     方案：pet/notify.py。
+
+[S] 通知
+  S1 通知开关（默认 true）+ 四类帧（approval/requested、question/requested、
+     session/event、host/agent-error）+ 子代理门 + 活动延迟 1500ms + 单槽覆盖
+     本地：无系统通知。 缺口：整机缺失。
+     方案：新 pet/notify.py（QSystemTrayIcon.showMessage 等价）+ 事件源见 Q1。
+  S2 正文裁剪 MAX_BODY=80；点击唤起会话
+     方案：pet/notify.py。
+
+[T] 播放回执
+  T1 状态机 accepted→playing→ended/failed/cancelled；终态不可覆盖、同状态幂等；
+     新点播取消上一场（cancelled/superseded）；回执编号 pb-<now36>-<seq36>；
+     保留 60s；wait 列表 + timeout ≤10000
+     本地：无。 缺口：整机缺失（第三方点播动画的回执契约）。
+     方案：新 pet/playback.py。
+
+[U] 动效 API
+  U1 POST /position：x/y 归一化中心、越界夹取回实际值、三模式 instant/spring/line、
+     line 必填非负 duration、校验顺序 x→y→mode→duration→宠物
+     本地：无外部定位接口。 方案：pet/motion_engine.py + 内部 API。
+  U2 POST /throw：angle 有限、power>0、1.0 = 1200px/s
+     方案：pet/physics.py。
+  U3 POST /pose/report + GET /pose：x/y 有限不夹取、facing 两值、
+     仅 desktop 可用、无快照文案「还没收到过这只宠物的桌面端实况（…）」
+     方案：pet/state.py（姿态叶子）。
+
+[V] HTTP 契约（若走本地服务）
+  V1 40+ 路由（config/desktop/menu/state/balance/interaction/motion/playback/
+     chat/attachment/voice/assets 12 组分派，素材兜底最后）
+     本地：无 HTTP 服务。 缺口：整机缺失。 方案：新 pet/apiserver.py；见 Q1。
+  V2 语义：业务失败一律 200 + {ok:false,reason,message}；协议失败 400/405/413/416/500；
+     请求体上限 1MiB；素材 Range 单段（206/416）；静态缓存 max-age=3600；
+     路径穿越防护；no-store 于 config/state
+     方案：pet/apiserver.py + pet/http_util.py。
+
+[W] 独立应用形态
+  W1 自建 127.0.0.1 服务（默认 3080，占用顺延 25 个）、运行状态文件
+     standalone-runtime.json（name/pid/startedAt/port/token/settingsUrl/pluginRoot）、
+     清理需 pid+token 双匹配
+     本地：无服务。 方案：pet/standalone.py。
+  W2 鉴权矩阵：Host 严格 127.0.0.1:<port>/localhost:<port>；Origin 同源且拒
+     sec-fetch-site: cross-site；公开只读白名单（/、/health、设置页三件套、
+     /dsh-pet-7340/ GET/HEAD 除 whisper/chat）；敏感与写方法需 43 字符
+     x-dsh-pet-token（timingSafeEqual）；令牌不落日志
+     方案：pet/auth.py。
+  W3 本机 AI 设置页（/standalone-ai/settings）：协议/BaseURL/模型/密钥/启用/
+     自动碎碎念/间隔 60-86400 默认 300/输出上限 128-4096 默认 1024；
+     测试连接 15s、maxTokens 32、探测「hi」、预览 40 字；
+     保存限流 20 次/60s；文件 32KiB、原子写、Windows ACL 收紧
+     本地：无。 方案：pet/settings_ui.py（本机）+ pet/ai_provider.py。
+  W4 独立 AI 通道：协议白名单端点、鉴权头重建、6 次/60s 限流、
+     输入 32768 字符/消息 1-64/输出 16384
+     方案：pet/ai_provider.py。
+  W5 降级面（无 DSH）：ctx.on no-op、commands no-op、credentials 空、
+     余额 unsupported、图片 400「当前模式不支持图片（缺少附件服务）」、
+     无 DSH 通知、无网页浮层；碎碎念周期下限 60s
+     方案：随 Q1 事件源方案给出等价降级表。
+
+[X] 发版
+  X1 上游：npm prepack 8 步闸门（build/typecheck/lint/cycles/runtime/format/
+     prepack-check/openapi）、electron-builder ^26、产物类型在快照中【未固定】
+     本地：README 有 PyInstaller 单文件命令，无 spec、无流水线。
+     方案：新增 桌宠.spec + 构建脚本 + 可选 installer；见待确认项 Q5。
+  X2 版本号单一来源（0.3.8）
+     方案：pet/version.py + 配置元信息。
+
+[Y] 现有能力对等性核查（不改动，仅验证）
+  Y1 点击音效：上游 click-duck.wav / volume 0.5 / 节流 100ms / 默认关
+     本地：三音源（synth/duck/fx1）+ 音量 + 默认开。状态：更强，保留。
+  Y2 皮肤（4 套）：上游为 pet pack 概念（独立动画池）；本地为 skins 注册表。
+     方案：把 skins 扩展为 pet pack 的对等物（每皮肤可带自己的动画池与配置）。
+
+[Z] 交互与视觉补充（清点遗漏项，必须补齐）
+  Z1 点击积分与爆分：SCORE_MIN_SPEED=400；分值 max(1, round(speed/100×462/size))；
+     20 粒彩色粒子、持续 2200ms、粒子速度 120-460px/s、重力 700、寿命 500-900ms；
+     速度达标才爆且本次点击不重复计分；弹窗可点外 / Esc 关闭
+     本地：无。 方案：新 pet/score.py + 点击链路。
+  Z2 悬浮 tooltip：命区内悬停显示宠物名；间距 size×0.022、max-width 0.8×size、
+     padding 0.010/0.021×size、radius 0.016×size、字号 0.026×size、opacity .12s；
+     越界翻边且不超出「窗口∩工作区」
+     本地：无（仅托盘 tooltip）。 方案：新 pet/tooltip.py（浮层窗口）。
+  Z3 光标与右键抑制：cursor grab / grabbing（热点 16 16）；拖拽中或刚拖完
+     JUST_DRAGGED_MS=100 内不弹右键菜单；拖拽后 / 阈值内 / 拖拽中三态不响点击音效
+     本地：无抑制逻辑。 方案：pet/drag.py + pet/menus.py。
+  Z4 z 序分层：命中区 1 < tooltip 2 < 气泡 3 < 宠物 40 < 设置确认弹窗（最高）
+     本地：单窗口 paintEvent 内顺序（气泡最后画）。
+     方案：pet/bubble.py + 浮层窗口 raise_ 顺序。
+  Z5 第三方广播与清气泡：text / image / url / duration / anim；duration 默认
+     10000ms、0 合法；image 与 url 二选一；空文本 / 非法时长 / 双配图 / 非法 URL /
+     池外配图五条拒绝文案
+     本地：仅内部 say()，无外部投喂。 方案：pet/state.py 叶子 + pet/bubble.py。
+  Z6 占用锁契约：TTL 默认 120000、范围 1000-1800000；四种 cause 文案
+     （已过期 / 已被释放 / 已被用户接管（拖拽、点击、隐藏、关闭）/ 编号不是当前生效）；
+     释放永不失败、支持 force；拖拽 / 点击 / 隐藏 / 关闭都会释放锁
+     本地：无锁概念。 方案：新 pet/lock.py。
+  Z7 命令入口：/pet 弹出宠物选择（id/label/detail）并切换；命令面图标补丁
+     本地：无命令面板。【完成】等价物：右键菜单「宠物」子菜单（label + detail，
+     当前只在项打勾，点选 → show/raise/activate + 吐一句「我在这里」）+
+     GET /pets 返回同一份清单（id/label/detail/display/visible）；只有一只宠
+     物时整个子菜单隐藏。命令面图标补丁属宿主 UI，不适用。
+  Z8 日志落盘：单文件 1MiB 触发、保留尾 512KiB、1s 或 64 行刷盘、待写上限 1000、
+     敏感内容脱敏（token / #token= / DSH_PET_SITE_URL=）
+     本地：无落盘日志。 方案：新 pet/log.py。
+
+======================================================================
+三、不可对等项（阻塞原因 / 替代方案 / 影响 / 风险）
+======================================================================
+N1 Electron 下载与解压（helper/electron.ts：43.3.0、npmmirror、10 分钟超时、
+   进度 3000ms、下载日志借用工作气泡 api 槽 12s 清槽）
+   阻塞：Python 版无 Electron 运行时。
+   替代：以「运行时自检」（Python/Qt 版本、素材完整性、字体）为等价槽位，
+   复用 api 工作槽显示进度。
+   影响：无 Electron 下载体验。风险：低。
+N2 桌面 Helper 子进程（spawn/IPC 11 频道/bridge 行协议/宿主探活/重启退避/熔断）
+   阻塞：PySide6 单进程无渲染子进程。
+   替代：单进程内直接调用等价函数；崩溃恢复改为「单实例守护 + 异常重启」。
+   影响：无跨进程隔离。风险：中（崩溃会带走主进程）。
+N3 浏览器内浮层（DSH Web overlay，display=web/both）
+   阻塞：无 DSH 网页宿主。
+   替代：display 保留四值语义，web 仅对本地 HTTP 服务可见（不渲染窗口）。
+   影响：无网页内桌宠。风险：低。
+N4 DSH 会话事件源（turn/start、tool/call、approval/asked、agent/error）
+   阻塞：剥离后无宿主事件。
+   替代：本地 API 主动推送（等价 POST /work-status 与内部事件总线），
+   并提供适配脚本入口对接 DSH 若仍在使用。
+   影响：工作状态/气泡详情/通知/碎碎念的自动化触发依赖外部推送。
+   风险：高（决定 C/D/S/G 是否有实际意义）→ 见待确认项 Q1。
+N5 Cordis 服务面（petApi7340.getState/menuEvents/pose/progress）
+   阻塞：无 Cordis 插件系统。
+   替代：Python 侧同名服务对象（进程内单例），并可选经本地 HTTP 暴露。
+   影响：无第三方插件调用面（除非走 HTTP）。风险：中。
+N6 Windows 安装器/签名/NSIS（electron-builder 配置在快照中不存在）
+   阻塞：无配置可依，且需安装器工具链。
+   替代：PyInstaller onefile + 可选 Inno Setup/NSIS 脚本。
+   影响：无签名与自动更新。风险：中 → 见待确认项 Q5。
+N7 视频动画 alpha 通道（webm VP9-alpha / mov HEVC-alpha）
+   阻塞：Qt 无内建 alpha 视频合成；QMediaPlayer+QVideoSink 抓帧会丢 alpha。
+   替代：见待确认项 Q4。风险：高（直接决定「体验不打折」能否成立）。
+N8 浏览器缓存/CORS/prefersMov 平台判定
+   阻塞：非浏览器环境。
+   替代：不实现（无意义）。影响：无。风险：无。
+
+======================================================================
+四、上游配置默认值全表（21 个顶层键，需映射到本地配置）
+======================================================================
+1  whisperPrompt        人设文本（见上游 config.jsonc 第 27 行）
+2  chatMemoryRounds     5
+3  whisperModel         {provider:"", model:""}
+4  chatModel            {provider:"", model:""}
+5  whisperImageEnabled  true
+6  chatImageEnabled     true
+7  chatImageLimit       10
+8  voiceEnabled         false
+9  voiceName            "zh-CN-XiaoyiNeural"
+10 memes                {目录→描述映射}
+11 notificationsEnabled true
+12 clickSoundEnabled    false
+13 confineToScreen      false
+14 trayEnabled          true
+15 workStatusTexts      [六档文案数组]
+16 physics              {gravity:1400, restitution:0.78, groundFriction:2.5,
+                         ceilingBounce:true, throwPower:1, petCollision:false}
+17 font                 {family, size, followPet}
+18 pets[]               {id, name, size:462, balanceEnabled, whisperEnabled,
+                         workStatusEnabled, fixedEnabled, display:"both",
+                         position:{corner:"top-right", marginX:24, marginY:100},
+                         whisperPrompt?}
+19 animations           {idle[], turn[], drag[], clicks[], moves{default{minDist:80,
+                         maxDist:360, margin:20, leadSec:2, tailSec:2}, actions[]},
+                         categories[], events{balance[], whisper[], workStatus[]}}
+20 eventsRefreshSec     {balance:1800, whisper:300}
+21 animationWeights     {idle:80, turn:0, move:0}
+   注：全局键 12 个（physics/font/confineToScreen/voiceEnabled/voiceName/
+   whisperImageEnabled/chatImageEnabled/chatImageLimit/chatMemoryRounds/
+   whisperModel/chatModel/eventsRefreshSec）；只读 main 2 个
+   （notificationsEnabled、eventsRefreshSec.balance）。
+
+======================================================================
+五、分批实施计划（每批结束跑 smoke_check，isolation 必须通过）
+======================================================================
+批 1  基础设施：pet/config.py（JSONC/三层合并/白名单/串行/元信息/迁移）、
+      pet/state.py、pet/log.py（Z8）、pet/version.py
+批 2  几何与物理：pet/geometry.py、pet/physics.py、pet/drag.py（含 Z3）、
+      pet/motion_engine.py（walk/follow/flight/position-follow 四驱动）、
+      pet/lock.py（Z6）
+批 3  动画与气泡：pet/animation_pool.py（PNG 帧载体）、pet/bubble.py
+      （单槽/优先级/多页/翻页/Z4/Z5）、pet/tooltip.py（Z2）、pet/score.py（Z1）
+批 4  事件层：pet/workstatus.py、pet/tooldetail.py、pet/playback.py、
+      pet/notify.py、pet/persona.py、pet/time_context.py、pet/memes.py
+批 5  余额与碎碎念：pet/balance_providers.py、pet/balance_view.py、
+      pet/whisper.py、pet/model_select.py（含 E8 提醒去重）
+批 6  对话与语音：pet/chat_memory.py、pet/chat_attach.py、pet/tts.py（edge-tts）
+批 7  UI 与多宠：pet/settings_ui.py、pet/chat_ui.py、pet/menu_tree.py（Z7）、
+      pet/multipet.py（多窗口池 / display 四态 / 碰撞）
+批 8  桌面集成：pet/desktop.py（托盘开关/双看门狗/DPI/多屏/穿透租约）
+批 9  对外接口与独立形态：pet/apiserver.py、pet/auth.py、pet/standalone.py、
+      pet/ai_provider.py
+批 10 打包：桌宠.spec、构建脚本、版本注入、requirements 追加 edge-tts
+批 11 回归：smoke 新增检查项（逐域）+ 全量回归 + 数据文件未改写核验
+
+每批完成标准：新增模块可导入、有可触发入口、参数与上游一致、smoke 22 项 + 新增项
+全绿、真实数据文件哈希不变、不产生 .md 文件、不执行 git 提交。
+
+======================================================================
+六、决策记录与依赖声明（Q1-Q4 已确认）
+======================================================================
+Q1 形态与事件源 = A 进程内 API + 本地 HTTP【已确认】
+   落地：pet/apiserver.py 暴露 /dsh-pet-7340 全量路由与语义（业务失败 200 + 实体、
+   协议失败 4xx/5xx、1MiB 上限、Range 206/416、config/state no-store）；
+   UI 与内部模块直接调用同一套处理器；工作状态 / 工具详情 / 通知由 HTTP 推送
+   （等价 POST /work-status 与内部事件总线），不监听 DSH 会话文件。
+Q2 多宠 = 完整多宠【已确认】
+   落地：pet/multipet.py 多窗口池 + display 四态 + 碰撞恢复 0.995；
+   现有 4 套皮肤即 4 个「种类」，每个种类可开多只实例。
+Q3 语音 = 新增 edge-tts【已确认】
+   落地：requirements.txt 追加 edge-tts；4 音色 id 与上游一致；rate 透传
+   （-50%~+100%）；缓存 sha1 / 20MB / 200 文件；15s 超时 + .part 原子落盘。
+Q4 动画 = 保持 PNG 帧【已确认】
+   落地：动画池 / 权重 / 事件动画 / 去重 / 冻结解冻 1:1 实现，载体为现有 PNG 帧与
+   spritesheet；上游 webm/mov 不直接播放（需先导出帧图再入库）。
+Q5 发版 = 待确认（默认按 A 执行：仅 PyInstaller 单文件 exe，不引入安装器工具链）
+
+依赖变更（唯一新增）：edge-tts（纯 Python HTTP 客户端，无原生依赖）
+不改动：PySide6 / requests / psutil / pynvml
+
+不可对等项与决策的对应：N4（事件源）由 Q1 的本地 HTTP 推送覆盖；
+N7（动画 alpha）由 Q4 覆盖为「不播放视频载体」，其余 N1/N2/N3/N5/N6/N8 按第三节
+替代方案执行。
+
+======================================================================
+七、执行进度（每项均以 tools/smoke_check.py 全绿为完成判据）
+======================================================================
+批 1【完成】pet/config.py、pet/state.py、pet/log.py、pet/version.py
+  回归：26/26。config 已接管桌面程序的读写（桌宠.py 不再内联默认字典）。
+批 2【完成】pet/geometry.py、pet/physics.py、pet/drag.py、
+  pet/motion_engine.py、pet/lock.py
+  回归：31/31。抛掷/弹弓/Q弹/弹簧/可达区 24px/占用锁全部有断言。
+批 3【完成】pet/animation_pool.py、pet/bubble.py、pet/overlay.py（tooltip+积分）
+  回归：34/34。单槽优先级、多页翻页重计时、权重掷骰与去重有断言。
+批 4【完成】pet/workstatus.py、pet/tooldetail.py、pet/playback.py、
+  pet/notify.py、pet/persona.py、pet/time_context.py、pet/memes.py
+  回归：39/39。文案表与六档机逐参数对齐；6300ms 滞回、60s 终态清理有断言。
+批 5【完成】pet/balance_providers.py、pet/balance_view.py、pet/whisper.py、
+  pet/model_select.py
+  回归：43/43。四服务商顺序、三态失败、custom 树白名单、碎碎念锁不推进有断言。
+批 6【完成】pet/chat_memory.py、pet/chat_attach.py、pet/tts.py
+  回归：46/46。轮次窗口/按轮删除/魔数嗅探/sha256 存取/缓存淘汰有断言。
+批 7【进行中】pet/multipet.py、pet/settings_ui.py 已落地并接入主程序
+  7a 多宠容器：PetWindow 改为按 pets[] 实例装配（scale=size×9/16/340）、
+     display 四态过滤、首只建托盘其余不建、corner/margin 定位、
+     每只名字/尺寸写回 pets[]；未声明 pets 时走原单窗路径（老用户尺寸不变）
+  7b 设置页（全局/语音/模型/外观物理/宠物/路径）+ 菜单「⚙ 设置…」
+     + 显示位置四态子菜单 + trayEnabled 热开关
+  回归：51/51（新增 settings/menu/语音/碎碎念四项为真实构建与调用验证）
+  7c【部分完成】对话面板三项已接线：
+     · 图片附件：选图 → 魔数校验 → 640KB/2048 压缩 → sha256 落盘 → 预览条
+       （点击移除）→ 多模态发送（image_url data URL）；模型不支持时报
+       「图片没发出去（当前模型可能不支持图片）」；配图开关关闭时明确拒绝
+     · 按轮删除：会话页「按轮删除」→ 勾选列表 → 删 idx 整轮（问+答一起）
+     · T 键：窗口内无修饰键 T 打开对话面板（WidgetWithChildren 作用域）
+     回归：60/60
+  7c【完成】对话面板：图片附件（选图/拖拽/粘贴/截屏 四入口共用同一校验与
+     压缩链路）、按轮删除（idx 整轮，问+答一起）、T 键、历史分页
+     （每次 14 条，底部「加载更早」）
+     回归：63/63
+  9c【完成】ai_provider（openai/anthropic 两协议、端点白名单、拒绝重定向、
+     凭据加密存储、碎碎念优先走独立通道再回 DeepSeek）、
+     第三方菜单项平铺到「更多」并回传点击事件、设置页模型卡新增独立通道字段
+     回归：63/63
+     独立应用形态说明：Python 单进程 + 自建本地服务 + Qt 设置页即上游
+     「单进程独立应用」的等价物；Electron 下载/NSIS 安装器按 N1/N2/N6 不适用
+  7d 已接线：TTS 播出（_speak_reply，voiceEnabled 门控 + mci 播放）、
+     碎碎念定时（30s 一拍、周期 300s 下限 60s、锁跳过不推进、落盘日志）、
+     窗口持有 OccupancyLock（TTL 120s）
+  7d 待做：工作状态与状态叶子、余额改走服务商注册表与多页气泡、
+     人设/时间背景接入对话系统提示词
+批 8-11【进行中】
+  9a【完成】pet/petservice.py 路由分发（state/work-status/lock/broadcast/bubble/
+     anim/position/throw/pose/playback/config/pet-display/menu/voice/balance/
+     whisper/chat）+ pet/apiserver.py（127.0.0.1、Host/Origin 校验、令牌矩阵、
+     1MiB 上限、no-store）+ pet/service_hooks.py（气泡/动画/三模式定位/抛掷飞行/
+     对话历史与按轮删除/显示切换）
+     主程序启动即拉起服务并注册窗口钩子；回执自动 playing→ended(2.6s)
+     回归：56/56（含真实回环 HTTP：无令牌 403、带令牌 200、Host 伪装 403）
+  9b【完成】运行状态文件 api-runtime.json（0600 原子写、pid+token 双匹配清理）、
+     设置页接口地址与令牌（未启动明示 + 一键复制）、apiEnabled 热开关、
+     素材路由 /logo /pic /sound /thumb（单段 Range 206/416、穿越防护 404）
+     对话回复在窗口不在前台时弹通知（80 字截断）
+     回归：59/59（新增运行状态/素材 Range/通知三项，含真实回环请求）
+批 8【完成】pet/desktop.py：置顶看门狗（1s tick / 5s 重申、仅在可见且
+     topmost 开启时 raise）、多屏兜底 ensure_on_screens（定位/抛掷/回屏/改尺寸后调用）、
+     命中区穿透（Win32 WM_NCHITTEST 返回 HTTRANSPARENT，只穿透宠物列以外余量，
+     不裁切绘制）；设置页新增「边缘鼠标穿透」开关
+     DPI 线性化与任务栏看门狗：Qt 逻辑坐标 + Tool 窗口本就不进任务栏，
+     上游那两项是 Electron 补丁，此处不适用（已在模块头注明）
+     回归：66/66
+批 10【完成】requirements 追加 edge-tts、桌宠.spec（collect_submodules 收全
+     pet/skins、datas 带 sprites/stickers、版本号取自 pet/version.py）、
+     tools/build_exe.py（关键文件 + 全包语法自检 → PyInstaller，subprocess 无 shell）
+     回归：66/66
+  工作状态 UI【完成】pet/workstatus_ui.py：轮询状态叶子（200ms），
+     有 task 显示 task、否则按六档从 workStatusTexts 抽句；终态 10s、
+     非终态常驻、回空闲收起；终态附带一次动作；服务层 /work-status 新增 tool/args
+     时自动生成工具详情文案
+批 11【完成】全量回归：连续两次 72/72 通过，四份真实数据哈希与开工前一致，
+   根目录无 logs.txt / api-runtime.json / voice-cache / attachments / config.jsonc 残留
+   新增回归覆盖：配置（JSONC/合并/白名单/声明）、状态版本与长轮询、日志轮转与脱敏、
+   几何 24px、物理与拖拽三态、运动引擎、占用锁、动画池、气泡优先级与分页、
+   tooltip/积分、工具文案、工作状态机与展示、回执、通知帧、人设/时间、梗图、
+   余额服务商/多页/字体、碎碎念、模型选择、对话记忆/附件/按轮删、TTS、多宠、
+   设置页、菜单（含第三方）、服务分发、HTTP 鉴权与 Range、窗口钩子、运行状态文件
+批 12【完成】G4 等价实现：pet/selfcheck.py + pet/selfcheck_ui.py（启动自检写工作槽，
+   3000ms 节流 / 12s 清槽）、pet/guard.py（崩溃兜底 + 10 分钟 3 次退避重启，
+   --relaunch-parent 等父进程退出）、tools/installer.iss + build_exe.py 的
+   --zip/--installer；tools/smoke_check.py 新增 selfcheck/guard/安装器三项回归
+   并修复测试间状态污染（_start_emote 猴补忘还、待机眨眼未归零）
+   另：多宠选择入口（右键「宠物」子菜单 + GET /pets）
+   回归：77/77（offscreen 与 -p windows 两套），四份真实数据哈希不变
+
+已知落差（需后续批次或评审确认，不得静默忽略）：
+G1 农历节日：已提供 pet/lunar_table.py + 随包 lunar.json（2024–2035 的正月初一），
+   元宵（1-15）自动按「初一 + 14 天」推算；其余农历节日（端午/中秋/七夕等）
+   需在 lunar.json 里补一条「月-日: 公历日期」即可启用；文件缺失时整体跳过，
+   绝不猜日期。已验证：2026-02-17 生成「今天是大年初一」
+G2 opencode-go / commandcode 响应结构：按防御式解析实现（识别常见字段名），
+   取不到就报 fetch-error，不伪造金额；需以真实账号响应校准字段名。
+G3 动画素材：上游 webm/mov 需先导出 PNG 帧才能入库（Q4 已确认）。
+G4 Electron 下载/Helper/安装器【完成，按 N1/N2/N6 等价实现】：
+   · 下载槽 → pet/selfcheck.py + pet/selfcheck_ui.py：启动逐项自检（Python/Qt/
+     皮肤注册表/素材/字体/可选依赖/DPAPI），进度写工作状态同一槽位、3000ms
+     节流（与上游下载日志一致）、12s 无新进度自动清槽（WorkStatusMachine.
+     set_download 的既有语义），失败落 error 档并写日志；步骤 250ms 一拍，
+     不阻塞首帧。全绿时静默（上游没有下载任务也不写工作槽，启动多一条
+     气泡属于体验打折），只有超过 3000ms 未跑完、或结论降级/失败才说话。工作槽的 5s 滞回补写 / 60s 终态清理 / 12s 清槽由
+     workstatus_ui 每 200ms 调 svc.work.poll() 真正推进（此前默认时钟恒为 0，
+     这三条定时语义都不会触发）。
+   · Helper 子进程 → pet/guard.py：sys.excepthook + threading.excepthook 记录
+     未捕获异常、托盘提示、退避重启（10 分钟最多 3 次，临时目录记账）；
+     重启子进程带 --relaunch-parent <pid>，等父进程退出（最多 15s）再启动，
+     否则会被单实例互斥锁挡回。
+   · 安装器 → tools/installer.iss（Inno Setup 6，AppId/版本由构建脚本 /D 传入、
+     可选桌面图标、安装后立即运行、卸载清理缓存目录）+ tools/build_exe.py 新增
+     --zip（便携 zip：exe+LICENSE+README）与 --installer（找不到 ISCC.exe 时
+     明确提示并跳过，不引入硬依赖）。
+   · 回归：76/76（新增 selfcheck/guard/安装器三项，均含真实执行）
+G5 score/tooltip【完成】：ScorePopup（20 粒粒子、2200ms、点外部不消费事件关闭）
+   接在甩出/弹弓落地前；PetTooltip 按 size 等比定位（0.022 间距/0.8 宽/0.026 字号），
+   悬停显示、离开隐藏、对鼠标透明
+G10 服务契约补齐：/config/meta、/models、/reload、/quit（GET 探测 + POST 退出）、
+   /pet-config、/attachment?id=（sha256 校验 + Range）；surface 四值与 display 联动
+   （any 放行 none，其余按 web/desktop/both 收窄）
+G12 第三方契约细节：/broadcast 的 image 改为走表情包池（不在池内回
+   「配图不在表情包池内：X」并以图片气泡展示）；带 lockId 时与当前锁不一致回
+   lock-lost（不带锁仍放行，同上游）；url 气泡显示文字 + 链接并记日志；
+   第三方菜单多个 owner 时按 owner 分组子菜单，单个 owner 平铺
+G11 TTS 已安装并实测：edge-tts 7.3.1，首合成 12240 字节、二次命中缓存
+G8 通知帧入口【完成】：POST /notify（approval/question/session/error），
+   收口到 notify.toast（正文 80 字）、通知开关关闭时静默、帧写入 notify 叶子
+G9 漫游走位【完成】：wander 改走 motion_engine.Walk（lead/tail 缓入缓出，
+   平均速度由距离/SPEED+lead+tail 推导）；陈旧走位丢弃重规划避免跨场景跳帧；
+   拖拽/改模式/改尺寸/回屏均取消走位
+   【指纹基线已按有意变更重生】：tools/smoke_baseline.json 已用
+   --update-baseline 重生（wander 场景 lead=2s 内不动，故另加
+   「Walk 引擎走位单调推进且到点结束」专项断言保证覆盖）
+   末次重生原因：_reset_motion_state 增补 _blink_next 归零后，鲸鱼娘待机眨眼
+   序列不再继承上一检查的残留帧（旧基线捕获的是随时间累积的偶然帧）；
+   已用同参数连跑两次确认指纹稳定，再改基线。
+G7 工作状态动画【完成】：按档位切动画（_set_work_anim，长播 3600s；
+   回空闲 _clear_work_anim 收尾），/anim 改为按皮肤实际帧映射（无该状态时按
+   上游 EVENT_FALLBACK 回落，仍无则 play/idle），/pose 增加 display 过滤
+   （web/desktop/both 与宠物显示不一致时回 unsupported）
+G7 余额多页/字体/配图【完成】：
+   · 余额页：money 1 页、windows 2 页（额度/明细）、custom 按 views 页数；
+     气泡区域点击翻页（挂件与非挂件皮肤都支持），只有一页时不消费点击
+   · 字体：family 白名单映射 + size/21 × (宠物宽/462) 倍率（followPet 可关），
+     直接乘在气泡各档基准字号上，排版比例不变；保存设置后热更新
+   · 配图：提示词注入「[配图] … [图:名称]」+ 清单（chatImageLimit 截断）；
+     回复尾部标记解析后剥除并在气泡内绘制图片 + 一行文案；碎碎念按
+     whisperImageEnabled 先抽图再生成，模型未给标记时回退到抽中的图
+G6 拖拽接线【完成】：起手阈值 5px、双击 200ms 弹弓、松手三态
+   place/throw/sling；甩出复用 Flight 积分，放下后按可达区 24px 夹取
+   （修「拖出视口松手后失联」）；刚拖完 100ms 不弹右键菜单
+
+
+======================================================================
+八、交付清单（改动文件 / 功能对照 / 未对等项 / 回归结果）
+======================================================================
+[新增模块 pet/，43 个]
+  基础设施：config.py state.py log.py version.py storage 扩展
+  物理与几何：geometry.py physics.py drag.py motion_engine.py lock.py
+  表现层：animation_pool.py bubble.py overlay.py score_ui.py tooltip_ui.py
+          workstatus_ui.py font_ui.py chat_ui.py
+  事件与文案：workstatus.py tooldetail.py playback.py notify.py persona.py
+              time_context.py memes.py
+  余额与模型：balance_providers.py balance_view.py model_select.py whisper.py
+              ai_provider.py
+  对话与语音：chat_memory.py chat_attach.py tts.py
+  多宠与设置：multipet.py settings_ui.py
+  服务与外设：petservice.py apiserver.py service_hooks.py runtime_state.py
+              desktop.py
+  自检与兜底：selfcheck.py selfcheck_ui.py guard.py
+  历法：lunar_table.py（随包数据 lunar.json）
+
+[新增非模块文件]
+  桌宠.spec（PyInstaller 入口，已从 .gitignore 的 *.spec 中显式放行）
+  tools/build_exe.py（自检 + 打包 + --zip + --installer）
+  tools/installer.iss（Inno Setup 6 安装包脚本）
+  lunar.json、移植功能对照清单.txt
+
+[修改文件]
+  桌宠.py（多宠装配/菜单入口/拖拽物理/浮层/命中穿透/服务启动/崩溃兜底/自检）
+  pet/storage.py（config_jsonc、pets_dir、log、voice_cache、attachments、
+                api_state、损坏备份）
+  pet/menus.py（设置/显示位置/宠物清单/第三方分组/走位清理）
+  pet/chat.py（TTS 播出、碎碎念、人设与时间背景、梗图、通知）
+  pet/motion.py（表情调度、绘制、唤醒/受惊）
+  pet/gadget.py、pet/balance.py、pet/credentials.py（DPAPI 字段扩展）
+  skins/dsh_whale.py（状态帧协议对齐）
+  requirements.txt（edge-tts）
+  tools/smoke_check.py、tools/smoke_baseline.json（回归与指纹基线）
+  .gitignore（放行 桌宠.spec）
+
+[功能对照（上游能力 -> 本地位置 -> 验证）]
+  语音（voiceEnabled/voiceName/设置页语音卡） -> pet/tts.py + pet/settings_ui.py
+       smoke「tts: 参数校验」「settings: 设置页」
+  右侧栏对话面板 -> pet/chat_ui.py（非模态、T 键、图片/按轮删除/分页）
+       smoke「chat_ui: 」两项
+  工作气泡操作详情与忙碌回弹 -> pet/workstatus.py + pet/tooldetail.py +
+      pet/workstatus_ui.py（5s 滞回） smoke「workstatus: 」与「工具详情」
+  托盘 trayEnabled 默认开 -> pet/menus.py::set_tray_enabled + 配置
+       smoke「settings: 」
+  Electron 下载日志写工作状态 → pet/selfcheck.py（3000ms 节流 / 12s 清槽，
+      全绿静默）
+       smoke「selfcheck: 」
+  单进程独立应用 + Windows 发行流水线 -> _ensure_single_instance + pet/guard.py
+      + 桌宠.spec + tools/build_exe.py --zip/--installer
+       smoke「packaging: 」两项、「guard: 」
+  JSONC 注释保留 -> pet/config.py（read_jsonc / 白名单回写）
+       smoke「config: 」
+  拖出视口不失联 -> pet/drag.py + pet/geometry.py clamp + pet/physics.py
+       smoke「drag: 」
+  motion/geometry 边界 -> pet/geometry.py + pet/physics.py + pet/motion_engine.py
+       smoke「motion: 」三项
+  any 表面 display:none -> pet/petservice.py::_require_surface +
+      pet/service_hooks.py::_api_display  smoke「service: 」「api: 」
+  积分与悬浮 tooltip -> pet/score_ui.py + pet/tooltip_ui.py
+       smoke「score/tooltip: 」
+  多宠与 /pet 选择 -> pet/multipet.py::roster + 右键「宠物」子菜单 + GET /pets
+       smoke「multipet: 」「menu: 多宠选择列表」
+
+[未能对等项与风险]
+  G2 三个服务商（opencode-go / commandcode）真实响应字段未校准：
+     已按防御式解析实现，取不到即 fetch-error，不伪造金额；
+     风险：这两家余额可能一直显示失败，需真实账号一次抓包补字段名。
+  G3 上游动画素材（webm VP9-alpha / mov HEVC-alpha）无法入库：
+     已按确认的方案保持 PNG 帧，状态映射与回落完整；
+     风险：个别动作的观感与上游不同，需要上游导出 PNG 后才能逐帧一致。
+  G13 多模态图片真实调用未实测：附件链路、data URL、失败文案均已就绪，
+     风险：真实模型若不支持图片，只能看到既有提示，需一次带密钥的实测。
+  N1 至 N8（Electron 下载 / Helper / 网页浮层 / DSH 事件源 / Cordis 服务面 /
+     安装器签名 / 视频 alpha / 浏览器缓存）见第三节，均已给出替代方案。
+
+[回归结果]
+  tools/smoke_check.py：offscreen 77/77、-p windows 77/77
+  四份真实运行数据哈希与开工前一致：config.json 8775B151B902、
+  pet_memory.json F4412FD41176、pet_sessions.json 11FFFE9BB60F、
+  usage_ledger.json 078212A85191
+  根目录无 logs.txt / config.jsonc / api-runtime.json / voice-cache /
+  attachments / dist 残留
+  指纹基线：_reset_motion_state 增补 _blink_next/emote_total/emote_loops
+  归零后按有意变更重生，并以相同参数连跑两次确认稳定
+
+======================================================================
+九、平台皮肤与操作台扩展（2026-10-29）
+======================================================================
+[右键菜单审计]
+  整合前：29 个顶层项 + 5 条分隔线 = 34 行，找任何一项都要从上到下扫
+  整合后：7 个顶层项（第三方菜单为空时实际可见 6 个）+ 2 条分隔线 = 9 行
+  分组：互动（喂食/睡觉/随机动作/换装/音效/音效音源/改名）
+        模式（走动 3 + 大小 4 + 显示位置 4 + 显示隐藏/回屏/穿透/置顶/自启）
+        数据（余额/天气/Key/用量模式 3/峰谷文案 3/Token/消耗/气泡秒数/
+              记忆/会话 4/宠物清单）
+  旧入口全部可达（smoke 递归比对），设置入口统一为「桌宠面板」控制台
+
+[控制台 pet/console_ui.py]
+  QMainWindow + 左侧导航三页：
+  - 主窗口：形象预览、聊天/随机动作/睡觉/显隐/回屏、名字/形象/尺寸/显示/
+    接口/余额
+  - 设置面板：原设置页六张卡直接嵌入（保存与热更新逻辑未改）
+  - 管理面板：皮肤库（预览 + 应用 + 打开素材目录）、动作库（搜索/分类/
+    点播，106 段）、宠物清单、服务状态（接口/令牌/版本/素材/日志）
+  关闭只隐藏，单实例复用
+
+[新皮肤 dsh-pet]
+  素材：上游 dsh-pet/assets/webm 全部 106 段 VP9-alpha（640x360 / 24fps）
+  管线：tools/import_dsh_skin.py
+        ffmpeg(libvpx-vp9) 解码 -> 全动作并集 alpha 包围盒裁剪 ->
+        以「待机动作包围盒」定统一倍率（避免跳起变小）-> 10fps / 280 高 /
+        质量 50 编码动画 WebP；首帧另存 PNG 预览
+  产物：sprites/dsh-pet/anim/*.webp（106 段，约 155MB）、preview/*.png、
+        manifest.json（动作/帧数/尺寸/标签 + 上游 animations 与权重）
+  运行时：skins/dsh_pet.py 惰性解码（LRU 2 段）、统一倍率缩放、
+        窗口宽度按待机宽度 1.6 倍封顶
+  动作接线：idle/turn/move/click/drag/sleep/wake/eat/play/think/working/
+        result/waiting/success/error、余额六档、碎碎念三选一；随机动作按
+        上游权重（idle 10 / turn 5 / move 5 / 分类合计 80）掷骰
+
+[专属走/转/拖适配（2026-10-30）]
+  走：moves.actions 三段（螃蟹走路 / 原地漂浮踏步 / 原地左转奔跑）等概率；
+     距离/边距/lead/tail 按各自 params（参考宽 462 缩放）；演出时长取素材 clip
+     （10s），位移与脚步同一节奏；walk 期间状态键指向本次动作。
+     _pet_state 补上 _walk 判定：之前漫游滑行时仍按待机播，走路动画根本不出
+  转：闲置换向/随机池播「东张西望」，播完按上游约定翻面；镜像改为按动作粒度
+     （mirror_for），带文字的 2 段动作不镜像；演出期间不规划新走位，避免一边
+     滑行一边播转向
+  拖：拖动中最高优先级，状态键「被鼠标拖拽悬空反馈」；松手恢复行走/待机
+  兼容：动作绑定层（walk/drag 覆盖、区间循环、fps、mirror）优先于皮肤默认；
+     绑定 walk 时演出时长取绑定素材
+  回归：dsh-pet 检查新增动作池参数、状态键、翻面、拖拽与镜像断言
+
+[动作优先级与频率（2026-10-30）]
+  优先级：点击/喂食/唤醒/拖拽 100 > 手动点播 60 > 随机 30 > 行走/工作长驻 10
+  （走位进行中，随机级改为排队等待这段走位结束，见下方「互为缓存」）
+  - 手动来源：控制台动作库、/anim、动作编辑器预览；随机来源：idle_pick、
+    余额/碎碎念事件、转向动画
+  - 低优先级在播时只缓存最高的一条，播完自动接上；同级保留先到的，避免风暴
+  - 拖拽：开始即清待播并让低于点击级的演出让位；拖拽期间其它动作只排队
+  - 工作动画被点击/手动抢断后自动接回；演出期间暂停位移，结束后按暂停时长
+    续上走位时钟（不再边滑边演）
+  频率：dsh-pet 随机动作冷却 36~60s（原 12~30s），触发概率 0.004；转向冷却 30s
+     5 分钟仿真：6 段随机动作，间隔 37~73s，占空比约 20%
+  回归：smoke 83/83（新增「action: 拖拽打断 / 工作动画接回 / 走位暂停」）
+
+[自由行走参数适配（2026-10-31）]
+  根因一：漫游边缘夹取后仍用素材 clip 作为时长（如 30px 也走 10s）
+        → 看起来原地踏步；现在按动作 minDist 的一半设最小步长，
+        不足则换向；两侧都不够就休息，不再拖满一段演出
+  根因二：方向映射两套、基准朝向判断反了（左转奔跑被镜像后成了右转）
+        → dsh-pet 提供 facing_for_dir（基准朝左：left=+1/right=-1，左转奔跑按左向编排），
+        两条路径共用；旧皮肤仍沿用各自原约定，不动既有表现
+  参数口径：walk_profile(params, clip, size) = 区间×3 + 按 clip-lead-tail 拆出行进时长
+        动作先选、区间×3 后随机距离；实际步速 = 距离 / 素材行进时长；
+        时长 = lead + 行进 + 惯性（不再用整段 clip）；位移停即退出行走状态，
+        素材尾部 2/4.8s 不再原地播放；短距漂浮 / 中距螃蟹 / 长距奔跑自然分层
+  方向回收：新增 _stop_walk()（结束/陈旧/拖拽/改模式/改尺寸/回屏/入睡统一走）
+        清 _walk、惯性、动作名，dir 回 down、facing 回 1，不残留上一段朝向
+  位移门禁：只有行走动画在播时才推进位移；思考态（ds_busy）立即停走并丢弃走位，
+        随机动作播放期间也不位移（不再出现“演着演着人挪了”）
+  起步同步：_walk_anim_t0 = frame_t + lead，lead 阶段保持待机；真正开走后
+        走位动画从第 0 帧开始，避免“动画先跑/先摔倒、角色后动”
+  跟随路径：进入远距时同样选一段 moves 动作，到近/到达时回收；
+        速度仍为原有 SPEED=380px/s（按“不影响既有行为”保持不变）
+  实测（宠物宽约 421px、区间×3）：漂浮 109–327px（18–55px/s）、
+        螃蟹 164–655px（27–109px/s）、奔跑 328–874px（95–253px/s）；
+        长跑结束另给 0.5s 线性减速惯性（位移≈speed×0.25）；结束后回 down/1
+  回归：smoke 85/85（新增「walk: 自由行走参数适配 / 边缘换向 / 朝向回收」）
+
+[动作频率与防打断（2026-10-31）]
+  频率：dsh 随机动作冷却 72–120s（原 36–60s），触发概率 0.002（原 0.004）；
+        转向冷却 60s；whale-girl 12–24s（原 5.6–15.2s）、概率 0.01（原 0.02）。
+        5 分钟仿真：3 段随机动作，间隔 104–117s，占空比约 10%。
+  防打断：自由行走进行中，随机级（含余额/碎碎念/工作/转向/随机小动作）
+        只排队，走完由 _flush_queued 自动接上，脚步不被打断；
+        同级随机仍按原语义覆盖（事件动画需要即时切换）。
+        手动点播/点击/拖拽仍可抢占行走，抢占后停走，动作结束歇 2–4s。
+  惯性：长跑（左转奔跑）结束后另给 0.5s 线性减速惯性（约 speed×0.25 位移）。
+
+[动作调度日志与间隔闸门（2026-10-31）]
+  日志：logs.txt 中以 "ACTION t=..s ..." 记录 start / block / queue / end / walk / work；
+        start 带 name/prio/dur/prev，队列带 set/drop/expire/start，结束带 gap；
+        动作提前结束会记 "end early name=.. remain=.."。
+  根因：
+    1) 动作库皮肤原先把调用方 1.6~2.8s 的拍子放宽到 8s，而素材是 10s，
+       所以每段尾部被截掉 2s；
+    2) 动作未播完时新请求（高优先级/点击/事件/工作）直接抢占，造成当前动作截断；
+    3) dsh 的 idle 分支走 action_binding 成功时没设 _idle_cd，下一帧继续抽；
+    4) _end_emote 结束就立刻播缓存/立刻接回工作动画，段与段 0 间隔；
+    5) 工作动画用手动级，绕过所有闸门。
+  修复：
+    - single_shot 皮肤一律按素材 anim_duration 播完整段，不再用调用方时长截断；
+    - 普通演出动作在播时，任何新请求（含点击/手动/事件）都只排队，不截断当前动作；
+      仅拖拽可接管；工作长驻动画可被点击/手动切换；
+    - 动作结束进入 3–5s 全局静默：走位不准起步，队列不准释放；
+      缓存动作由 _tick_action_queue 到点再播，TTL 60s，过期丢弃（日志 expire）；
+    - 队列规则：低优先级只留最高一条，同优先级保留先到；
+      静默/播放期间来的更高优先级会顶掉队列里的低优先级，但不抢占当前动作；
+    - 每次 idle 抽签后必设冷却 72–120s（dsh）、12–24s（whale）；
+    - 工作动画降为空闲级并排队，状态清除/新状态时同步清队列。
+  证据（当前代码仿真）：螃蟹走路 dur=10.0 实播 10.02s → end gap=4s →
+        queue start 3.56s；动作结束后走位等 4.12s 才起步；
+        旧运行日志中出现的 0s 间隔（end 与 walk start 同刻、walk stop 与 queue start 同刻）
+        已由「结束后 3–5s 静默 + 走位门禁 + 队列闸门」三条同时封住。
+  回归：smoke 87/87（新增「action: 完整时长 / 3–5s 释放 / 无零间隔」）
+
+[顺带修复]
+  ApiServer 端口：Windows 的 SO_REUSEADDR 会让第二个进程也能绑定 7340，但请求
+  仍由先占者处理（表现为「令牌总是不对」）；改为不共享端口、port=0 交给系统
+  选空闲端口，启动返回实际端口。api 两项回归恢复通过。
+  指纹基线：motion-windows 在当前显示器/DPI 下渲染指纹变化（窗口尺寸不变，
+  offscreen 稳定），按「有意变更」重生 windows 基线；offscreen 不变。
+  数量核对：106 段 / 10549 帧（均值 99.5 帧）；manifest 无坏文件、无缺预览，
+        标签覆盖 idle/turn/move/drag/click、workStatus 0-5、balance 0-5、
+        whisper 0-2
+
+[上游静态素材]
+  click-duck.wav：已接入点击音源「上游鸭叫」（dsh-duck，固定 0.5 音量，
+        缺失回落合成音）
+  cursor-grab.png / cursor-grabbing.png：已接入悬停/拖拽光标（热点 16,16，
+        缺失回落系统手形）
+  pic/*.png（6 张通知图标）、memes/*.png（27 张表情包）、logo.png：归档在
+        sprites/dsh-pet/pic、upstream/ 并在 upstream/ASSETS.json 逐项注明
+        未直接使用的原因：Qt 托盘通知只接受系统图标枚举；本项目已有自己的
+        表情包/梗图体系与全局 memes 配置，合并会改动现有提示词；logo 用自有
+        图标。以上均不构成动作/皮肤缺失
+  回归：smoke 新增「dsh-pet: 素材清单/动作全量/状态映射」与
+        「console: 主窗口/设置/管理 + 皮肤库 + 动作库」
