@@ -24,11 +24,26 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QImageReader, QPixmap
 
 from pet.storage import P
+from pet import motion_engine
+from pet import segments
 from skins.base import SkinBase
 
 BASE_DIR = os.path.join(P.sprites, "dsh-pet")
 MANIFEST = os.path.join(BASE_DIR, "manifest.json")
 CACHE_MAX = 2
+
+# 移动动作的分段表（帧号 0 起、闭区间）。奔跑素材自带「开场/循环/收尾」：
+# 长距离时只把 loop 段多跑几轮，帧率不变，所以脚不会在地上打滑。
+# 「原地左转奔跑」100 帧 @10fps：0–17 惊喜+转身 / 18–25 奔跑一循环
+# （8 帧 = 跑两步，帧 20–27 与 28–35 逐拍对应）/ 45–59 摔倒+惯性滑行 /
+# 60–99 爬起+尴尬挠头。
+MOVE_TIMELINES = {
+    "原地左转奔跑": {
+        "fps": 10,
+        "segments": [(0, 17, "once"), (18, 25, "loop"),
+                     (45, 59, "once"), (60, 99, "once")],
+    },
+}
 
 # 本地状态键 / 表情名 → 上游中文动画名（上游没有同名状态时的固定映射）
 CORE_MAP = {
@@ -229,6 +244,18 @@ class DshPetSkin(SkinBase):
         cap = max(idle_w * 1.6, widths[len(widths) // 2])
         return [int(round(min(widths[-1], cap)))]
 
+    def canvas_width_for(self, h):
+        """绘制画布需要的宽度：按最宽动作取，不封顶。
+
+        `width_for` 给的是「判定主体宽」（封顶，避免窗口被一只特效动作撞宽）；
+        但绘制时宽动作若超出窗口就会被裁掉两侧。这里把差值交给窗口的画布
+        宽度承担：窗口变宽，本体判定主体宽不变。
+        """
+        if not self._meta:
+            return 0
+        scale = float(h) / float(self._base_h or 340)
+        return int(round(max(row["width"] * scale for row in self._meta.values())))
+
     def icon_pixmap(self, h):
         row = self._entry(CORE_MAP.get("idle", ""))
         if row is None and self._meta:
@@ -291,6 +318,22 @@ class DshPetSkin(SkinBase):
                         "clip": self.anim_duration(name)})
         return out
 
+    def move_timeline(self, name):
+        """移动动作的分段表（没有就返回 None，调用方回退到整段取模）。"""
+        row = MOVE_TIMELINES.get(name or "")
+        if not row:
+            return None
+        cached = getattr(self, "_timeline_cache", None)
+        if cached is None:
+            cached = {}
+            self._timeline_cache = cached
+        key = (name, row["fps"], tuple(row["segments"]))
+        timeline = cached.get(key)
+        if timeline is None:
+            timeline = segments.SegmentTimeline(row["fps"], row["segments"])
+            cached[key] = timeline
+        return timeline
+
     def pick_move(self, win=None):
         """选一段专属行走动画（上游 moves.actions 等概率），并记住它给 state_key。"""
         pool = self.move_actions()
@@ -298,6 +341,23 @@ class DshPetSkin(SkinBase):
             self._move_name = None
             return None
         choice = random.choice(pool)
+        self._move_name = choice["name"]
+        return choice
+
+    def pick_move_for(self, win, distance):
+        """按距离挑移动动作：短→漂浮 / 中→螃蟹 / 长→奔跑（区间由素材参数换算）。
+
+        漫游用 pick_move（随机抽距离）；取点走位距离是给定的，随机抽会让
+        动作语义和距离对不上，所以这里按区间选。
+        """
+        pool = self.move_actions()
+        if not pool:
+            self._move_name = None
+            return None
+        size = (getattr(win, "pet_size", 0) or getattr(win, "win_w", 0)
+                or 462)
+        choice = (motion_engine.select_move(pool, distance, size)
+                  or random.choice(pool))
         self._move_name = choice["name"]
         return choice
 
@@ -360,7 +420,10 @@ class DshPetSkin(SkinBase):
             return
         anim = self._animations
         weights = self._weights or {}
-        fixed = bool((getattr(win, "pet_conf", {}) or {}).get("fixedEnabled"))
+        # 冻结开关：pets[] 里逐只声明优先，未声明时退回全局 cfg（单只装也生效）
+        conf = getattr(win, "pet_conf", {}) or {}
+        cfg = getattr(win, "cfg", {}) or {}
+        fixed = bool(conf.get("fixedEnabled", cfg.get("fixedEnabled")))
         cats = [c for c in anim.get("categories") or []
                 if isinstance(c, dict) and (c.get("actions") or [])]
         buckets = [("idle", float(weights.get("idle", 10))),
@@ -379,13 +442,17 @@ class DshPetSkin(SkinBase):
                 break
         name = None
         if chosen == "idle":
-            name = CORE_MAP["idle"]
+            # 「待机呼吸」就是站着本身：真去开播会占住演出槽（单段素材最长 10s），
+            # 玩家看到的是原地不动、却不走位也不接别的动作。直接跳过，只记冷却。
+            win._alog("idle skip: 默认待机不占演出槽")
+            return
         elif chosen == "turn":
             name = self.turn_anim() or CORE_MAP["turn"]
         elif chosen == "move":
-            # 专属行走动画要真走起来，不能原地播
+            # 专属行走动画要真走起来，不能原地播；掷到「走一走」就不再接着休息
             planner = getattr(win, "_plan_walk", None)
             if getattr(win, "mode", "wander") == "wander" and callable(planner):
+                win.rest_until = 0
                 planner()
                 win._idle_cd = random.randint(3600, 6000)
             return

@@ -694,8 +694,10 @@ def _():
     assert G.intersects(0, 0, 462, [area])
     assert not G.intersects(-2000, -2000, 462, [area])
     assert G.ensure_visible(-2000, -2000, 462, [area])[0] > -1000
-    b = G.throw_bounds(100, 100, 462, area)
+    b = G.flight_bounds(area, (60, 180, 360, 418), side_allow=100)
     assert b[0] < 0 and b[1] > area[2] - 462
+    # 底边按本体底算：窗口再高也不能沉到屏幕下方（否则只剩一截）
+    assert b[3] == area[3] - 418, b
 
 
 @check("physics: 抛掷停留/反弹/估速/弹弓/Q弹/弹簧")
@@ -1295,7 +1297,8 @@ def _():
     assert r["count"] == 2 and [w.tray for w in made] == [True, False], r
     rows = mgr.roster()
     assert [x["id"] for x in rows] == ["a", "b"], rows
-    assert rows[0]["label"] == "a" and "both" in rows[0]["detail"], rows[0]
+    assert rows[0]["label"] == "a" and "桌面+网页" in rows[0]["detail"], rows[0]
+    assert "自定义" in rows[0]["detail"] or "中" in rows[0]["detail"], rows[0]
     assert rows[1]["display"] == "desktop" and rows[1]["visible"] is True, rows[1]
     a = mgr.by_id("a")
     mgr.sync({"pets": [{"id": "a", "size": 300, "display": "both"}]})
@@ -3026,7 +3029,9 @@ def _():
         assert abs(prof["speed"] - prof["mid"] / prof["travel"]) < 1e-6, prof
 
         geo = (w.screen() or CTX["app"].primaryScreen()).availableGeometry()
-        w.move(geo.right() - w.width() - 2, geo.center().y())
+        # 让「本体」贴右边缘：画布已按最宽动作加宽，窗口靠右不等于本体靠右
+        w.move(int(round(geo.right() - 2 - w.body_w / 2.0 - w.width() / 2.0)),
+               geo.center().y())
         w.mode, w.target, w.emote = "wander", None, None
         w.rest_until, w.t, w.dragging = 0, 1000, False
         orig_pick = sk.pick_move
@@ -3290,6 +3295,865 @@ def _():
         pd.reject()
     ui_layout.reset()
     assert not os.path.exists(ui_layout.path())
+
+
+@check("geometry: 本体盒与绘制公式同源，且能逆推窗口位置")
+def _():
+    from pet import geometry as G
+    # paintEvent：素材水平居中，底边 = top_pad + margin + cur_h
+    b = G.body_box(300, 238, 260, 100, 4)
+    assert b == (20.0, 104.0, 280.0, 342.0), b
+    cx, cy = G.body_center_abs(1000, 500, 300, 238, 260, 100, 4)
+    assert abs(cx - 1150.0) < 1e-9 and abs(cy - (500 + (104 + 342) / 2.0)) < 1e-9, (cx, cy)
+    back = G.window_for_body_center(cx, cy, 300, 238, 260, 100, 4)
+    assert abs(back[0] - 1000.0) < 1e-9 and abs(back[1] - 500.0) < 1e-9, back
+    box = G.body_box_abs(1000, 500, 300, 238, 260, 100, 4)
+    assert G.near_body((1015, 600), box, 10) is True
+    assert G.near_body((1015, 600), box, 2) is False
+    # 关键回归：窗口容器的角落在本体之外，不能算「本体到位」
+    assert G.near_body((1002, 505), box, 0) is False, "容器角落不该算本体命中"
+
+
+@check("motion: 跟随判定主体是本体，不是窗口容器")
+def _():
+    from PySide6.QtCore import QPoint
+    from pet import geometry as G
+    w = CTX["win"]
+    _reset_motion_state(w)
+    geo = (w.screen() or CTX["app"].primaryScreen()).availableGeometry()
+    w.move(geo.left() + 300, geo.top() + 300)
+    w.mode, w.emote, w.ds_busy, w.rest_until, w.target = "follow", None, False, 0, None
+
+    class _Cursor:
+        def __init__(self, x, y):
+            self._p = QPoint(int(x), int(y))
+
+        def pos(self):
+            return self._p
+
+    try:
+        box = w._body_box()
+        bcx, bcy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+        # 容器头顶气泡区内的点：在窗口里，但离本体顶部 120px
+        far_y = box[1] - 120
+        w.cursor = lambda: _Cursor(bcx, far_y)
+        w._tick_movement()
+        assert w.target is not None, "落在气泡区（离本体很远）不该算「够近」"
+        # 这个点在旧口径（窗口矩形外扩 100）下会被判成 near
+        assert G.near_body((bcx, far_y), (w.x() - 100, w.y() - 100,
+                                         w.x() + w.width() + 100,
+                                         w.y() + w.height() + 100), 0), \
+            "测试点应落在旧口径的 near 区内，否则测不出差异"
+
+        # 目标点由「本体中心对准光标」反推（改回容器口径会差一个 win_mx）
+        # 缩小体型：窗口小才测得出公式，不会被工作区夹取干扰
+        w.cur_h = 120
+        w._recompute_width()
+        w.move(geo.left() + 4, geo.top() + 4)
+        w.target, w.cur_speed = None, 0.0
+        box = w._body_box()
+        bcy = (box[1] + box[3]) / 2.0
+        cur_x, cur_y = int(box[2] + 120), int(bcy)   # 本体右缘外 120px，远超 pad
+        w.cursor = lambda: _Cursor(cur_x, cur_y)
+        w._tick_movement()
+        assert w.target is not None, "本体外 120px 应算「不够近」"
+        want = G.window_for_body_center(cur_x, cur_y, w.width(), w.cur_h,
+                                        w._body_w(), w._dsh_top_h(), w.MARGIN)
+        assert abs(w.target[0] - want[0]) < 1e-6, (w.target, want)
+        assert abs(w.target[1] - want[1]) < 1e-6, (w.target, want)
+        win_mx = (w.width() - w._body_w()) / 2.0
+        assert abs(w.target[0] + win_mx + w._body_w() / 2.0 - cur_x) < 1e-6
+        # 横向本体与容器同心；真正的差异在纵向：旧实现写死 cursor.y - 90
+        assert abs((cur_y - 90) - w.target[1]) > 1.0, "纵向应由本体盒反推，不是写死 90"
+
+        # 光标压在本体中心上：算到位，清目标
+        w.target = (100.0, 100.0)
+        w.cur_speed = 0.0
+        box = w._body_box()
+        w.cursor = lambda: _Cursor((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+        w._tick_movement()
+        assert w.target is None
+    finally:
+        w.__dict__.pop("cursor", None)
+        w.cur_h = int(340 * float(w.cfg.get("size", 0.7)))
+        w._recompute_width()
+        _reset_motion_state(w)
+
+
+@check("point: 按距离选移动动作（短→漂浮 / 中→螃蟹 / 长→奔跑）")
+def _():
+    from pet import motion_engine as ME
+    from skins import load_skin
+    sk = load_skin("dsh-pet")
+    sk.load([187, 238, 306])
+    size = int(238 * 16 / 9)
+    pool = sk.move_actions()
+    assert len(pool) >= 3, [c["name"] for c in pool]
+    bands = {c["name"]: ME.move_band(c, size) for c in pool}
+    assert ME.select_move(pool, 120, size)["name"] == "原地漂浮踏步", bands
+    assert ME.select_move(pool, 400, size)["name"] == "螃蟹走路", bands
+    assert ME.select_move(pool, 1500, size)["name"] == "原地左转奔跑", bands
+    # 单调：距离越远，选中动作的区间中点不递减
+    mids = []
+    for d in (80, 200, 450, 900, 2000):
+        c = ME.select_move(pool, d, size)
+        mids.append(ME.walk_profile(c["params"], c["clip"], size)["mid"])
+    assert mids == sorted(mids), mids
+    # 距离落在动作区间内时，行进时长应接近素材自己的步频（不靠提速硬拉）
+    crab = [c for c in pool if c["name"] == "螃蟹走路"][0]
+    prof = ME.walk_profile(crab["params"], crab["clip"], size)
+    travel, speed = ME.seek_travel(prof["mid"], prof)
+    assert abs(travel - prof["travel"]) < 0.2, (travel, prof["travel"])
+    assert abs(speed - prof["speed"]) < 1e-6, (speed, prof["speed"])
+
+
+@check("point: 右键取点 → 走到该点；点菜单项不走行")
+def _():
+    from PySide6.QtCore import QPoint
+    from pet import pointmove as PM
+    from pet.motion import TICK
+    w = CTX["win"]
+    old_char = w.character
+    _reset_motion_state(w)
+    w._bind_skin("dsh-pet")
+    w.cfg["character"] = "dsh-pet"
+    w._recompute_width()
+    saved = {}
+    try:
+        assert w._body_w() > 0
+        geo = (w.screen() or CTX["app"].primaryScreen()).availableGeometry()
+        w.move(geo.left() + 160, geo.top() + 160)
+        w.mode, w.emote, w.dragging, w.rest_until = "wander", None, False, 0
+        gx = geo.left() + (geo.width() * 2) // 3
+        gy = geo.top() + (geo.height() * 2) // 3
+
+        assert w._walk_to_point(gx, gy) is True
+        assert w._walk is not None and getattr(w, "_walk_point", False) is True
+        # 动作必须按这次点击的距离选，不能是随机抽的
+        from pet import motion_engine as ME
+        expect = ME.select_move(w.skin.move_actions(), w._walk_distance, w.pet_size)
+        assert w.skin._move_name == expect["name"], (w.skin._move_name, expect["name"])
+        walk = w._walk
+        ex, ey, done = walk.at(walk.duration)
+        assert done
+        w.move(int(round(ex)), int(round(ey)))
+        box = w._body_box()
+        ccx, ccy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+        assert abs(ccx - gx) <= 1.5 and abs(ccy - gy) <= 1.5, ((ccx, ccy), (gx, gy))
+
+        # 走位推进：中途确实在挪（本体中心单调靠近），走完自动没收
+        w._stop_walk()
+        w.move(geo.left() + 160, geo.top() + 160)
+        w.rest_until = 0
+        assert w._walk_to_point(gx, gy) is True
+        t0 = w.t * TICK
+        w._walk_t0 = t0
+        b0 = w._body_box()
+        b0x = (b0[0] + b0[2]) / 2.0
+        # lead 阶段不走位：取「起步结束后的中段」看位移
+        half_ms = int((w._walk.lead + (w._walk.duration - w._walk.lead) * 0.5) * 1000)
+        w._advance_walk(t0 + half_ms)
+        bm = w._body_box()
+        assert abs((bm[0] + bm[2]) / 2.0 - b0x) > 1.0, "取点走位应真的产生位移"
+        w._advance_walk(t0 + int(w._walk.duration * 1000) + 10)
+        assert w._walk is None and getattr(w, "_walk_point", False) is False
+
+        # 原地不点：太近不规划
+        b = w._body_box()
+        assert w._walk_to_point((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) is False
+
+        # 菜单项命中 → 只执行菜单项；菜单外点击关闭 → 走到该点
+        calls = []
+        saved["walk"] = w._walk_to_point
+        w._walk_to_point = lambda x, y: (calls.append((x, y)), True)[1]
+        saved["menu"] = w._menu
+        w.drag_state.reset()
+
+        class _Ev:
+            def globalPos(self):
+                return QPoint(10, 10)
+
+        class _Menu:
+            def __init__(self, ret):
+                self.ret = ret
+
+            def exec(self, *_a):
+                return self.ret
+
+        w._menu = _Menu(object())
+        w.contextMenuEvent(_Ev())
+        assert calls == [], "选中菜单项不得触发行走"
+
+        saved["arm"] = w._pick_arm
+
+        def _arm(menu):
+            watcher = PM.OutsideClickWatcher(menu, w)
+            watcher.global_pos = QPoint(700, 700)
+            w._pick_watcher = watcher
+
+        w._pick_arm = _arm
+        w._menu = _Menu(None)
+        w.contextMenuEvent(_Ev())
+        assert calls == [(700, 700)], calls
+        assert w._pick_watcher is None, "监听必须卸载"
+    finally:
+        w._menu = saved.get("menu", getattr(w, "_menu", None))
+        w.__dict__.pop("_walk_to_point", None)
+        w.__dict__.pop("_pick_arm", None)
+        _reset_motion_state(w)
+        w._bind_skin(old_char)
+        w.cfg["character"] = old_char
+        w._recompute_width()
+
+
+@check("run: 奔跑分段表（开场→循环→摔倒→爬起）帧序列")
+def _():
+    from pet import motion_engine as ME
+    from pet import segments
+    from skins import load_skin
+    sk = load_skin("dsh-pet")
+    sk.load([187, 238, 306])
+    tl = sk.move_timeline("原地左转奔跑")
+    assert tl is not None and tl.has_loop
+    # 四段：0–17 惊喜+转身 / 18–25 奔跑一循环 / 45–59 摔倒滑行 / 60–99 爬起挠头
+    assert abs(tl.head_sec - 1.8) < 1e-6, tl.head_sec
+    assert abs(tl.loop_sec - 0.8) < 1e-6, tl.loop_sec
+    assert tl.after_loop_secs == [1.5, 4.0], tl.after_loop_secs
+    assert abs(tl.total_sec(3) - (1.8 + 2.4 + 1.5 + 4.0)) < 1e-6
+
+    assert tl.frame_at(0.0) == 0
+    assert tl.frame_at(tl.head_sec - 0.05) == 17, tl.frame_at(tl.head_sec - 0.05)
+    assert tl.frame_at(tl.head_sec) == 18
+    # 循环段每轮同帧：第 k 轮第 0.35s 都是同一帧
+    same = {tl.frame_at(tl.head_sec + k * tl.loop_sec + 0.35, 4) for k in range(4)}
+    assert len(same) == 1, same
+    # 循环段只能落在 18–25：中间那些不属于循环节的帧不得出现
+    for i in range(80):
+        t = tl.head_sec + (i / 80.0) * tl.loop_sec * 3
+        assert 18 <= tl.frame_at(t, 3) <= 25, (t, tl.frame_at(t, 3))
+    tail_t = tl.head_sec + 3 * tl.loop_sec
+    assert tl.frame_at(tail_t + 0.05, 3) == 45, tl.frame_at(tail_t + 0.05, 3)
+    assert tl.frame_at(tail_t + 1.55, 3) == 60, tl.frame_at(tail_t + 1.55, 3)
+    assert tl.frame_at(999, 3) == 99, tl.frame_at(999, 3)
+
+    # 距离反推：整轮循环，跑动 + 滑行恒等于距离
+    run = [c for c in sk.move_actions() if c["name"] == "原地左转奔跑"][0]
+    speed = ME.walk_profile(run["params"], run["clip"], 423)["speed"]
+    for d in (700, 1300, 2000):
+        plan = segments.plan_run(tl, d, speed)
+        assert plan["run_dist"] + plan["slide_dist"] == d
+        assert plan["loops"] * plan["step"] == plan["run_dist"]
+        assert plan["loops"] >= 1
+
+
+@check("point: 奔跑长距离——段1 原地、段2 循环跑、段3 滑行收尾")
+def _():
+    from pet import segments
+    w = CTX["win"]
+    old_char = w.character
+    _reset_motion_state(w)
+    w._bind_skin("dsh-pet")
+    w.cfg["character"] = "dsh-pet"
+    w._recompute_width()
+    saved = {}
+    try:
+        geo = (w.screen() or CTX["app"].primaryScreen()).availableGeometry()
+        w.move(geo.left() + 10, geo.top() + 10)
+        w.mode, w.emote, w.dragging, w.rest_until = "wander", None, False, 0
+        gx = geo.left() + (geo.width() * 3) // 4
+        gy = geo.top() + (geo.height() * 2) // 3
+        # 距离不够选不到奔跑（小屏），直接指定动作来测编排接线
+        run = [c for c in w.skin.move_actions() if c["name"] == "原地左转奔跑"][0]
+        saved["pick"] = w.skin.pick_move_for
+        w.skin.pick_move_for = lambda win, distance: dict(run)
+        assert w._walk_to_point(gx, gy) is True
+        timeline = w.skin.move_timeline("原地左转奔跑")
+        dist = w._walk_distance
+        speed = w._walk_speed
+        plan = segments.plan_run(timeline, dist, speed)
+        walk = w._walk
+        assert getattr(w, "_walk_timeline", None) is timeline
+        assert w._walk_loops == plan["loops"] >= 1, (w._walk_loops, plan)
+        # 段1 原地：动画立即开播，但位移要等 lead（段1）结束
+        assert abs(w._walk_anim_t0 - w.frame_t) < 1e-6, (w._walk_anim_t0, w.frame_t)
+        assert abs(walk.lead - timeline.head_sec) < 1e-6, walk.lead
+        want_dur = (timeline.head_sec + plan["loops"] * timeline.loop_sec
+                    + sum(timeline.after_loop_secs))
+        assert abs(walk.duration - want_dur) < 1e-6, (walk.duration, want_dur)
+        assert abs(walk.travel - plan["loops"] * timeline.loop_sec) < 1e-6
+
+        # 绘制接线：paintEvent 传的是「已播秒数」，不能再减一次起点
+        # （减两次会永远算回第 0 帧，看着就像一直在原地待机）
+        got_el = w._frame_index_for("walk", 100, 10.0, 2.68)
+        assert got_el == timeline.frame_at(2.68, plan["loops"]), got_el
+        assert w._frame_index_for("walk", 100, 10.0, 0.9) != 0, \
+            "段1 中段不该停在第 0 帧"
+
+        t0 = w.t * 20
+        w._walk_t0 = t0
+        x0, y0 = w.x(), w.y()
+        w._advance_walk(t0 + int(timeline.head_sec * 500))       # 段1 中段
+        assert (w.x(), w.y()) == (x0, y0), "段1 强调转身：不该有位移"
+        w._advance_walk(t0 + int((timeline.head_sec + timeline.loop_sec * 0.5) * 1000))
+        assert (w.x(), w.y()) != (x0, y0), "段2 必须发生位移"
+        # 到达：跑动段 + 滑行段 = 点击距离
+        w._advance_walk(t0 + int(walk.duration * 1000) + 20)
+        box = w._body_box()
+        ccx, ccy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+        assert abs(ccx - gx) <= 2.0 and abs(ccy - gy) <= 2.0, ((ccx, ccy), (gx, gy))
+        assert w._walk is None and getattr(w, "_walk_point", False) is False
+        assert timeline.frame_at(999, w._walk_loops) == 99
+    finally:
+        w.skin.pick_move_for = saved.get("pick", w.skin.pick_move_for)
+        _reset_motion_state(w)
+        w._bind_skin(old_char)
+        w.cfg["character"] = old_char
+        w._recompute_width()
+
+
+@check("driver: 位移驱动互斥（抛掷/接口定位/拖拽抢占走位）")
+def _():
+    w = CTX["win"]
+    old_char = w.character
+    _reset_motion_state(w)
+    w._bind_skin("dsh-pet")
+    w.cfg["character"] = "dsh-pet"
+    w._recompute_width()
+    sk = w.skin
+    crab = {c["name"]: c for c in sk.move_actions()}["螃蟹走路"]
+    saved_pick = sk.pick_move
+    sk.pick_move = lambda win=None: dict(crab)      # 固定动作，避免随机距离让规划落空
+    geo = (w.screen() or CTX["app"].primaryScreen()).availableGeometry()
+
+    def start_walk():
+        w.mode, w.emote, w.dragging, w.rest_until = "wander", None, False, 0
+        w.move(geo.left() + 10, geo.top() + 40)
+        w._plan_walk()
+        assert w._walk is not None, "应先规划出走位"
+
+    try:
+        # 1) 抛掷启动 → 走位让位，且只有 flight 一个驱动
+        start_walk()
+        w._start_flight(320.0, -120.0)
+        assert w._walk is None, "抛掷开始应停走位"
+        assert w._move_drivers() == ["flight"], w._move_drivers()
+        w.t += 1
+        w._tick_movement()
+        assert w._walk is None and w.target is None, "16ms 驱动在跑时 tick 不能再规划走位"
+
+        # 2) 飞行中不接取点（否则会把宠物悬停半空）
+        assert w._walk_to_point(geo.center().x(), geo.center().y() + 120) is False
+        w._stop_move_drivers()
+
+        # 3) 接口定位 instant → 停走位与其它驱动
+        start_walk()
+        w._api_position(0.5, 0.5, "instant", 0)
+        assert w._walk is None, "接口定位应停走位"
+        assert w._move_drivers() == [], w._move_drivers()
+
+        # 4) 接口定位 line → follow 独占，tick 不抢
+        start_walk()
+        w._api_position(0.5, 0.6, "line", 400)
+        assert w._walk is None, "接口定位应停走位"
+        assert w._move_drivers() == ["follow"], w._move_drivers()
+        w.t += 1
+        w._tick_movement()
+        assert w._walk is None and w.target is None
+
+        # 5) 用户取点优先：先停接口定位，再走
+        assert w._walk_to_point(geo.center().x() + 200, geo.center().y()) is True
+        assert w._move_drivers() == [], "取点应先停掉接口定位"
+        w._stop_walk()
+
+        # 6) 拖拽打断：独立驱动全部让位
+        w._start_flight(200.0, -80.0)
+        assert w._move_drivers() == ["flight"]
+        w._drag_interrupt()
+        assert w._move_drivers() == [], w._move_drivers()
+
+        # 7) 交接不瞬移：起点在漫游合法区外时（接口定位刚把它放出去），
+        #    走位开走那一帧不得硬夹回边界；但惯性段仍要夹
+        from pet.motion_engine import Walk
+        t0 = w.t * 20
+        w.move(100, 100)
+        w._walk = Walk((100, 100), (300, 100), 10.0, 2.0, 2.0)
+        w._walk_t0 = t0
+        w._walk_coast_sec = 0.0
+        w._walk_left, w._walk_right = 200, 400
+        w._advance_walk(t0)
+        assert w.x() == 100, (w.x(), "起步帧被边界硬夹 → 会看到瞬移")
+        w._walk = Walk((100, 100), (300, 100), 6.0, 2.0, 2.0)
+        w._walk_t0 = t0
+        w._walk_left, w._walk_right = 0, 250
+        w._walk_coast_sec, w._walk_coast_dir, w._walk_coast_dist = 1.0, 1, 100.0
+        w._advance_walk(t0 + 4500)      # 行进结束(4.0s)后的惯性中段
+        assert w.x() == 250, (w.x(), "惯性段必须夹边界")
+        w._stop_walk()
+    finally:
+        w._stop_move_drivers()
+        sk.pick_move = saved_pick
+        _reset_motion_state(w)
+        w._bind_skin(old_char)
+        w.cfg["character"] = old_char
+        w._recompute_width()
+
+
+@check("skin: 切皮肤清理走位/分段表（不再越界渲染）")
+def _():
+    w = CTX["win"]
+    old_char = w.character
+    _reset_motion_state(w)
+    w._bind_skin("dsh-pet")
+    w.cfg["character"] = "dsh-pet"
+    w._recompute_width()
+    try:
+        geo = (w.screen() or CTX["app"].primaryScreen()).availableGeometry()
+        w.move(geo.left() + 8, geo.top() + 8)
+        w.mode, w.emote, w.dragging, w.rest_until = "wander", None, False, 0
+        run = [c for c in w.skin.move_actions() if c["name"] == "原地左转奔跑"][0]
+        w.skin.pick_move_for = lambda win, distance: dict(run)
+        assert w._walk_to_point(geo.left() + 600, geo.top() + 300) is True
+        assert w._walk_timeline is not None and w._walk_loops >= 1
+        # 切到帧表完全不同的皮肤：旧帧号必须跟着清，否则拿旧帧号索引新帧表
+        w._bind_skin("whale-girl")
+        assert w._walk is None, "切肤后不该还有走位"
+        assert w._walk_timeline is None and w._walk_loops == 0, "分段表必须清"
+        assert w.emote is None and w._emote_prio == 0, "演出槽必须清"
+        assert w.target is None
+        pix = w.grab()      # 之前这里 paintEvent 会 IndexError
+        assert pix.width() > 0 and pix.height() > 0
+    finally:
+        _reset_motion_state(w)
+        w._bind_skin(old_char)
+        w.cfg["character"] = old_char
+        w._recompute_width()
+
+
+@check("action: 睡眠时停用位移驱动（不被抛掷/接口定位拖走）")
+def _():
+    from pet import action_binding
+    w = CTX["win"]
+    _reset_motion_state(w)
+    w._sleeping = False
+    try:
+        w._start_flight(260.0, -80.0)
+        assert w._move_drivers() == ["flight"], w._move_drivers()
+        w._enter_sleep()
+        assert w._move_drivers() == [], w._move_drivers()
+        assert w._walk is None and getattr(w, "target", None) is None
+        assert w.emote == "sleep"
+        assert w._emote_prio == action_binding.PRIO_IDLE
+        assert w._emote_queue == []
+    finally:
+        w._stop_move_drivers()
+        w._sleeping = False
+        w.emote = None
+        w.emote_t = 0.0
+        w._emote_prio = 0
+        w.sleep_until = 0
+        _reset_motion_state(w)
+
+
+@check("action: 随机待机跳过默认 idle（不占演出槽）")
+def _():
+    from skins import load_skin
+    w = CTX["win"]
+    sk = load_skin("dsh-pet")
+    sk.load([187, 238, 306])
+    assert sk._ready, "皮肤未就绪，测不了"
+    anim, weights = sk._animations, dict(sk._weights or {})
+    try:
+        sk._weights = {"idle": 1000.0, "turn": 0.0, "move": 0.0}
+        sk._animations = dict(anim, categories=[])
+        w.emote, w.emote_t, w._emote_prio = None, 0.0, 0
+        sk.idle_pick(w)
+        assert w.emote is None, (w.emote, "默认待机不该占住演出槽")
+    finally:
+        sk._animations = anim
+        sk._weights = weights
+        w.emote, w.emote_t, w._emote_prio = None, 0.0, 0
+
+
+@check("chain: 随机动作严格串行且间隔达标（虚拟 300s）")
+def _():
+    from pet.motion import TICK
+    w = CTX["win"]
+    old_char = w.character
+    _reset_motion_state(w)
+    w._bind_skin("dsh-pet")           # 动作库皮肤才有真正的「随机动作」
+    w.cfg["character"] = "dsh-pet"
+    w._recompute_width()
+    w.mode, w.target, w.emote, w.dragging = "wander", None, None, False
+    w.rest_until, w._idle_cd, w._auto_next_at = 0, 0, 0
+    w._emote_queue, w._sleeping, w.ds_busy = [], False, False
+    w._work_anim = None
+    w.cur_speed = 0.0
+    random.seed(20261103)
+    intervals, cur = [], None
+    try:
+        for _i in range(15000):     # 15000 tick = 300s 虚拟时长（冷却 72–120s，够跑两三轮）
+            w.tick()
+            if w.emote and cur is None:
+                cur = [w.t * TICK, w.emote]
+            elif not w.emote and cur is not None:
+                cur.append(w.t * TICK)
+                intervals.append(tuple(cur))
+                cur = None
+        if cur is not None:
+            cur.append(w.t * TICK)
+            intervals.append(tuple(cur))
+        assert len(intervals) >= 2, intervals
+        for start, name, end in intervals:
+            assert end > start, (start, name, end)
+        for prev, nxt in zip(intervals, intervals[1:]):
+            gap = nxt[0] - prev[2]
+            assert gap >= 2900, (prev, nxt, gap)
+    finally:
+        _reset_motion_state(w)
+        w._bind_skin(old_char)
+        w.cfg["character"] = old_char
+        w._recompute_width()
+
+
+@check("layout: 画布按最宽动作加宽，气泡基准宽不变")
+def _():
+    from pet import ui_layout
+    w = CTX["win"]
+    old_char = w.character
+    _reset_motion_state(w)
+    w._bind_skin("dsh-pet")
+    w.cfg["character"] = "dsh-pet"
+    w._recompute_width()
+    try:
+        need = w.skin.canvas_width_for(w.cur_h)
+        assert need > 0
+        assert need > w.body_w, (need, w.body_w, "应有动作比判定主体宽，否则无需加宽")
+        # 判定主体宽仍由 width_for（封顶）说话
+        assert w.body_w == w.skin.width_for(w.cur_h)[0]
+        assert w.layout_w == w.body_w + w.win_mx * 2
+        # 画布容得下最宽动作：整幅都在窗口内，两侧不裁
+        assert w.width() == max(w.layout_w, need + w.win_mx * 2), (w.width(), need)
+        assert w.width() - 2 * w.win_mx >= need
+        # 气泡/边距仍按基准宽：加宽不把气泡拉胖、也不抬高宠物
+        win = ui_layout.load()["window"]
+        assert abs(w._dsh_bubble_geom()[0] - w.layout_w) < 1e-6
+        assert abs(w._dsh_top_h() - (win["top_h_ratio"] * w.layout_w
+                                    - win["margin"])) < 1e-6
+        # 可交互竖列仍是本体宽：多出来的画布区继续穿透
+        assert w.hit_region().width() == int(round(w.body_w)), w.hit_region().width()
+        # 贴边放好后再夹一次：本体不被拉回中间（横向按本体夹）
+        geo = (w.screen() or CTX["app"].primaryScreen()).availableGeometry()
+        w.move(geo.right() - w.width(), geo.top() + 40)
+        w.snap_into_screen()
+        box = w._body_box()
+        body_cx = (box[0] + box[2]) / 2.0
+        assert body_cx > geo.right() - w.body_w, (body_cx, geo.right(), w.body_w)
+        # 真的渲染一张宽幅动作：内容不碰窗口左右边缘
+        rows = w.skin._meta
+        widest = max(rows.values(), key=lambda r: r["width"] / float(r["height"]))
+        name = widest["name"]
+        # 画布宽必须≥实际解码出来的帧宽，否则就是真裁切
+        decoded = w.skin.load_frames((name, w.cur_h)) or []
+        assert decoded, "最宽动作解码失败"
+        assert max(p.width() for p in decoded) <= need, \
+            (max(p.width() for p in decoded), need, "画布窄于帧宽 → 会裁")
+        w.emote, w.emote_t, w._emote_prio = None, 0.0, 0
+        assert w._start_emote(name, dur=2.0, loops=1, prio="manual",
+                              bypass_gate=True) is True
+        w.skin._move_name = name
+        w.cross_t = 0.0
+        w.prev_key = None
+        img = w.grab().toImage()
+        cols = [x for x in range(img.width())
+                if any(img.pixelColor(x, y).alpha() > 16
+                       for y in range(0, img.height(), 4))]
+        assert cols, "宽幅动作渲染为空白？"
+        assert min(cols) >= 1 and max(cols) <= img.width() - 2, \
+            (name, min(cols), max(cols), img.width())
+    finally:
+        w.emote, w.emote_t, w._emote_prio = None, 0.0, 0
+        _reset_motion_state(w)
+        w._bind_skin(old_char)
+        w.cfg["character"] = old_char
+        w._recompute_width()
+
+
+@check("multipet: 尺寸往返落回档位，非档位尺寸也必须有帧")
+def _():
+    from pet import multipet
+    w = CTX["win"]
+    # 1) 档位往返：px ↔ scale 不能掉档（之前 int() 截断会把 0.7 变成 237）
+    for label, scale, _px in multipet.SIZE_STEPS:
+        px = multipet.size_for(scale)
+        back = multipet.scale_for(px)
+        assert abs(back - scale) < 0.002, (label, back, scale)
+        assert abs(int(round(340 * back)) - int(round(340 * scale))) <= 1, label
+    # 2) 默认多宠尺寸 462px 不在档位上，但皮肤必须按实际高度建帧（否则整只隐形）
+    state = (w.character, w.scale, w.cur_h, w.pet_conf)
+    try:
+        for name in ("whale-girl", "fish", "dsh-pet"):
+            w.pet_conf = {"id": "probe", "size": 462}
+            w.scale = multipet.scale_for(462)
+            w.cur_h = int(round(340 * w.scale))
+            w._bind_skin(name)
+            w._recompute_width()
+            heights = w._skin_heights()
+            assert w.cur_h in heights, (name, w.cur_h, heights)
+            w.cross_t = 0.0
+            w.prev_key = None
+            w.emote, w.emote_t, w._emote_prio = None, 0.0, 0
+            img = w.grab().toImage()
+            cols = [x for x in range(0, img.width(), 2)
+                    if any(img.pixelColor(x, y).alpha() > 24
+                           for y in range(0, img.height(), 4))]
+            assert cols, (name, "非档位尺寸渲染为空白 → 帧表缺该高度")
+    finally:
+        w.pet_conf, w.scale, w.cur_h = state[3], state[1], state[2]
+        w._bind_skin(state[0])
+        w._recompute_width()
+
+
+@check("multipet: 位置热更新不拉回角落，且能落盘")
+def _():
+    from pet import multipet
+    w = CTX["win"]
+    saved_cfg_pets = w.cfg.get("pets")
+    saved_conf = w.pet_conf
+    saved_pos = (w.x(), w.y())
+    try:
+        row = {"id": "mp-probe", "name": "探针", "size": 423, "display": "both",
+               "position": {"corner": "top-left", "marginX": 40, "marginY": 40}}
+        w.cfg["pets"] = [dict(row)]
+        w.pet_id = "mp-probe"
+        w.apply_pet(multipet.instances(w.cfg)[0])
+        corner_pos = (w.x(), w.y())
+        # 拖到别处 -> 存盘 -> 再来一次热更新（模拟设置页保存/管理器 sync）
+        w.move(corner_pos[0] + 120, corner_pos[1] + 90)
+        dragged = (w.x(), w.y())
+        w._sync_pet_conf()
+        assert w.cfg["pets"][0].get("x") == dragged[0], w.cfg["pets"][0]
+        assert w.cfg["pets"][0].get("y") == dragged[1], w.cfg["pets"][0]
+        w.apply_pet(multipet.instances(w.cfg)[0])
+        assert (w.x(), w.y()) == dragged, ((w.x(), w.y()), dragged, "拖动位置被拉回")
+        # 改角落 -> 必须真的搬家（旧绝对坐标作废）
+        w.cfg["pets"][0]["position"] = {"corner": "bottom-right",
+                                         "marginX": 12, "marginY": 12}
+        w.apply_pet(multipet.instances(w.cfg)[0])
+        assert (w.x(), w.y()) != dragged, "改角落没生效"
+    finally:
+        if saved_cfg_pets is None:
+            w.cfg.pop("pets", None)
+        else:
+            w.cfg["pets"] = saved_cfg_pets
+        w.pet_id = "main"
+        w.pet_conf = saved_conf or {}
+        w.move(*saved_pos)
+
+
+@check("multipet: 碰撞驱动接开关，冲量写进真实飞行状态")
+def _():
+    from pet import multipet
+
+    class _Timer:
+        def __init__(self, active=True):
+            self.active = active
+
+        def isActive(self):
+            return self.active
+
+        def start(self, _ms):
+            self.active = True
+
+        def stop(self):
+            self.active = False
+
+    class _Win:
+        def __init__(self, box, vel, visible=True, flying=True, wall=None):
+            self._box = box
+            self.flight_velocity = vel
+            self._flight_timer = _Timer(flying)
+            self._flight = type("F", (), {"state": {"vx": vel[0], "vy": vel[1]}})()
+            self.pet_size = 423
+            self._visible = visible
+            self.impulses = []
+            self.shifts = []
+            self._pos = [box[0], box[1]]
+            self._wall = wall            # 可选：模拟屏边，位移被夹住
+
+        def isVisible(self):
+            return self._visible
+
+        def x(self):
+            return self._pos[0]
+
+        def y(self):
+            return self._pos[1]
+
+        def _body_box(self):
+            l, t, r, b = self._box
+            w, h = r - l, b - t
+            return (self._pos[0], self._pos[1],
+                    self._pos[0] + w, self._pos[1] + h)
+
+        def shift_body(self, dx, dy):
+            nx = self._pos[0] + dx
+            ny = self._pos[1] + dy
+            if self._wall is not None:
+                nx = min(nx, self._wall[0])
+                ny = min(ny, self._wall[1])
+            moved = ((nx - self._pos[0]) ** 2 + (ny - self._pos[1]) ** 2) ** 0.5
+            self._pos = [nx, ny]
+            self.shifts.append((dx, dy))
+            return moved
+
+        def apply_impulse(self, vx, vy):
+            self.impulses.append((vx, vy))
+            self._flight.state["vx"] = vx
+            self._flight.state["vy"] = vy
+
+    def _mgr(collision, a, b):
+        mgr = multipet.PetManager(lambda pet, tray: None,
+                                  {"physics": {"petCollision": collision}})
+        mgr._wins = {"a": a, "b": b}
+        mgr._order = ["a", "b"]
+        return mgr
+
+    fa = _Win((0, 0, 200, 200), (100.0, 0.0))
+    fb = _Win((50, 0, 250, 200), (-100.0, 0.0))
+    _mgr(False, fa, fb).tick()
+    assert not fa.impulses and not fb.impulses, "开关关闭时不该有碰撞"
+
+    _mgr(True, fa, fb).tick()
+    assert fa.impulses and fb.impulses, "开关打开后应互相弹开"
+    assert fa._flight.state["vx"] == fa.impulses[-1][0], "冲量没写进 Flight 状态"
+    assert fb._flight.state["vx"] == fb.impulses[-1][0]
+
+    # 两只都落地（无 Flight）但重叠：必须被位移分开，否则会卡死在角落
+    fc = _Win((0, 0, 200, 200), (0.0, 0.0), flying=False)
+    fd = _Win((50, 0, 250, 200), (0.0, 0.0), flying=False)
+    _mgr(True, fc, fd).tick()
+    assert fc.shifts and fd.shifts, "静止重叠也必须分离（卡死修复）"
+    assert fc.shifts[-1][0] < 0 < fd.shifts[-1][0], (fc.shifts, fd.shifts)
+    assert not fc.impulses and not fd.impulses, "静止贴着不该莫名起飞"
+
+    # 大重叠 + 一侧贴墙：逐帧分离必须收敛到零重叠，而且不反复抽动
+    ga = _Win((0, 0, 200, 200), (0.0, 0.0), flying=False)
+    gb = _Win((0, 0, 200, 200), (0.0, 0.0), flying=False, wall=(200, 200))
+    gb._pos = [20, 0]
+    mgr = _mgr(True, ga, gb)
+    for _i in range(120):
+        mgr.tick()
+        ra, rb = ga._body_box(), gb._body_box()
+        if ra[2] <= rb[0]:
+            break
+    assert ra[2] <= rb[0], "角落重叠 180px 必须分得开：%s %s" % (ra, rb)
+    n = len(ga.shifts)
+    mgr.tick()
+    mgr.tick()
+    assert len(ga.shifts) == n, "分开后就该停手，不能一直抽动：%s" % len(ga.shifts)
+
+    # 实时速度取 Flight 积分状态：起了个头的 flight_velocity 会残留，
+    # 拿它当碰撞输入就是「同一记冲量反复复用」，两只越撞越快
+    st = _Win((0, 0, 200, 200), (4000.0, 0.0))
+    st._flight.state = {"vx": 20.0, "vy": 0.0}
+    assert multipet.PetManager._vel(st) == (20.0, 0.0), "碰撞必须用实时速度"
+    landed = _Win((0, 0, 200, 200), (4000.0, 0.0), flying=False)
+    assert multipet.PetManager._vel(landed) == (0.0, 0.0), "落地的就该算静止"
+
+    # 同一对弹过一次就进冷却，不能每帧重复注能
+    hm = _mgr(True, _Win((0, 0, 200, 200), (100.0, 0.0)),
+              _Win((50, 0, 250, 200), (-100.0, 0.0)))
+    wa, wb = hm.windows()
+    hm.tick()
+    assert wa.impulses, "相向而行应弹开"
+    assert hm._hit_ready(wa, wb) is False, "冷却期内不得再弹一次"
+
+    # 真实窗口：apply_impulse 必须改 Flight.state
+    w = CTX["win"]
+    saved = (getattr(w, "_flight", None), getattr(w, "flight_velocity", (0.0, 0.0)),
+             getattr(w, "_flight_timer", None))
+    try:
+        w._start_flight(120.0, -60.0)
+        assert w.apply_impulse(10.0, 20.0) is True
+        assert w._flight.state["vx"] == 10.0 and w._flight.state["vy"] == 20.0
+        assert w.flight_velocity == (10.0, 20.0)
+        # 落地后（Flight 已停）也要能被撞开
+        w._stop_move_drivers()
+        assert getattr(w, "_flight", None) is None
+        assert w.apply_impulse(80.0, 0.0) is True, "静止时必须能起一次轻推"
+        assert w._flight is not None
+        w._stop_move_drivers()          # 再清掉飞行，才测得到「过小不折腾」
+        assert w.apply_impulse(5.0, 0.0) is False, "过小的推不应折腾"
+    finally:
+        w._stop_move_drivers()
+        w._flight, w.flight_velocity, w._flight_timer = saved
+
+
+@check("multipet: 清单包含全部宠物且信息可读")
+def _():
+    from pet import multipet
+    cfg = {"pets": [
+        {"id": "a", "name": "阿甲", "size": 423, "display": "both",
+         "position": {"corner": "top-right", "marginX": 24, "marginY": 100}},
+        {"id": "b", "name": "小乙", "size": 462, "display": "none",
+         "position": {"corner": "bottom-left", "marginX": 10, "marginY": 20}},
+    ], "physics": {"petCollision": False}}
+    mgr = multipet.PetManager(lambda pet, tray: None, cfg)
+    rows = mgr.overview()
+    assert [r["id"] for r in rows] == ["a", "b"], rows
+    assert rows[1]["display"] == "none"
+    assert "隐藏" in rows[1]["detail"], rows[1]
+    assert "中" in rows[0]["detail"], rows[0]
+    assert all(r["alive"] is False for r in rows)
+    assert mgr.roster() == [], "没有窗口时菜单清单应为空"
+    assert multipet.size_label(423).startswith("中")
+    assert multipet.size_label(462).startswith("自定义")
+    assert multipet.next_free_corner([{"position": {"corner": "top-right"}}]) \
+        != "top-right"
+
+
+@check("physics: 重叠分离方向 + 飞行边界不越屏幕底边")
+def _():
+    from pet import physics as P
+    # 重叠更浅的轴分离：x 重叠 10 / y 重叠 90 → 沿 x 分开，a 左 b 右
+    sep = P.separate((0, 0, 100, 100), (90, 10, 190, 110), 400, 400)
+    assert sep is not None
+    assert sep[0][0] < 0 < sep[1][0], sep
+    assert sep[0][1] == 0 and sep[1][1] == 0, sep
+    assert P.separate((0, 0, 100, 100), (200, 0, 300, 100), 400, 400) is None
+    # 轻的退得多
+    light = P.separate((0, 0, 100, 100), (90, 10, 190, 110), 300, 600)
+    assert abs(light[0][0]) > abs(light[1][0]), light
+    # 单帧位移封顶：大重叠靠逐帧收敛，不靠瞬移
+    big = P.separate((0, 0, 200, 200), (20, 0, 220, 200), 423, 423)
+    assert abs(big[0][0]) + abs(big[1][0]) <= P.PET_SEPARATE_MAX_PX + 0.001, big
+    assert P.separate_axis((0, 0, 100, 100), (90, 10, 190, 110)) == 0
+    assert P.separate_axis((0, 0, 100, 100), (10, 90, 110, 190)) == 1
+
+    # 撞后速度封顶：两只贴着逐帧重算不能越撞越快
+    fast = P.collide({"x": 0.0, "y": 0.0, "vx": 6000.0, "vy": 0.0},
+                     {"x": 50.0, "y": 0.0, "vx": 0.0, "vy": 0.0}, 423, 423)
+    assert fast is not None
+    assert max(abs(fast[0]["vx"]), abs(fast[1]["vx"])) <= P.PET_IMPACT_MAX_SPEED + 0.001, fast
+
+    # 真实窗口：向下猛甩，收尾时本体底不得越过屏幕底（否则只剩一截）
+    w = CTX["win"]
+    saved = (getattr(w, "_flight", None), getattr(w, "flight_velocity", (0.0, 0.0)),
+             getattr(w, "_flight_timer", None))
+    try:
+        area = w._api_area()
+        w._start_flight(0.0, 4200.0)
+        for _i in range(900):
+            st = w._flight.step(1.0 / 60.0)
+            w.move(int(st["x"]), int(st["y"]))
+            if w._flight.done:
+                break
+        box = w._body_box()
+        assert box[3] <= area[3] + 1, (box[3], area[3], "本体沉出屏幕底")
+        assert box[1] >= area[1] - 1, (box[1], area[1])
+    finally:
+        w._stop_move_drivers()
+        w._flight, w.flight_velocity, w._flight_timer = saved
 
 
 # ---------------------------------------------------------------- 运行器

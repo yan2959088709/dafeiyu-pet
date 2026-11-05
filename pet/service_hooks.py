@@ -21,6 +21,7 @@ from pet import motion_engine
 from pet import physics
 
 NO_IMAGE_MSG = "当前模式不支持图片（缺少附件服务）"
+PUSH_MIN_SPEED = 30.0     # 碰撞轻推的最小速度：低于它不折腾（px/s）
 
 
 class ServiceHooksMixin:
@@ -135,15 +136,47 @@ class ServiceHooksMixin:
         return any(isinstance(k, tuple) and k[0] == name for k in frames)
 
     # ------------------------------------------------------------ 定位
+    def apply_impulse(self, vx, vy):
+        """碰撞冲量：写进正在飞的 Flight；已落地的宠物也要能被推开。
+
+        每条宠物的飞行一旦结束，Flight 就没了；如果只写 `flight_velocity`，
+        两只贴在一起落地的宠物就再也没人处理——表现就是「卡死在角落」。
+        所以这里没有 Flight 时补一个轻推（起一次短飞，摩擦自然收尾）。
+        """
+        vx, vy = float(vx), float(vy)
+        self.flight_velocity = (vx, vy)
+        flight = getattr(self, "_flight", None)
+        timer = getattr(self, "_flight_timer", None)
+        if flight is not None and timer is not None and timer.isActive():
+            # 只往「还在跑」的飞行里写：落定后的 Flight 是残留对象，写进去没人读
+            try:
+                flight.state["vx"] = vx
+                flight.state["vy"] = vy
+                return True
+            except Exception:
+                return False
+        if math.hypot(vx, vy) < PUSH_MIN_SPEED:
+            return False
+        try:
+            self._start_flight(vx, vy)
+            return True
+        except Exception:
+            return False
+
     def _api_position(self, x, y, mode, duration_ms):
         size = self._api_size()
         area = self._api_area()
         bx, by = geometry.center_to_box(x, y, size, area)
         bx, by = geometry.clamp_reachable(bx, by, size, area)
+        # 接口定位独占坐标：走位与另一个 16ms 驱动都得让位（否则两边互拉）
+        if getattr(self, "_walk", None) is not None:
+            self._stop_walk()
         if mode == "instant" or not duration_ms:
+            self._stop_move_drivers()
             self.move(int(bx), int(by))
             self.ensure_on_screens()
             return (bx, by)
+        self._stop_move_drivers(keep="follow")
         self._follow = motion_engine.PositionFollow(self.x(), self.y())
         self._follow.set(bx, by, mode, int(duration_ms), now_ms=int(time.time() * 1000))
         self._ensure_follow_timer()
@@ -176,8 +209,17 @@ class ServiceHooksMixin:
 
     def _start_flight(self, vx, vy):
         """启动一次物理飞行（接口抛掷与鼠标甩出共用）。"""
+        self._stop_move_drivers(keep="flight")
+        if getattr(self, "_walk", None) is not None:
+            self._stop_walk()              # 飞行独占坐标：走位让位
         area = self._api_area()
-        bounds = geometry.throw_bounds(self.x(), self.y(), self._api_size(), area)
+        # 边界按「本体盒」：窗口比本体高（头顶气泡区）、又比本体宽（画布加宽），
+        # 拿窗口矩形当边界会让宠物沉到屏幕下方，只剩上面一截
+        box = self._body_box()
+        body = (box[0] - self.x(), box[1] - self.y(),
+                box[2] - self.x(), box[3] - self.y())
+        side = geometry.SIDE_ALLOW_RATIO * max(1.0, self._body_w())
+        bounds = geometry.flight_bounds(area, body, side)
         self._flight = motion_engine.Flight(self.x(), self.y(), float(vx), float(vy),
                                             bounds, self.cfg.get("physics"))
         self.flight_velocity = (float(vx), float(vy))
@@ -198,7 +240,19 @@ class ServiceHooksMixin:
         if flight.done:
             timer.stop()
             self.flight_velocity = (0.0, 0.0)
-            self.ensure_on_screens()
+            # 落地时按「本体」夹回屏内：飞行中给过 side_allow 的撞墙余量，
+            # 可能刚好停在屏外一点（看起来就是「只剩一瓣」）
+            snap = getattr(self, "snap_into_screen", None)
+            if callable(snap):
+                snap()
+            else:
+                self.ensure_on_screens()
+            persist = getattr(self, "_persist_position", None)
+            if callable(persist):
+                try:
+                    persist()          # 落地后记住落点，重启不会回角落
+                except Exception:
+                    pass
 
     def _api_preempt(self):
         self._api_clear_bubble()

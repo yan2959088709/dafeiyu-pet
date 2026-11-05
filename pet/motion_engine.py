@@ -14,6 +14,8 @@ from pet import physics
 FALLBACK_DURATION_SEC = 10.09
 MIN_WALK_PX = 24
 WALK_STRIDE = 3.0
+SEEK_FALLBACK_SPEED = 360.0   # 没有行走素材的皮肤：沿用跟随速度量级
+SEEK_TRAVEL_MAX_SEC = 12.0    # 取点走位最长行进时间：再远就提速，不让人干等
 
 
 def walk_profile(params, clip, size, stride=WALK_STRIDE):
@@ -74,6 +76,48 @@ def wander_target(cx, size, area, moves):
     duration = float(d.get("durationSec") or 0) or FALLBACK_DURATION_SEC
     _ = (lead, tail)
     return (target, duration, direction)
+
+
+def seek_travel(distance, profile):
+    """取点走位的行进时长：用「所选动作自己的步速」，只在过长时提速。
+
+    步速 = 该动作的中位距离 / 行进时长。距离落在动作区间内时，行进时间
+    天然接近该素材一轮步频，动画与位移节奏对得上；只有距离远超区间时
+    才线性提速，避免为了等脚踩完而干等十几秒。
+    返回 (行进秒数, 实际步速)。
+    """
+    speed = float((profile or {}).get("speed") or 0.0) or SEEK_FALLBACK_SPEED
+    travel = max(0.4, float(distance) / speed)
+    if travel > SEEK_TRAVEL_MAX_SEC:
+        travel = SEEK_TRAVEL_MAX_SEC
+        speed = max(1.0, float(distance) / travel)
+    return travel, speed
+
+
+def move_band(cand, size, stride=WALK_STRIDE):
+    """一段移动动作能覆盖的距离区间（屏幕像素，已按体型换算与放大）。"""
+    p = walk_profile((cand or {}).get("params"), (cand or {}).get("clip"), size,
+                     stride)
+    return (p["min"], p["max"])
+
+
+def select_move(cands, distance, size, stride=WALK_STRIDE):
+    """按距离挑一段移动动作：短→漂浮 / 中→螃蟹 / 长→奔跑。
+
+    优先选「区间包含该距离」的动作，同包含时取区间更窄的（语义更贴）；
+    没人包含时取缺口最小的。完全确定的结果：同分时再比中点距离。
+    """
+    best = None
+    for cand in cands or []:
+        lo, hi = move_band(cand, size, stride)
+        if hi < lo:
+            lo, hi = hi, lo
+        gap = 0.0 if lo <= distance <= hi else min(abs(distance - lo),
+                                                 abs(distance - hi))
+        key = (round(gap, 6), round(hi - lo, 6), round(abs((lo + hi) / 2.0 - distance), 6))
+        if best is None or key < best[0]:
+            best = (key, cand)
+    return best[1] if best else None
 
 
 def _smoothstep(t):

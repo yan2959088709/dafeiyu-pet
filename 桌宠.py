@@ -43,7 +43,8 @@ from pet.petservice import PetService                               # noqa: E402
 from pet.apiserver import ApiServer, PREFIX as API_PREFIX           # noqa: E402
 from pet import runtime_state as pet_runtime                        # noqa: E402
 from pet.service_hooks import ServiceHooksMixin                     # noqa: E402
-from pet.desktop import DesktopMixin                               # noqa: E402
+from pet.desktop import DesktopMixin                                 # noqa: E402
+from pet.pointmove import PointPickMixin                              # noqa: E402
 from pet import lunar_table as pet_lunar                           # noqa: E402
 from pet import time_context as pet_time                           # noqa: E402
 from pet.workstatus_ui import WorkStatusMixin                      # noqa: E402
@@ -1035,9 +1036,17 @@ class FoodPanel(QWidget):
         self.raise_()
 
 
+def _pos_key(pos):
+    """位置配置的可比较形式：判断角落/边距是不是真的变了。"""
+    if not isinstance(pos, dict):
+        return None
+    return (pos.get("corner"), pos.get("marginX"), pos.get("marginY"))
+
+
 class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
                 GadgetMixin, BalanceMixin, MenuMixin, FactsPanelMixin, SoundMixin,
-                ServiceHooksMixin, DesktopMixin, WorkStatusMixin, QWidget):
+                ServiceHooksMixin, DesktopMixin, PointPickMixin, WorkStatusMixin,
+                QWidget):
     def __init__(self, pet=None, with_tray=True):
         self.pet_conf = pet or {}
         self.pet_id = str(self.pet_conf.get("id") or "main")
@@ -1059,10 +1068,11 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             str(self.cfg.get("pet_name", "")).strip()   # 可编辑名字（未配置回退默认）
 
         # ---- 精灵加载：委托皮肤注册表（每套皮肤独立模块实现帧加载）----
+        # 高度先定下来：皮肤要按实际高度建帧，否则非档位尺寸会一帧都取不到
+        self.cur_h = int(round(340 * self.scale))
         self._bind_skin(self.character)
         self.setWindowTitle(f"{self._pet_display_name()}桌宠")   # 需在绑定皮肤后取 display_name
 
-        self.cur_h = int(340 * self.scale)
         self.pet_size = int(self.cur_h * 16 / 9)
         self.win_mx = 0            # 由 _recompute_width 按布局余量派生
         self._recompute_width()
@@ -1228,12 +1238,17 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             self.tray.show()
         self._update_tray_tooltip()
 
-        x, y = self.cfg.get("x"), self.cfg.get("y")
-        if x is None or y is None:
-            screen = QApplication.primaryScreen().availableGeometry()
-            x = screen.right() - self.width() - 80
-            y = screen.bottom() - self.height() - 60
-        self.move(int(x), int(y))
+        if not self.pet_conf:
+            # 单宠：沿用全局 x/y（没存过就落右下角）。
+            # 多宠不能走这里：每只自己的 corner/绝对坐标已经在上面的
+            # _apply_pet_geometry 算过了，这里再 move 一次会把它们全部覆盖，
+            # 表现为「多宠位置乱、重启回角落」。
+            x, y = self.cfg.get("x"), self.cfg.get("y")
+            if x is None or y is None:
+                screen = QApplication.primaryScreen().availableGeometry()
+                x = screen.right() - self.width() - 80
+                y = screen.bottom() - self.height() - 60
+            self.move(int(x), int(y))
         self.show()
         self.snap_into_screen()
         if self.skin.kind == "gadget":
@@ -1248,6 +1263,29 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
 
         QTimer.singleShot(3500, self._startup_greet)
 
+    def _skin_heights(self):
+        """皮肤需要预载的高度：标准档位 ∪ 当前实际高度。
+
+        whale-girl / fish / deepseek-girl / dsh-whale 的 `load()` 只给传入的高度
+        建帧；若 cur_h 落在档位之外（自定义尺寸、或 px→scale 往返取整差 1px），
+        它们就一帧都取不到 → 宠物凭空消失/闪烁。这里把当前高度一并传进去。
+        """
+        heights = {int(round(340 * m)) for m in SIZE_LEVELS.values()}
+        cur = int(getattr(self, "cur_h", 0) or 0)
+        if cur > 0:
+            heights.add(cur)
+        return sorted(heights)
+
+    def _ensure_height_frames(self):
+        """尺寸变化后给新高度补帧（按高度预载的皮肤不会自动补）。"""
+        loader = getattr(self.skin, "load", None)
+        if not callable(loader):
+            return
+        try:
+            loader(self._skin_heights())
+        except Exception:
+            pass
+
     def _bind_skin(self, name):
         """绑定皮肤：实例化皮肤注册表皮肤模块并加载素材；维护兼容引用 sprites/wg_frames。
 
@@ -1255,9 +1293,11 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         """
         self.character = name
         self.skin = load_skin(name)
-        self.skin.load(sorted({int(340 * m) for m in SIZE_LEVELS.values()}))
+        self.skin.load(self._skin_heights())
         self._auto_next_at = 0
         self._emote_queue = []
+        # 走位/分段表帧号都是上一套皮肤的，必须清掉（否则新皮肤拿来索引会越界）
+        self._reset_motion_for_skin()
         self.sprites = self.skin.sprites      # 兼容引用：单帧型（fish / dsh-whale）
         self.wg_frames = self.skin.frames     # 兼容引用：多帧型（whale-girl）
         self.MARGIN = MARGIN                  # 供皮肤模块访问（吸附几何对齐）
@@ -1398,13 +1438,13 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         Qt 界面只能在主线程更新，所以后台一律入队、这里统一消费。
         """
         if self._say_queue:
-            for text in list(self._say_queue):
+            # 整体换出新列表再消费：直接 list()+clear() 会丢掉“清空前刚追加”的那条
+            queued, self._say_queue = self._say_queue, []
+            for text in queued:
                 self.say(text)
-            self._say_queue.clear()
 
         if self._stream_queue:
-            items = list(self._stream_queue)
-            self._stream_queue.clear()
+            items, self._stream_queue = self._stream_queue, []
             for piece in items:
                 if self._stream_accum is None:
                     self._stream_accum = ""
@@ -1414,8 +1454,7 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
                 self.chat_panel.stream_delta(stickers.strip_marks(self._stream_accum))
 
         if self._chat_queue:
-            items = list(self._chat_queue)
-            self._chat_queue.clear()
+            items, self._chat_queue = self._chat_queue, []
             for item in items:
                 text = item[0]
                 save = item[1] if len(item) > 1 else True
@@ -1501,10 +1540,25 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         widths = self.skin.width_for(self.cur_h)
         if not widths:
             widths = [self.cur_h]
-        self.win_w = max(widths) + self.win_mx * 2
+        self.body_w = max(widths)                        # 判定主体宽（皮肤自己封顶）
+        self.layout_w = self.body_w + self.win_mx * 2    # 气泡/边距的基准宽（稳定，不随画布变）
+        # 画布宽：最宽的那段动作也要整幅装下，否则特效动作两侧被窗口裁掉
+        need = 0
+        canvas = getattr(self.skin, "canvas_width_for", None)
+        if callable(canvas):
+            try:
+                need = int(canvas(self.cur_h) or 0)
+            except Exception:
+                need = 0
+        old_w = float(self.width() or 0)
+        self.canvas_w = max(self.layout_w, need + self.win_mx * 2)
+        self.win_w = int(self.canvas_w)
         self.setFixedSize(self.win_w,
                           int(self.cur_h + self._dsh_top_h()
                               + w["margin"] * 2 + w["bottom_pad"]))
+        # 画布是从中心长出来的：保持窗口中心不动，宠物不会因为加宽横移
+        if old_w > 0 and int(round(old_w)) != self.win_w:
+            self.move(int(self.x() - (self.win_w - old_w) / 2.0), self.y())
 
     def _resolve_scale(self):
         """每只宠物按自己的 size(px) 换算缩放；未声明 pets 时沿用全局档位。"""
@@ -1515,18 +1569,29 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         size = self.cfg.get("size", 0.7)
         if size not in SIZE_LEVELS.values():
             size = min(SIZE_LEVELS.values(), key=lambda v: abs(v - size))
+        self.cur_h = int(round(340 * size))
         self.cfg["size"] = size
         return size
 
-    def _apply_pet_geometry(self):
-        """按 pets[] 的 corner/margin 摆位（夹进工作区）。"""
-        pos = (self.pet_conf or {}).get("position") or {}
-        scr = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-        area = (scr.left(), scr.top(), scr.right(), scr.bottom())
-        x, y = pet_multipet.corner_xy(pos.get("corner", "top-right"),
-                                      pos.get("marginX", 24), pos.get("marginY", 100),
-                                      self.width(), self.height(), area)
-        self.move(int(x), int(y))
+    def _apply_pet_geometry(self, force=True, use_absolute=True):
+        """按 pets[] 的位置摆位：优先绝对坐标 x/y，否则按 corner/margin。
+
+        force=False 时位置没变就不动（不动用户拖好的位置）。
+        """
+        conf = self.pet_conf or {}
+        x = conf.get("x") if use_absolute else None
+        y = conf.get("y") if use_absolute else None
+        if x is None or y is None:
+            pos = conf.get("position") or {}
+            scr = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+            area = (scr.left(), scr.top(), scr.right(), scr.bottom())
+            x, y = pet_multipet.corner_xy(pos.get("corner", "top-right"),
+                                         pos.get("marginX", 24), pos.get("marginY", 100),
+                                         self.width(), self.height(), area)
+        x, y = int(x), int(y)
+        if not force and abs(x - self.x()) <= 1 and abs(y - self.y()) <= 1:
+            return
+        self.move(x, y)
 
     def _sync_pet_conf(self):
         """把本窗口的尺寸/名字/位置写回 cfg['pets']，供保存时落盘。"""
@@ -1543,26 +1608,52 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             pos = conf.get("position")
             if isinstance(pos, dict):
                 row["position"] = dict(pos)
+            # 绝对坐标：多宠拖到的位置也要能记住（不然重启就回角落了）
+            row["x"] = int(self.x())
+            row["y"] = int(self.y())
             break
 
+    def _persist_position(self):
+        """记住当前落点：单宠写 cfg.x/y，多宠由 _sync_pet_conf 写进 pets[].x/y。"""
+        self.cfg["x"], self.cfg["y"] = int(self.x()), int(self.y())
+        self._save_cfg()
+
     def apply_pet(self, pet):
-        """配置热更新：换名字/尺寸/位置（同一 id 不重建窗口）。"""
+        """配置热更新：换名字/尺寸/位置（同一 id 不重建窗口）。
+
+        位置只在「尺寸变了」或「配置里的角落变了」时才重算，否则保留用户拖到
+        的位置——之前每次 sync 都无条件重摆，拖好的宠物会被拉回角落。
+        """
+        old_conf = self.pet_conf or {}
         self.pet_conf = pet or {}
         self.pet_id = str(self.pet_conf.get("id") or self.pet_id)
         name = str(self.pet_conf.get("name") or "").strip()
         if name:
             self.pet_name = name
         scale = pet_multipet.scale_for(self.pet_conf.get("size"))
+        resized = False
         if scale and abs(scale - self.scale) > 1e-6:
             self.scale = scale
-            self.cur_h = int(340 * scale)
+            self.cur_h = int(round(340 * scale))
             self.pet_size = int(self.cur_h * 16 / 9)
             self.prev_key = None
+            self._ensure_height_frames()   # 新档位必须有帧，否则整只隐形
             self._recompute_width()
             self._apply_icon()
             if self.skin.kind == "gadget":
                 self.skin.on_resize(self)
-        self._apply_pet_geometry()
+            resized = True
+        pos_changed = (_pos_key(old_conf.get("position")) !=
+                       _pos_key(self.pet_conf.get("position")))
+        if pos_changed:
+            # 用户改的是角落：旧的绝对坐标作废，按新角落重摆
+            self.pet_conf.pop("x", None)
+            self.pet_conf.pop("y", None)
+            self._apply_pet_geometry(force=True, use_absolute=False)
+        elif resized or self.pet_conf.get("x") is not None:
+            # 尺寸变了（角落锚点依赖窗口大小）或已有绝对坐标：按坐标摆
+            self._apply_pet_geometry(force=resized)
+        # 其余情况：配置没动位置，保持用户拖到的地方
         self.setWindowTitle(f"{self._pet_display_name()}桌宠")
 
     # ---------- 鼠标事件 ----------
@@ -1638,6 +1729,7 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
                         return
                     # 原地放下：夹进可达区（修「拖出视口松手后失联」）
                     self._clamp_after_place()
+                    self._persist_position()
                     self._set_dir("down", 1)
                     self.rest_until = self.t * TICK + random.randint(6000, 14000)
                     self._do_squash(0.82)
@@ -1739,7 +1831,14 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         if self.skin.kind != "gadget" and \
                 self.drag_state.just_dragged(int(time.time() * 1000)):
             return
-        self._menu.exec(e.globalPos())
+        # 菜单关闭后：选中菜单项只执行菜单项；点在菜单外则是「走到这里」
+        self._pick_arm(self._menu)
+        try:
+            action = self._menu.exec(e.globalPos())
+        finally:
+            dest = self._pick_release()
+        if action is None and dest is not None:
+            self._walk_to_point(dest.x(), dest.y())
 
     def _clamp_after_place(self):
         """松手/移动后把窗口夹进可达区（命中区与屏幕边缘各留 24px）。"""
@@ -1755,8 +1854,7 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             if getattr(self, "_tooltip", None) is None:
                 from pet.tooltip_ui import PetTooltip
                 self._tooltip = PetTooltip()
-            box = (self.x(), self.y(), self.x() + self.width(),
-                   self.y() + self.height())
+            box = self._body_box()      # 气泡贴本体头顶，不贴容器顶部
             self._tooltip.show_for(self._pet_display_name(), box,
                                    self.pet_size or self.win_w, self._api_area())
         except Exception:

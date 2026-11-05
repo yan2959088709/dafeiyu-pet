@@ -316,11 +316,12 @@ class SettingsDialog(QDialog):
 
     # ---------------------------------------------------------- 宠物列表
     def _load_pets(self):
+        from pet import multipet
         self.list_pets.blockSignals(True)
         self.list_pets.clear()
         for pet in self._pets:
-            self.list_pets.addItem("%s (%spx)" % (pet.get("name") or pet.get("id"),
-                                                  pet.get("size") or 0))
+            self.list_pets.addItem("%s · %s" % (pet.get("name") or pet.get("id"),
+                                               multipet.size_label(pet.get("size"))))
         self.list_pets.blockSignals(False)
         if self._pets:
             self.list_pets.setCurrentRow(0)
@@ -364,22 +365,25 @@ class SettingsDialog(QDialog):
         self.list_pets.blockSignals(True)
         item = self.list_pets.item(index)
         if item is not None:
-            item.setText("%s (%spx)" % (pet.get("name") or pet.get("id"),
-                                        pet.get("size")))
+            from pet import multipet
+            item.setText("%s · %s" % (pet.get("name") or pet.get("id"),
+                                      multipet.size_label(pet.get("size"))))
         self.list_pets.blockSignals(False)
 
     def _new_pet(self):
+        from pet import multipet
         self._flush_pet()
         used = {str(p.get("id")) for p in self._pets}
         n = len(self._pets) + 1
         while "pet-%d" % n in used:
             n += 1
-        self._pets.append({"id": "pet-%d" % n, "name": "", "size": 462,
+        # 新宠默认：占一个还没人用的角落 + 标准中档尺寸（避免几只完全重叠/尺寸落在档位外）
+        self._pets.append({"id": "pet-%d" % n, "name": "", "size": 423,
                            "balanceEnabled": True, "whisperEnabled": False,
                            "workStatusEnabled": True, "fixedEnabled": False,
                            "display": "desktop",
-                           "position": {"corner": "top-right", "marginX": 24,
-                                        "marginY": 100}})
+                           "position": {"corner": multipet.next_free_corner(self._pets),
+                                        "marginX": 24, "marginY": 100}})
         self._load_pets()
         self.list_pets.setCurrentRow(len(self._pets) - 1)
 
@@ -458,6 +462,12 @@ class SettingsDialog(QDialog):
             mgr = mgr or getattr(QApplication.instance(), "_pet_manager", None)
         except Exception:
             pass
+        if mgr is not None:
+            # 先让管理器吃下新配置（窗口集合/碰撞驱动都要跟着变），再热更新各窗口
+            try:
+                mgr.sync(self.cfg)
+            except Exception:
+                pass
         for pet in multipet.instances(self.cfg):
             if mgr is not None:
                 win = mgr.by_id(pet["id"])

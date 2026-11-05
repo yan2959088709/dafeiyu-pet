@@ -50,6 +50,42 @@ def hit_box_abs(left, top, size):
     return (left + hb[0], top + hb[1], left + hb[2], top + hb[3])
 
 
+def body_box(win_w, cur_h, body_w, top_pad, margin):
+    """桌宠本体（素材基准实绘区）在窗口内的矩形 (l, t, r, b)。
+
+    与 paintEvent 的绘制公式同源：素材水平居中（cx = win_w / 2），底边
+    = top_pad + margin + cur_h。窗口两侧余量与头顶气泡区都不属于本体——
+    判定一律用本体盒，别用窗口矩形，否则「容器进范围」会被当成「本体到位」。
+    """
+    x0 = (float(win_w) - float(body_w)) / 2.0
+    y0 = float(top_pad) + float(margin)
+    return (x0, y0, x0 + float(body_w), y0 + float(cur_h))
+
+
+def body_box_abs(left, top, win_w, cur_h, body_w, top_pad, margin):
+    """窗口在 (left, top) 时，本体在屏幕坐标系里的矩形。"""
+    b = body_box(win_w, cur_h, body_w, top_pad, margin)
+    return (left + b[0], top + b[1], left + b[2], top + b[3])
+
+
+def body_center_abs(left, top, win_w, cur_h, body_w, top_pad, margin):
+    """本体的中心点（屏幕坐标）：跟随/到达/取点都以它为准。"""
+    b = body_box_abs(left, top, win_w, cur_h, body_w, top_pad, margin)
+    return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+
+def window_for_body_center(cx, cy, win_w, cur_h, body_w, top_pad, margin):
+    """本体中心对准 (cx, cy) 时窗口左上角该在哪（body_center_abs 的逆运算）。"""
+    b = body_box(win_w, cur_h, body_w, top_pad, margin)
+    return (cx - (b[0] + b[2]) / 2.0, cy - (b[1] + b[3]) / 2.0)
+
+
+def near_body(cursor, box, pad):
+    """光标是否落在本体盒外扩 pad 的范围内（跟随模式的「够近了」判定）。"""
+    return (box[0] - pad <= cursor[0] <= box[2] + pad and
+            box[1] - pad <= cursor[1] <= box[3] + pad)
+
+
 def center_to_box(rx, ry, size, area):
     """归一化中心 (0~1) → 窗口左上角坐标。"""
     m = metrics(size)
@@ -119,13 +155,18 @@ def ensure_visible(left, top, size, areas):
     return clamp_reachable(left, top, size, best)
 
 
-def throw_bounds(left, top, size, area):
-    """抛掷积分用的窗口包围盒（左右各放宽 side_allow，撞墙才反弹）。"""
-    m = metrics(size)
-    return (area[0] - m["side_allow"],
-            area[2] - m["win_w"] + m["side_allow"],
+def flight_bounds(area, body, side_allow=0.0):
+    """抛掷积分的窗口包围盒（窗口左上角坐标）。
+
+    边界要按「本体盒」算：窗口比本体宽（画布加宽）、头顶还压着气泡区，
+    用窗口矩形当边界会让宠物整体沉到屏幕下方、只剩一小截；本体 box 是
+    本体在窗口内的矩形 (l, t, r, b)。横向给 side_allow 的放宽是为了撞墙手感。
+    """
+    bl, _bt, br, bb = body
+    return (area[0] - bl - side_allow,
+            area[2] - br + side_allow,
             area[1],
-            area[3] - m["win_h"])
+            area[3] - bb)
 
 
 def dist_scale(size):

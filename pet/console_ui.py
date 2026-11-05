@@ -422,8 +422,9 @@ class ConsoleWindow(QMainWindow):
     def _build_pets_tab(self):
         page = QWidget()
         box = QVBoxLayout(page)
-        self.pet_table = QTableWidget(0, 4)
-        self.pet_table.setHorizontalHeaderLabels(["id", "名字", "显示", "宽度(px)"])
+        self.pet_table = QTableWidget(0, 7)
+        self.pet_table.setHorizontalHeaderLabels(
+            ["id", "名字", "形象", "档位", "显示", "位置", "状态"])
         self.pet_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.pet_table.horizontalHeader().setStretchLastSection(True)
         box.addWidget(self.pet_table, 1)
@@ -637,12 +638,33 @@ class ConsoleWindow(QMainWindow):
 
     def _refresh_pets(self):
         from pet import multipet
+        from PySide6.QtWidgets import QApplication
         rows = multipet.instances(self.cfg)
+        mgr = getattr(QApplication.instance(), "_pet_manager", None)
         self.pet_table.setRowCount(len(rows))
         for i, pet in enumerate(rows):
-            for j, value in enumerate((pet["id"], pet.get("name") or "",
-                                       pet.get("display") or "both",
-                                       str(int(pet.get("size") or 0)))):
+            win = mgr.by_id(pet["id"]) if mgr is not None else None
+            alive = win is not None
+            try:
+                visible = bool(alive and win.isVisible())
+            except Exception:
+                visible = False
+            skin = getattr(win, "skin", None) if alive else None
+            pos = pet.get("position") or {}
+            if alive:
+                where = "%d,%d" % (int(win.x()), int(win.y()))
+            else:
+                where = "%s(%s,%s)" % (pos.get("corner", "-"),
+                                       pos.get("marginX", 0), pos.get("marginY", 0))
+            status = "在屏" if visible else ("隐藏" if alive else "未加载")
+            values = (pet["id"],
+                      pet.get("name") or "-",
+                      getattr(skin, "display_name", "") or "-",
+                      multipet.size_label(getattr(win, "pet_size", 0)
+                                          if alive else pet.get("size")),
+                      multipet.DISPLAY_LABELS.get(pet.get("display") or "both", "-"),
+                      where, status)
+            for j, value in enumerate(values):
                 self.pet_table.setItem(i, j, QTableWidgetItem(value))
 
     def _pet_visibility(self, visible):

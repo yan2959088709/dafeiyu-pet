@@ -497,10 +497,11 @@ class MenuMixin:
 
     def snap_into_screen(self):
         self._stop_walk()
-        geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-        x = max(geo.left(), min(geo.right() - self.width(), self.x()))
-        y = max(geo.top(), min(geo.bottom() - self.height(), self.y()))
-        self.move(x, y)
+        # 按「本体」夹两轴：窗口比本体宽（画布）又比本体高（头顶气泡区），
+        # 按窗口夹会：横向把刚抛到边的宠物拉回中间、纵向把它抬离地面。
+        dx, dy = self._body_clamp_delta()
+        if abs(dx) > 0.5 or abs(dy) > 0.5:
+            self.move(int(round(self.x() + dx)), int(round(self.y() + dy)))
         self.ensure_on_screens()
 
     def _apply_passthrough(self, on):

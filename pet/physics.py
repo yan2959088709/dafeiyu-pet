@@ -42,7 +42,10 @@ SQ_SOFT_SPEED = 300.0
 SQ_HARD_SPEED = 1500.0
 SQ_MAX_SQUASH = 0.55
 
+# 多宠碰撞：恢复系数、单帧最大分离位移（px）、撞后最大速度（px/s）
 PET_BOUNCE_E = 0.995
+PET_SEPARATE_MAX_PX = 14.0
+PET_IMPACT_MAX_SPEED = 1500.0
 
 DEFAULT_PHYSICS = {
     "gravity": GRAVITY,
@@ -216,8 +219,13 @@ def spring_settled(pos, vel, target):
     return abs(target - pos) <= SETTLE_PX and abs(vel) <= SETTLE_SPEED
 
 
-def collide(a, b, size_a, size_b):
-    """两宠弹性碰撞：动量守恒 + 恢复系数 0.995（质量 ∝ size²）。"""
+def collide(a, b, size_a, size_b, max_speed=PET_IMPACT_MAX_SPEED):
+    """两宠弹性碰撞：动量守恒 + 恢复系数 0.995（质量 ∝ size²）。
+
+    a/b 的 x,y 必须是**本体中心**（不是矩形角），否则法线方向会偏，
+    两只反而被推到一起。速度封顶 max_speed：两只贴着时碰撞每帧重算，
+    不设上限就会越撞越快、满屏乱飞。
+    """
     ma = max(1.0, float(size_a) ** 2)
     mb = max(1.0, float(size_b) ** 2)
     nx = b["x"] - a["x"]
@@ -232,7 +240,47 @@ def collide(a, b, size_a, size_b):
     if along > 0:
         return None
     j = -(1.0 + PET_BOUNCE_E) * along / (1.0 / ma + 1.0 / mb)
-    return (
-        {"vx": a["vx"] - j * nx / ma, "vy": a["vy"] - j * ny / ma},
-        {"vx": b["vx"] + j * nx / mb, "vy": b["vy"] + j * ny / mb},
-    )
+    va = soft_clamp_speed(a["vx"] - j * nx / ma, a["vy"] - j * ny / ma, max_speed)
+    vb = soft_clamp_speed(b["vx"] + j * nx / mb, b["vy"] + j * ny / mb, max_speed)
+    return ({"vx": va[0], "vy": va[1]}, {"vx": vb[0], "vy": vb[1]})
+
+
+def overlap_depth(a, b):
+    """两个矩形 (l,t,r,b) 的重叠量；不重叠返回 None。"""
+    dx = min(a[2], b[2]) - max(a[0], b[0])
+    dy = min(a[3], b[3]) - max(a[1], b[1])
+    if dx <= 0 or dy <= 0:
+        return None
+    return dx, dy
+
+
+def separate_axis(a, b):
+    """分离优先轴：重叠更浅的那条轴（位移最小）。0=横、1=纵。"""
+    ov = overlap_depth(a, b)
+    if ov is None:
+        return None
+    return 0 if ov[0] < ov[1] else 1
+
+
+def separate(a, b, size_a, size_b, axis=None, max_px=PET_SEPARATE_MAX_PX):
+    """重叠分离：把重叠量按质量分摊给两侧，返回各自的位移 (dx, dy)。
+
+    弹性碰撞只在「相向而行」时给冲量；两只贴到零相对速度时会互相卡住
+    （最常见就是一起被甩到角落）。这里不看速度、只看重叠，保证一定分得开。
+    默认走「重叠更浅的那条轴」——位移最小；贴墙时由调用方指定另一条轴重试。
+    每帧封顶 max_px：大重叠分几帧推开，看起来是被人挤开而不是瞬移。
+    """
+    ov = overlap_depth(a, b)
+    if ov is None:
+        return None
+    axis = separate_axis(a, b) if axis is None else axis
+    depth = min(ov[axis], max_px)
+    cax, cay = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
+    cbx, cby = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+    sign = 1.0 if (cbx if axis == 0 else cby) >= (cax if axis == 0 else cay) else -1.0
+    ma = max(1.0, float(size_a) ** 2)
+    mb = max(1.0, float(size_b) ** 2)
+    wa = mb / (ma + mb)          # 轻的一侧退得多
+    wb = ma / (ma + mb)
+    dx_a, dx_b = -sign * depth * wa, sign * depth * wb
+    return ((dx_a, 0.0), (dx_b, 0.0)) if axis == 0 else ((0.0, dx_a), (0.0, dx_b))

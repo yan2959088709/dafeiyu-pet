@@ -826,9 +826,10 @@ class LayoutEditor(QDialog):
 
     # ---------- 预览 ----------
     def pixel_scale(self):
-        """1 viewBox 单位 = 多少主窗像素。"""
+        """1 viewBox 单位 = 多少主窗像素（按布局基准宽，不含画布加宽）。"""
         L = ui_layout.load()
-        return max(1.0, self.owner.width()) / max(1.0, L["bubble"]["view_w"])
+        width = float(getattr(self.owner, "layout_w", 0) or self.owner.width())
+        return max(1.0, width) / max(1.0, L["bubble"]["view_w"])
 
     def label_of(self, key):
         for spot, label, _kind in ui_layout.HOTSPOTS:

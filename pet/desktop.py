@@ -100,9 +100,17 @@ class DesktopMixin:
 
     # ------------------------------------------------------------ 穿透
     def hit_region(self):
-        """可交互矩形：宠物所在的那一竖列（左右余量留给穿透）。"""
-        mx = max(0, int(getattr(self, "win_mx", 0)))
-        return QRect(mx, 0, max(1, self.width() - mx * 2), self.height())
+        """可交互矩形：本体所在的那一竖列。
+
+        窗口为了装宽幅特效动作会加宽，两侧多出来的画布区不算本体：
+        那里仍然穿透，否则透明区会把桌面点击吐掉。
+        """
+        body = float(getattr(self, "body_w", 0) or 0)
+        if body <= 0:
+            mx = max(0, int(getattr(self, "win_mx", 0)))
+            return QRect(mx, 0, max(1, self.width() - mx * 2), self.height())
+        x0 = int(round((self.width() - body) / 2.0))
+        return QRect(x0, 0, max(1, int(round(body))), self.height())
 
     def nativeEvent(self, eventType, message):
         """Win32 命中测试：在余量区返回 HTTRANSPARENT，点击直达下层窗口。"""

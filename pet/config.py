@@ -96,6 +96,17 @@ DEFAULT_PETS = [{
     "position": {"corner": "top-right", "marginX": 24, "marginY": 100},
 }]
 
+# 宠物条目的布尔开关默认值：载入时就补齐。
+# 不补的话，保存前的 validate_pet_payload 会因「balanceEnabled 必须是布尔值」
+# 把整包拒掉——而失败提示只在控制台，pythonw 启动下根本看不到，表现为
+# 「改完设置重启又变回去了」。
+PET_FLAG_DEFAULTS = {
+    "balanceEnabled": True,
+    "whisperEnabled": False,
+    "workStatusEnabled": True,
+    "fixedEnabled": False,
+}
+
 # 本地既有键（不得改名）+ 上游同名字段；两者共同构成「程序管辖的键」。
 DEFAULT_CFG = {
     # ---- 本地既有键 ----
@@ -342,6 +353,9 @@ def validate(cfg):
             pets.remove(entry)
             continue
         seen.add(pid)
+        for flag, default in PET_FLAG_DEFAULTS.items():
+            if not isinstance(entry.get(flag), bool):
+                entry[flag] = default
         size = entry.get("size")
         if isinstance(size, bool) or not isinstance(size, (int, float)) or size <= 0:
             bad("pets", "宠物 %s 的 size 必须 > 0" % pid, None)

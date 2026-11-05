@@ -54,17 +54,31 @@ def _fmt(template, **kw):
 class GadgetMixin:
     """PetWindow 的 DSH 挂件气泡能力。"""
 
+    def _dsh_layout_w(self):
+        """气泡/边距的基准宽：与「画布加宽」解耦。
+
+        窗口为了装下宽幅特效动作会加宽，但气泡尺寸、字体、头顶留白都应该
+        跟本体（判定主体）走，否则加宽会把气泡一起放大。
+        """
+        return float(getattr(self, "layout_w", 0) or self.width())
+
+    def _dsh_canvas_off(self):
+        """画布比基准宽多出来的那一半：把气泡重新居中用。"""
+        return (float(self.width()) - self._dsh_layout_w()) / 2.0
+
     def _dsh_bubble_geom(self):
-        """DSH 气泡几何：宽度=窗口宽度，高度按布局里的 viewBox 等比映射。"""
+        """DSH 气泡几何：宽度=布局基准宽，高度按布局里的 viewBox 等比映射。"""
         b = ui_layout.load()["bubble"]
-        bw = self.win_w
+        bw = self._dsh_layout_w()
         return bw, bw * b["view_h"] / b["view_w"]
 
     def _dsh_top_h(self):
         """素材顶部偏移（所有皮肤统一）：让素材顶落在主椭圆底部之下，官方气泡自然
-        罩住素材头顶、小气泡压在素材身上。比例与边距都取自 ui_layout，可实时调。"""
+        罩住素材头顶、小气泡压在素材身上。比例与边距都取自 ui_layout，可实时调。
+
+        基准宽用布局宽而非窗宽：加宽画布不该抬高宠物。"""
         w = ui_layout.load()["window"]
-        return w["top_h_ratio"] * self.win_w - w["margin"]
+        return w["top_h_ratio"] * self._dsh_layout_w() - w["margin"]
 
     def _dsh_show_text(self, text, dur=2.8, prio=0):
         """官方气泡台词统一入口（say 调用）：显示任意文本，支持优先级保护。"""
@@ -213,7 +227,7 @@ class GadgetMixin:
         main = b["main"]
         tail = b["tail"]
         by = b["top_offset"]
-        s = self.width() / b["view_w"]        # viewBox 单位 → 像素
+        s = self._dsh_layout_w() / b["view_w"]        # viewBox 单位 → 像素（按布局宽，不跟画布）
         cx = main["cx"] * s                   # 主椭圆/文字 中心 x
         box = QRectF((main["cx"] - main["rx"]) * s,
                      (main["cy"] - main["ry"]) * s + by,
@@ -225,6 +239,7 @@ class GadgetMixin:
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         p.save()
+        p.translate(self._dsh_canvas_off(), 0)   # 画布加宽后把气泡重新居中
         p.setOpacity(self._dsh_bubble_alpha)
         # 填充层（先填充全部图形，无描边，避免描边交叉线）
         p.setPen(Qt.PenStyle.NoPen)

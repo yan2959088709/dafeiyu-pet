@@ -11,17 +11,22 @@ import math
 import random
 import time
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QPoint, QRectF, Qt
 from PySide6.QtGui import QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import QApplication
 
 from pet import ui_layout
 from pet import action_binding
+from pet import segments
+from pet import geometry as pet_geometry
 
 BUBBLE_H = 56
 MARGIN = 4
 SPEED = 380.0
 TICK = 20
+FOLLOW_NEAR_RATIO = 0.4      # 跟随「够近了」：本体盒外扩 = 本体高 × 该比例
+FOLLOW_ARRIVE_PX = 12.0      # 本体中心到目标小于它就算到位
+POINT_MIN_PX = 8.0           # 点得比这更近视为没点（避免原地抖动）
 
 # 气泡排版：自适应字号、限行数、超长截断，保证气泡不越过桌宠头顶安全区（避免遮挡桌宠素材）
 BUBBLE_MAX_LINES = 2
@@ -132,6 +137,146 @@ class MotionMixin:
             if self.action_t == 0:
                 self.action = None
 
+    def _reset_motion_for_skin(self):
+        """切皮肤：清掉上一套皮肤的走位/演出状态。
+
+        帧号是绑皮肤的：分段表的绝对帧号（0–99）、走位动画名都属于上一套
+        素材。留着会被新皮肤拿去索引自己的帧表，帧数不一致时 paintEvent
+        直接越界（IndexError: list index out of range）。
+        """
+        self._walk = None
+        self._walk_point = False
+        self._walk_timeline = None
+        self._walk_loops = 0
+        self._walk_coast_sec = 0.0
+        self._walk_coast_dist = 0.0
+        self._walk_coast_vec = None
+        self._walk_coast_pow = 2.0
+        self._walk_top = self._walk_bottom = None
+        self._walk_anim_t0 = 0.0
+        self.target = None
+        self.emote = None
+        self.emote_t = 0.0
+        self.emote_total = 0.0
+        self._emote_prio = 0
+        self.prev_key = None
+        self.cross_t = 0.0
+
+    def _frame_index_for(self, state, n_frames, fps, elapsed):
+        """取帧号：走位带分段表（奔跑 4 段）时按已播秒数取，否则走 action_binding。
+
+        第四个参数是**已播秒数**（调用方已经减过起点，与 action_binding.frame_index
+        的口径一致），这里不要再减一次。
+        """
+        timeline = getattr(self, "_walk_timeline", None)
+        if timeline is not None and state == "walk":
+            try:
+                idx = int(timeline.frame_at(elapsed,
+                                            getattr(self, "_walk_loops", 1) or 1))
+                # 防御：帧表比分段表短时（素材换版/错配）宁可停在末帧，不能越界
+                return max(0, min(idx, int(n_frames) - 1))
+            except Exception:
+                pass
+        cfg = action_binding.event_cfg(self.skin.name, state) if state else {}
+        return action_binding.frame_index(cfg, n_frames, fps, elapsed)
+
+    def _body_w(self):
+        """本体宽度（素材基准宽）：窗口两侧的余量不属于本体。"""
+        w = float(getattr(self, "body_w", 0) or 0)
+        if w > 0:
+            return w
+        return float(self.width() - 2 * max(0, int(getattr(self, "win_mx", 0))))
+
+    def _body_box(self):
+        """本体在屏幕坐标里的矩形 (l, t, r, b)：所有判定都以它为准。"""
+        return pet_geometry.body_box_abs(
+            self.x(), self.y(), self.width(), self.cur_h, self._body_w(),
+            self._dsh_top_h(), self.MARGIN)
+
+    def _body_clamp_delta(self):
+        """本体夹回当前屏工作区还差的位移 (dx, dy)（窗口比本体宽又比本体高，
+        所以只能按本体夹）。"""
+        geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        box = self._body_box()
+        cx = (box[0] + box[2]) / 2.0
+        cy = (box[1] + box[3]) / 2.0
+        half_w = (box[2] - box[0]) / 2.0
+        half_h = (box[3] - box[1]) / 2.0
+        ncx = max(geo.left() + half_w, min(cx, geo.right() - half_w))
+        ncy = max(geo.top() + half_h, min(cy, geo.bottom() - half_h))
+        return (ncx - cx, ncy - cy)
+
+    def shift_body(self, dx, dy):
+        """碰撞分离用：整体平移（连带走位/飞行进度），再按本体夹回屏内。
+
+        平移不经过 tick 的走位插值和抛掷积分，两者存的都是绝对坐标，不同步
+        修正的话下一帧就被拉回原位置——两只永远分不开（角落互卡的根因）。
+        返回真正生效的位移，调用方据此判断「推不动就别再推」。
+        """
+        ox, oy = self.x(), self.y()
+        self._apply_shift(float(dx), float(dy))
+        cdx, cdy = self._body_clamp_delta()
+        if abs(cdx) > 0.5 or abs(cdy) > 0.5:
+            self._apply_shift(cdx, cdy)
+        return math.hypot(self.x() - ox, self.y() - oy)
+
+    def _apply_shift(self, dx, dy):
+        if not (dx or dy):
+            return
+        px, py = self.x(), self.y()
+        nx, ny = int(round(px + dx)), int(round(py + dy))
+        self.move(nx, ny)
+        rx, ry = nx - px, ny - py
+        flight = getattr(self, "_flight", None)
+        if flight is not None:
+            try:
+                flight.state["x"] += rx
+                flight.state["y"] += ry
+            except Exception:
+                pass
+        walk = getattr(self, "_walk", None)
+        if walk is not None:
+            try:
+                walk.start = self._in_walk_bounds(walk.start[0] + rx, walk.start[1] + ry)
+                walk.end = self._in_walk_bounds(walk.end[0] + rx, walk.end[1] + ry)
+            except Exception:
+                pass
+
+    def _in_walk_bounds(self, x, y):
+        """夹进本次走位的合法区。平移路径时不夹，终点会跟着偏出屏外。"""
+        left = getattr(self, "_walk_left", None)
+        right = getattr(self, "_walk_right", None)
+        if left is not None and right is not None:
+            x = max(left, min(x, right))
+        top = getattr(self, "_walk_top", None)
+        bottom = getattr(self, "_walk_bottom", None)
+        if top is not None and bottom is not None:
+            y = max(top, min(y, bottom))
+        return (x, y)
+
+    # ---------- 位移驱动互斥 ----------
+    # 窗口坐标有三个写入口：tick 走位（20ms）、接口定位 PositionFollow（16ms）、
+    # 抛掷 Flight（16ms）。16ms 两个驱动跑在独立定时器上，不受 tick 闸门约束，
+    # 因此必须显式互斥：谁在跑，tick 走位就让位；新驱动启动则先停走位与其它驱动。
+    def _move_drivers(self):
+        """正在运行的 16ms 独立位移驱动名（follow=接口定位，flight=抛掷）。"""
+        running = []
+        for name in ("follow", "flight"):
+            timer = getattr(self, "_%s_timer" % name, None)
+            if timer is not None and timer.isActive():
+                running.append(name)
+        return running
+
+    def _stop_move_drivers(self, keep=None):
+        """停掉独立位移驱动（keep 为要保留的驱动名，如 "flight"）。"""
+        for name in ("follow", "flight"):
+            if name == keep:
+                continue
+            timer = getattr(self, "_%s_timer" % name, None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+            setattr(self, "_%s" % name, None)
+
     def _tick_movement(self):
         """三种模式的移动调度：跟随鼠标 / 自由散步 / 原地待着。"""
         if self.emote:
@@ -141,24 +286,47 @@ class MotionMixin:
             if getattr(self, "_walk", None) is not None:
                 self._stop_walk()
             return
+        if self._move_drivers():
+            # 16ms 驱动（接口定位/抛掷）在写窗口坐标：tick 走位让位，否则两边互拉
+            if getattr(self, "_walk", None) is not None or self.target is not None:
+                self.target = None
+                self._stop_walk()
+            return
         now_ms = self.t * TICK
+        if getattr(self, "_walk_point", False):
+            if getattr(self, "_walk", None) is None:
+                self._walk_point = False
+            else:
+                self._advance_walk(now_ms)   # 取点走位不受「动作后静默」闸门影响
+                return
         if now_ms < getattr(self, "rest_until", 0):
-            return   # 动作结束后的 3–5s 静默：跟随/漫游都不位移
+            # 静默期：谁都不位移；而「休息中」正是随机待机的唯一时机。
+            # （早先这里直接 return，把 wander 分支里的 _maybe_idle_action 变成了
+            #   死代码 —— 随机待机链从未触发过。）跟随模式例外：它在追光标。
+            if self.mode != "follow" and getattr(self, "_walk", None) is None:
+                self._maybe_idle_action()
+            return
         if self.mode != "wander" and getattr(self, "_walk", None) is not None:
             self._stop_walk()            # 离开漫游模式即丢弃走位，避免下次跳帧
         if self.mode == "follow":
             cursor = self.cursor().pos()
             screen = QApplication.screenAt(cursor) or self.screen() or QApplication.primaryScreen()
             geo = screen.availableGeometry()
-            near = (self.x() - 100 <= cursor.x() <= self.x() + self.width() + 100 and
-                    self.y() - 100 <= cursor.y() <= self.y() + self.height() + 100)
+            # 判定主体是「本体」而不是「容器」：窗口左右余量、头顶气泡区都不参与
+            near = pet_geometry.near_body(
+                (cursor.x(), cursor.y()), self._body_box(),
+                self.cur_h * FOLLOW_NEAR_RATIO)
             if near:
                 if self.target is not None:
                     self.target = None
                     self._stop_walk()
             else:
-                tx = max(geo.left(), min(geo.right() - self.width(), cursor.x() - self.width() / 2))
-                ty = max(geo.top(), min(geo.bottom() - self.height(), cursor.y() - 90))
+                # 目标存的是窗口左上角，由「本体中心对准光标」反推
+                tx, ty = pet_geometry.window_for_body_center(
+                    cursor.x(), cursor.y(), self.width(), self.cur_h,
+                    self._body_w(), self._dsh_top_h(), self.MARGIN)
+                tx = max(geo.left(), min(geo.right() - self.width(), tx))
+                ty = max(geo.top(), min(geo.bottom() - self.height(), ty))
                 if self.target is None and hasattr(self.skin, "pick_move"):
                     try:
                         self.skin.pick_move(self)
@@ -169,9 +337,6 @@ class MotionMixin:
             if getattr(self, "_walk", None) is None:
                 if self.emote:
                     return   # 专属演出（转向/随机动作）期间不规划走位
-                if now_ms < self.rest_until:
-                    self._maybe_idle_action()
-                    return
                 self._plan_walk()
                 if getattr(self, "_walk", None) is None:
                     return
@@ -182,17 +347,19 @@ class MotionMixin:
             return
 
         if self.target is not None:
-            cx, cy = self.x() + self.width() / 2, self.y() + self.height() / 2
+            box = self._body_box()
+            cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
             dx, dy = self.target[0] - cx, self.target[1] - cy
             dist = (dx * dx + dy * dy) ** 0.5
-            if dist < 12:
+            if dist < FOLLOW_ARRIVE_PX:
                 self.target = None
                 self._stop_walk()
                 self.rest_until = self.t * TICK + random.randint(8000, 18000)
             else:
                 step = self.cur_speed * TICK / 1000.0
                 nx, ny = cx + dx / dist * step, cy + dy / dist * step
-                self.move(int(nx - self.width() / 2), int(ny - self.height() / 2))
+                # 本体中心到窗口原点的偏移固定（素材水平居中、头顶固定）
+                self.move(int(nx - (cx - self.x())), int(ny - (cy - self.y())))
                 if abs(dx) > abs(dy) * 1.15:
                     direction = "left" if dx < 0 else "right"
                     # 跟随与自由行走共用同一套「方向 → 镜像」规则（旧皮肤保持原约定）
@@ -236,8 +403,10 @@ class MotionMixin:
         profile = (motion_engine.walk_profile(default, clip,
                                               self.pet_size or self.win_w)
                    if clip > 0 else None)
-        half = self.width() / 2.0
-        cx = self.x() + half
+        box = self._body_box()
+        half = (box[2] - box[0]) / 2.0
+        cx = (box[0] + box[2]) / 2.0
+        off = cx - self.x()          # 本体中心 → 窗口原点的固定偏移
         if profile:
             # 先选动作，再在放大后的区间里抽距离（短→漂浮 / 中→螃蟹 / 长→奔跑）
             distance = random.uniform(profile["min"], profile["max"])
@@ -255,7 +424,7 @@ class MotionMixin:
             target_cx = motion_engine.plan_move(cx, dirn, distance,
                                                self.pet_size or self.win_w,
                                                margin, left, right)
-            end_x = int(target_cx - half)
+            end_x = int(target_cx - off)
             actual = abs(end_x - self.x())
             if actual >= min_step:
                 plan = (dirn, end_x, actual)
@@ -295,15 +464,144 @@ class MotionMixin:
         self._walk_distance = actual
         # 动画从「真正开走」那一刻起从第 0 帧播，避免起跑/摔倒先于位移
         self._walk_anim_t0 = (self.frame_t + lead) if profile else 0.0
-        room = ((right - half) - end_x) if dirn > 0 else (end_x - (left - half))
+        right_win, left_win = right - off, left - off
+        room = (right_win - end_x) if dirn > 0 else (end_x - left_win)
         self._walk_coast_sec = coast_sec
         self._walk_coast_dir = dirn
         self._walk_coast_dist = min(max(0.0, self._walk_speed * coast_sec / 2.0),
                                     max(0.0, room))
-        self._walk_left, self._walk_right = left - half, right - half
+        self._walk_left, self._walk_right = left_win, right_win
+        self._walk_top = self._walk_bottom = None   # 漫游只走水平线
+        self._walk_coast_vec = None
+        self._walk_coast_pow = 2.0                  # 线性减速（沿用旧表现）
+        self._walk_timeline = None
+        self._walk_loops = 0
+        self._walk_point = False
         self._alog("walk start action=%s dir=%s dist=%d dur=%.1f speed=%.1f"
                    % (choice.get("name") if choice else "legacy", name, actual,
                       duration, self._walk_speed))
+
+    def _walk_to_point(self, gx, gy):
+        """走到屏幕坐标：本体中心对准点击点，位移仍只在行走动画里发生。
+
+        有分段表的动作（如「原地左转奔跑」）按它自己的 4 段走：
+          段1 惊喜+转身（原地不动）→ 段2 标准奔跑（整轮循环，位移主段）
+          → 段3 摔倒+惯性滑行（减速收尾）→ 段4 爬起+尴尬挠头（不动）
+        距离太长时不去放慢帧率，而是把段2 的循环节多跑几轮（见 pet/segments.py）。
+        """
+        from pet import motion_engine
+        if getattr(self.skin, "kind", "") != "wander" or self.dragging:
+            return False
+        if "flight" in self._move_drivers():
+            return False        # 抛掷飞行中不接取点：否则会把它悬停半空
+        self._stop_move_drivers()   # 用户点击优先：接口定位让位
+        now_ms = self.t * TICK
+        pick = QPoint(int(gx), int(gy))
+        screen = (QApplication.screenAt(pick) or self.screen()
+                  or QApplication.primaryScreen())
+        geo = screen.availableGeometry()
+        box = self._body_box()
+        cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+        half_w = (box[2] - box[0]) / 2.0
+        half_h = (box[3] - box[1]) / 2.0
+        # 终点夹进工作区：按「本体」夹 —— 画布是透明的，允许溢出屏幕，
+        # 否则宽幅动作把窗口撞宽后，点击会被平台往回拉。
+        tcx = max(geo.left() + half_w, min(float(gx), geo.right() - half_w))
+        tcy = max(geo.top() + half_h, min(float(gy), geo.bottom() - half_h))
+        dx, dy = tcx - cx, tcy - cy
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist < POINT_MIN_PX:
+            return False
+        if self.emote:
+            self._end_emote()        # 点击是用户指令：先收掉当前演出再走
+        # 距离是给定的：先按距离选动作（短→漂浮 / 中→螃蟹 / 长→奔跑），
+        # 漫游那套随机抽动作会让动作语义和距离对不上
+        choice = None
+        picker = getattr(self.skin, "pick_move_for", None)
+        if callable(picker):
+            try:
+                choice = picker(self, dist)
+            except Exception:
+                choice = None
+        if choice is None:
+            legacy = getattr(self.skin, "pick_move", None)
+            if callable(legacy):
+                try:
+                    choice = legacy(self)
+                except Exception:
+                    choice = None
+        clip = 0.0
+        if choice:
+            default = choice.get("params") or {}
+            clip = float(choice.get("clip") or 0.0)
+        else:
+            default = (self.cfg.get("animations") or {}).get("moves", {}).get("default") or {}
+        bound = action_binding.action_for(self.skin.name, "walk")
+        if bound and hasattr(self.skin, "anim_duration"):
+            clip = float(self.skin.anim_duration(bound) or clip)
+        profile = (motion_engine.walk_profile(default, clip, self.pet_size or self.win_w)
+                   if clip > 0 else None)
+        lead = float(default.get("leadSec", 2)) if profile is None else profile["lead"]
+        travel, speed = motion_engine.seek_travel(dist, profile)
+        tail = float(default.get("tailSec", 2)) if profile is None else 0.0
+        # ---- 有分段表的动作（奔跑）：位移拆成「跑 + 滑行」，跑的那节整轮循环 ----
+        timeline = None
+        getter = getattr(self.skin, "move_timeline", None)
+        if choice and callable(getter):
+            try:
+                timeline = getter(choice.get("name"))
+            except Exception:
+                timeline = None
+        loops = 0
+        slide_sec = 0.0
+        run_dist, slide_dist = dist, 0.0
+        if timeline is not None and timeline.has_loop:
+            plan = segments.plan_run(timeline, dist, speed)
+            loops = plan["loops"]
+            run_dist, slide_dist = plan["run_dist"], plan["slide_dist"]
+            slide_sec = plan["slide_sec"]
+            lead = timeline.head_sec                   # 段1：原地转身，不位移
+            travel = loops * timeline.loop_sec         # 段2：整轮循环，位移主段
+            tail = sum(timeline.after_loop_secs[1:])   # 段4：爬起+挠头，不位移
+        ux, uy = (dx / dist, dy / dist) if dist else (1.0, 0.0)
+        if abs(dx) > abs(dy) * 1.15:
+            name = "left" if dx < 0 else "right"
+        elif dy:
+            name = "up" if dy < 0 else "down"
+        else:
+            name = "left" if dx < 0 else "right"
+        self._set_dir(name, self._facing_for(name), allow_turn=False)
+        start = (self.x(), self.y())
+        run_end = (start[0] + ux * run_dist, start[1] + uy * run_dist)
+        final = (run_end[0] + ux * slide_dist, run_end[1] + uy * slide_dist)
+        duration = lead + travel + slide_sec + tail
+        self._walk = motion_engine.Walk(start, run_end, duration, lead, slide_sec + tail)
+        self._walk_t0 = now_ms
+        self._walk_distance = dist
+        self._walk_speed = speed
+        # 有分段表：动画立刻从第 0 帧播（段1 原地转身），位移到段2 才开始；
+        # 否则沿用「真正开走那一刻起播」的老口径。
+        self._walk_anim_t0 = (self.frame_t if loops else
+                              ((self.frame_t + lead) if profile else 0.0))
+        self._walk_coast_sec = slide_sec
+        self._walk_coast_dist = slide_dist
+        self._walk_coast_dir = 1
+        self._walk_coast_vec = ((ux * slide_dist, uy * slide_dist)
+                                if slide_dist > 0 else None)
+        # 滑行起始速度严格接上奔跑速度：位置曲线 L×[1-(1-t/T)^m]，
+        # 其中 m = v×T/L，因此 t=0 时速度正好是 v，t=T 时降为 0。
+        self._walk_coast_pow = ((speed * slide_sec / slide_dist)
+                               if slide_dist > 0 and slide_sec > 0 else 2.0)
+        self._walk_coast_pow = min(40.0, max(0.6, self._walk_coast_pow))
+        self._walk_timeline = timeline if loops else None
+        self._walk_loops = loops
+        self._walk_point = True
+        self._walk_left, self._walk_right = min(start[0], final[0]), max(start[0], final[0])
+        self._walk_top, self._walk_bottom = min(start[1], final[1]), max(start[1], final[1])
+        self.rest_until = 0
+        self._alog("walk point dist=%d dur=%.1f speed=%.0f loops=%d run=%d slide=%d dir=%s"
+                   % (dist, duration, speed, loops, run_dist, slide_dist, name))
+        return True
 
     def _facing_for(self, direction, legacy_left=-1):
         """方向 → 镜像符号：皮肤可覆写；旧皮肤保持原约定。"""
@@ -329,6 +627,12 @@ class MotionMixin:
         self._walk_coast_sec = 0.0
         self._walk_coast_dist = 0.0
         self._walk_anim_t0 = 0.0
+        self._walk_coast_vec = None
+        self._walk_coast_pow = 2.0
+        self._walk_timeline = None
+        self._walk_loops = 0
+        self._walk_point = False
+        self._walk_top = self._walk_bottom = None
         self._alog("walk stop")
         if reset_facing:
             self.dir = "down"
@@ -341,6 +645,9 @@ class MotionMixin:
         elapsed = (now_ms - self._walk_t0) / 1000.0
         if elapsed > walk.duration + 1.0:
             # 陈旧走位（跨场景/长时间没 tick）：丢弃重规划，而不是一步跳到终点
+            if getattr(self, "_walk_point", False):
+                self._stop_walk()   # 取点走位被打断太久：放弃，不改回漫游
+                return
             self._stop_walk()
             self._plan_walk()
             walk = getattr(self, "_walk", None)
@@ -350,12 +657,23 @@ class MotionMixin:
         x, y, done = walk.at(elapsed)
         coast_sec = getattr(self, "_walk_coast_sec", 0.0)
         if coast_sec and elapsed > walk.lead + walk.travel:
-            # 长跑结尾的摔跤：按 0.5s 线性减速补一小段惯性，再刹停
+            # 摔倒滑行：幂次曲线收尾，t=0 的速度接住奔跑速度，t=T 降到 0
             dt = min(coast_sec, elapsed - (walk.lead + walk.travel))
-            frac = 1.0 - (1.0 - dt / coast_sec) ** 2
-            x += getattr(self, "_walk_coast_dir", 0) * \
-                getattr(self, "_walk_coast_dist", 0.0) * frac
-        x = max(getattr(self, "_walk_left", x), min(x, getattr(self, "_walk_right", x)))
+            pow_ = float(getattr(self, "_walk_coast_pow", 2.0) or 2.0)
+            frac = 1.0 - (1.0 - dt / coast_sec) ** pow_
+            vec = getattr(self, "_walk_coast_vec", None)
+            if vec:
+                x += vec[0] * frac
+                y += vec[1] * frac
+            else:
+                x += getattr(self, "_walk_coast_dir", 0) * \
+                    getattr(self, "_walk_coast_dist", 0.0) * frac
+            # 只在惯性段夹边界：起点可能来自接口定位/拖拽，本就不在漫游合法区内，
+            # 每帧硬夹会在开走第一帧把窗口瞬移几十像素；行进段交给插值自然带回。
+            x = max(getattr(self, "_walk_left", x), min(x, getattr(self, "_walk_right", x)))
+            top = getattr(self, "_walk_top", None)
+            if top is not None:      # 取点走位可纵向：夹进本段航程的纵向区间
+                y = max(top, min(y, getattr(self, "_walk_bottom", y)))
         self.move(int(x), int(y))
         if random.random() < 0.002 and self.jump_t == 0:
             self.jump_t = 0.5
@@ -425,7 +743,6 @@ class MotionMixin:
         if self.emote or self._sleeping:
             return
         # 重要气泡(如AI回复)正在展示时，不做随机待机动作，避免打断气泡（缺陷2）
-        now = self.t * TICK / 1000.0
         if (self._dsh_bubble_until > 0 and self._dsh_bubble_until > time.time()
                 and self._dsh_prio >= 1):
             return
@@ -597,6 +914,7 @@ class MotionMixin:
     def _drag_interrupt(self):
         """拖拽开始：清掉待播，并让低于点击级的演出立即让位。"""
         self._emote_queue = []
+        self._stop_move_drivers()      # 拖拽独占坐标：接口定位/抛掷都要让位
         if self.emote and getattr(self, "_emote_prio", 0) < action_binding.PRIO_CLICK:
             self._end_emote()
 
@@ -623,9 +941,9 @@ class MotionMixin:
         self._auto_next_at = now + gap
         rest = getattr(self, "_post_action_rest_ms", 0)
         wait = max(gap, rest or 0)
+        self._post_action_rest_ms = 0      # 无论是否用上都清掉：残留会把下一次静默拉长
         if not self.dragging and not self._sleeping:
             # 动作结束后必须有 3–5s 静默：走位与队列释放都被它挡住
-            self._post_action_rest_ms = 0
             self.rest_until = now + wait
         work_anim = getattr(self, "_work_anim", None)
         if work_anim and not self.dragging and not self._sleeping:
@@ -666,6 +984,7 @@ class MotionMixin:
         self.emote_t0 = self.frame_t
         self._emote_prio = action_binding.PRIO_IDLE
         self._emote_queue = []      # 睡前丢掉待播动作，醒来不该再演旧戏
+        self._stop_move_drivers()   # 睡眠时连接口定位/抛掷也要停：不能被拖着飞
         self._stop_walk()
         self.sleep_until = self.t * TICK + random.randint(120000, 300000)  # 2~5 分钟
         self.say(random.choice(SLEEP_LINES))
@@ -780,17 +1099,15 @@ class MotionMixin:
                     pix = frames[self.skin.pick_idle_frame(self, frames)]
                 else:
                     # 帧钟：emote 从动作起点算（区间循环/播一次才有意义），
-                    # 走位从「真正开走」的帧起算，静止起步阶段不抢跑动画；
-                    # 其余长驻状态（拖拽等）沿用全局时钟
+                    # 走位从「开走」的帧起算；带分段表的走位则从转身那段的第一帧算。
                     if self.emote:
                         t0 = getattr(self, "emote_t0", 0.0)
                     elif getattr(self, "_render_state", None) == "walk":
                         t0 = getattr(self, "_walk_anim_t0", 0.0)
                     else:
                         t0 = 0.0
-                    cfg = action_binding.event_cfg(self.skin.name, state) if state else {}
-                    idx = action_binding.frame_index(cfg, len(frames), fps,
-                                                     self.frame_t - t0)
+                    idx = self._frame_index_for(state, len(frames), fps,
+                                                self.frame_t - t0)
                     pix = frames[idx]
                 # 素材基准朝向由皮肤声明：鲸鱼娘基准朝左（向右走时水平镜像）；
                 # deepseek-girl 已分左右两套帧集（mirror_follows_facing=False）
