@@ -450,6 +450,15 @@ class ChatPanel(QDialog):
         self.attach_label.hide()
         self.attach_label.mousePressEvent = lambda _e: self._clear_image()
         pcl.addWidget(self.attach_label)
+        # ---- 待发送表情 chip（单行：缩略图 + 标签 + 点击移除）----
+        self._sticker_tag = None
+        self.chip_row = QWidget()
+        _crl = QHBoxLayout(self.chip_row)
+        _crl.setContentsMargins(14, 2, 12, 2)
+        _crl.setSpacing(6)
+        _crl.addStretch(1)
+        self.chip_row.hide()
+        pcl.addWidget(self.chip_row)
 
         # ---- 输入区 ----
         bar = QFrame()
@@ -783,7 +792,14 @@ class ChatPanel(QDialog):
         return ('<div align="{1}"><img src="file:///{0}" width="{2}"></div><br>'
                 .format(path.replace("\\", "/"), align, stickers.THUMB_W))
 
-    def append_msg(self, who, text, sticker=None):
+    def _image_html(self, path, align="left", width=140):
+        """把附件文件转成聊天气泡下方的 <img> HTML（文件不在则空串）。"""
+        if not path or not os.path.exists(path):
+            return ""
+        return ('<div align="{1}"><img src="file:///{0}" width="{2}"></div><br>'
+                .format(str(path).replace("\\", "/"), align, width))
+
+    def append_msg(self, who, text, sticker=None, image=None):
         safe = html.escape(str(text).strip()).replace("\n", "<br>")
         if who == "user":
             blk = ('<div align="right"><span style="background-color:#5b8cff;'
@@ -794,6 +810,8 @@ class ChatPanel(QDialog):
         blk = blk.format(safe)
         if sticker:
             blk += self._sticker_html(sticker, align="right" if who == "user" else "left")
+        if image:
+            blk += self._image_html(image, align="right" if who == "user" else "left")
         self._msg_blocks.append(blk)
         self._render_view()
 
@@ -913,6 +931,49 @@ class ChatPanel(QDialog):
         self._attachment = None
         self.attach_label.hide()
 
+    def _set_sticker(self, tag):
+        """设置/替换/清除待发送表情。
+
+        同时只存在一个 chip：与 AI「每轮最多 1 个表情」的规则一致，
+        也避免插多个标记只有第一个生效、其余静默丢失。
+        """
+        self._sticker_tag = tag or None
+        lay = self.chip_row.layout()
+        while lay.count() > 1:          # 保留末尾 stretch
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if not self._sticker_tag:
+            self.chip_row.hide()
+            return
+        fname = stickers.MAP.get(self._sticker_tag)
+        chip = QFrame()
+        chip.setStyleSheet("QFrame{background:#eef3ff;border:1px solid #c9d8ff;"
+                           "border-radius:10px;}")
+        chip.setToolTip("点击移除表情")
+        hl = QHBoxLayout(chip)
+        hl.setContentsMargins(6, 2, 6, 2)
+        hl.setSpacing(4)
+        icon = QLabel()
+        if fname:
+            pix = QPixmap(stickers.path_for(fname))
+            if not pix.isNull():
+                icon.setPixmap(pix.scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio,
+                                          Qt.TransformationMode.SmoothTransformation))
+        lbl = QLabel(self._sticker_tag)
+        lbl.setStyleSheet("color:#3d5cd0;font-size:12px;background:transparent;"
+                          "border:none;")
+        x = QLabel("×")
+        x.setStyleSheet("color:#8fa3c8;font-size:14px;background:transparent;"
+                        "border:none;")
+        for w in (icon, lbl, x):
+            hl.addWidget(w)
+        chip.mousePressEvent = lambda _e: self._set_sticker(None)
+        lay.insertWidget(0, chip)
+        self.chip_row.show()
+        self.input.setFocus()
+
     def _on_delete_rounds(self):
         p = self.parent()
         if p is None:
@@ -951,23 +1012,21 @@ class ChatPanel(QDialog):
             return
 
     def _on_sticker_pick(self, tag):
-        """点选表情：把 ` <sticker:标签>` 插入输入框光标处，保持焦点。"""
-        text = self.input.text()
-        pos = self.input.cursorPosition()
-        mark = f" <sticker:{tag}>"
-        self.input.setText(text[:pos] + mark + text[pos:])
-        self.input.setCursorPosition(pos + len(mark))
-        self.input.setFocus()
+        """点选表情：转为待发送 chip，不往输入框插原始标记文本。"""
+        self._set_sticker(tag)
 
     def _on_submit(self):
         text = self.input.text().strip()
+        if self._sticker_tag:
+            text = (text + " <sticker:%s>" % self._sticker_tag).strip()
         att = getattr(self, "_attachment", None)
         if not text and not att:
             return
-        self.input.clear()
-        self._clear_image()
-        if self.parent():
-            self.parent()._send_chat(text, attachment=att)
+        # 发送成功才清空：被拒绝（无 Key/配图关闭/空消息）时保留用户输入与待发图
+        if self.parent() and self.parent()._send_chat(text, attachment=att):
+            self.input.clear()
+            self._clear_image()
+            self._set_sticker(None)
 
     def _on_mem(self):
         if self.parent():
@@ -1178,6 +1237,7 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         self._say_queue = []      # 后台线程 → 主线程 气泡
         self._chat_queue = []     # 后台线程 → 主线程 (text, save, sticker) 聊天回复
         self._stream_queue = []   # 后台线程 → 主线程 流式增量文本（打字机效果）
+        self._pending_msgs = []   # ds_busy 期间排队待发的 (text, sticker, attachment)
         self._stream_accum = None # 当前流式回复累积文本（None=无进行中的流）
         # ---- Token 统计悬浮窗状态（后台线程只写标记/金额，主线程 tick 统一刷新 UI）----
         self._last_turn_cost = 0.0    # 最近一轮对话消耗金额（元）
@@ -1381,7 +1441,12 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             st = m.get("sticker")
             if is_user and not st and m.get("sticker_tag"):
                 st = stickers.MAP.get(m.get("sticker_tag"))   # 用户历史表情：标签→文件
-            self.chat_panel.append_msg("user" if is_user else "pet", content, sticker=st)
+            img = None
+            if is_user and m.get("attachment"):
+                from pet import chat_attach
+                img = chat_attach.path_for(P.attachments, m["attachment"])
+            self.chat_panel.append_msg("user" if is_user else "pet", content,
+                                       sticker=st, image=img)
 
     def _load_earlier(self):
         """历史分页：每次多加载 14 条（上限仍受 max_history 约束）。"""
@@ -1483,8 +1548,10 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
                 text = item[0]
                 save = item[1] if len(item) > 1 else True
                 sticker = item[2] if len(item) > 2 else None
+                meme = item[3] if len(item) > 3 else None   # Harness FC 意图（表情包）
                 streamed = self._stream_accum is not None
-                self._chat_out(text, save=save, streamed=streamed, sticker=sticker)
+                self._chat_out(text, save=save, streamed=streamed,
+                               sticker=sticker, meme=meme)
                 if streamed:
                     # 流式收尾：重写为去掉标记的干净文本 + 表情缩略图
                     self.chat_panel.stream_finalize(stickers.strip_marks(self._stream_accum),
@@ -1497,6 +1564,10 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
                 self._token_stats_dirty = False
                 if self.token_window.isVisible():
                     self._refresh_token_stats()
+        # 排队中的下一条自动续发（busy 期间用户继续发的消息不丢）。
+        # 必须在 if 块外：异常路径也可能没有 _chat_queue 投递，块内会永远卡住排队
+        if self._pending_msgs and not self.ds_busy:
+            self._call_ds(*self._pending_msgs.pop(0))
 
     def _tick_background_polls(self):
         """周期性后台取数：余额、Token 统计窗、实时令牌用量。

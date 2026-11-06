@@ -332,6 +332,13 @@ def validate(cfg):
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
         bad("chatImageLimit", "配图上限必须是非负整数", 10)
 
+    # Harness 主聊天输出上限：手改 config / PUT /config 绕过 UI 的 _spin(128,4096)
+    # 会直接放大每跳成本（ thinking 开启时按 completion 计费），这里兜底校验
+    tokens = cfg.get("aiMaxTokens")
+    if isinstance(tokens, bool) or not isinstance(tokens, int) \
+            or not (128 <= tokens <= 4096):
+        bad("aiMaxTokens", "单次输出上限必须是 128-4096 的整数", 1024)
+
     pets = cfg.get("pets")
     if not isinstance(pets, list) or not pets:
         bad("pets", "宠物列表必须是非空数组", copy.deepcopy(DEFAULT_PETS))

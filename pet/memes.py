@@ -28,16 +28,29 @@ def meme_dirs(user_root, bundle_root, kind=None):
     return out
 
 
+def _safe_name(name):
+    """素材名只允许单段文件名（禁路径分隔/穿越），与 apiserver.safe_name 同口径。"""
+    name = str(name or "")
+    return name and name == os.path.basename(name) and name not in (".", "..")
+
+
+def _clip_desc(desc):
+    """描述进上下文前清洗：去控制字符 + 截断（本地文件可写，不当全文信任）。"""
+    return "".join(ch for ch in str(desc or "") if ch >= " " or ch in "\n\t")[:80]
+
+
 def load_pool(mapping, dirs):
-    """描述为空或磁盘缺图的条目剔除。"""
+    """描述为空或磁盘缺图的条目剔除；name 须为单段文件名。"""
     pool = {}
     for name, desc in (mapping or {}).items():
         if not isinstance(desc, str) or not desc.strip():
             continue
+        if not _safe_name(name):
+            continue
         for d in dirs or []:
             path = os.path.join(d, "%s.png" % name)
             if os.path.exists(path):
-                pool[name] = {"path": path, "desc": desc.strip()}
+                pool[name] = {"path": path, "desc": _clip_desc(desc)}
                 break
     return pool
 

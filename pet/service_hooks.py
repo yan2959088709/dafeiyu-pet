@@ -405,8 +405,11 @@ class ServiceHooksMixin:
             return {"ok": False, "reason": "bad-request", "message": "没有当前会话"}
         with self._mem_lock:
             kept, removed = chat_memory.delete_rounds(session.get("messages") or [], stamps)
-            session["messages"] = kept
-            self.chat_history = kept[-self.max_history:]
+            # 原地替换：切片拷贝重绑会破坏「chat_history 就是会话 messages」的身份，
+            # 之后 Harness 的迟到回复会被当成「会话已被清空」而丢弃
+            msgs = session["messages"]
+            msgs[:] = kept[-self.max_history:]
+            self.chat_history = msgs
             self._save_sessions()
             self._save_mem()
         self._reload_panel()

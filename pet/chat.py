@@ -8,12 +8,14 @@
 边界：_react_to_reply（回复文本 → 表情动作的映射）留在主窗界面层，
 因为它只调用 _start_emote，属于表现层职责。
 """
-import json
 import re
 import threading
+import time
 
 import requests
 
+from . import chat_attach
+from . import harness as pet_harness
 from . import stickers
 from . import log as pet_log
 from . import memes as pet_memes
@@ -23,6 +25,11 @@ from . import whisper as pet_whisper
 from . import time_context as pet_time
 from .pricing import DS_BASE_URL, DS_MODEL, calc_turn_cost
 from .storage import P
+
+# Harness 时代的表达规范：目录不再进提示词，改由 FC 工具按需检索发送
+HARNESS_HINT = ("【表达工具】想发表情包或小表情时用工具：先 search_memes / search_stickers "
+                "检索库里有什么，再 send_meme / send_sticker 发送，每轮各限一个；"
+                "正文只写字，不要把任何标记写进回复。")
 
 
 class ChatMixin:
@@ -51,12 +58,7 @@ class ChatMixin:
         city = self.cfg.get("city")
         if city:
             lines.append(f"主人所在城市：{city}。")
-        sp = self._sticker_prompt_block()   # 表情使用规范（末尾追加）
-        if sp:
-            lines.append(sp)
-        meme_block = self._meme_block()     # 配图清单（可选）
-        if meme_block:
-            lines.append(meme_block)
+        lines.append(HARNESS_HINT)
         return "\n".join(lines)
 
     def _meme_pool(self):
@@ -70,33 +72,12 @@ class ChatMixin:
         self._meme_pool_cache = pool
         return pool
 
-    def _meme_block(self):
-        pool = self._meme_pool()
-        if not pool or not self.cfg.get("chatImageEnabled", True):
-            return ""
-        limit = self.cfg.get("chatImageLimit", 10)
-        return ("[配图] 回复结尾可选附一张表情包给用户看，挑中就在回复最后另起一行写"
-                " [图:名称]；不要解释你在挑图。\n" + pet_memes.prompt_block(pool, limit))
-
     def _show_meme(self, name, caption="", dur=10.0):
         item = self._meme_pool().get(name)
         if not item:
             return False
         self._dsh_show_meme(item["path"], caption=caption, dur=dur)
         return True
-
-    def _sticker_prompt_block(self):
-        """生成表情使用规范：按情绪分组给出可用的推荐标签（过滤掉本地缺失项）。"""
-        if not stickers.MAP:
-            return ""
-        groups = []
-        for emo, tags in stickers.GROUPS:
-            tags = [t for t in tags if t in stickers.MAP]
-            if tags:
-                groups.append(f"  {emo}：{'、'.join(tags)}")
-        if not groups:
-            return ""
-        return stickers.PROMPT_TEMPLATE.format(groups="\n".join(groups))
 
     def _show_chat_dialog(self):
         key = self.cfg.get("ds_api_key", "")
@@ -116,47 +97,72 @@ class ChatMixin:
         self.chat_panel.popup_at(self.x() + self.width() / 2, self.y() + self._dsh_top_h())
 
     def _send_chat(self, text, attachment=None):
+        """发送一条聊天消息。
+
+        返回 True=已受理（调用方才可以清空输入框与待发图）；
+        False=被拒绝（无 Key / 配图关闭 / 空消息）——内容必须保留，否则用户白打。
+        """
         text = "" if text is None else str(text)
         if not text.strip() and not attachment:
-            return
+            return False
         if attachment and not self.cfg.get("chatImageEnabled", True):
             self.say("对话配图已关闭（设置 → 全局）")
-            return
+            return False
         clean, tag = stickers.split(text.strip())   # 拆分纯文字与用户选的表情标签（命中映射才保留）
-        shown = clean or "[图片]"
+        if not clean and not tag and not attachment:
+            # 只剩没命中映射的 <sticker:…>：发给 AI 也看不到，当空消息挡掉并保留输入
+            self.say("这个消息是空的哦")
+            return False
+        # 用户气泡文案分流：图片占位 / 纯表情 / 纯文字（历史落盘用同一套，重载不漂移）
+        img = None
+        if attachment and attachment.get("id"):
+            img = chat_attach.path_for(P.attachments, attachment["id"])
         if attachment:
-            shown = (clean + "\n[图片]") if clean else "[图片]"
-        # 用户气泡：文字 + 表情缩略图（右对齐）
+            # 缩略图渲染出来了就不必再留 [图片] 占位（占位只是无图可显时的兜底）
+            shown = (clean + "\n[图片]") if (clean and not img) else (clean or "[图片]")
+        elif not clean:
+            shown = "[表情]"
+        else:
+            shown = clean
+        # 用户气泡：文字 + 表情缩略图 + 图片缩略图（右对齐）
         self.chat_panel.append_msg("user", shown,
-                                   sticker=stickers.MAP.get(tag) if tag else None)
+                                   sticker=stickers.MAP.get(tag) if tag else None,
+                                   image=img)
         local = self._local_skill(clean) if clean else None
         if local is not None:
             self._chat_out(local, user_text=shown, user_sticker=tag)
-            return
-        self._call_ds(clean or "（发来一张图片）", user_sticker=tag,
-                      attachment=attachment)
+            return True
+        # 纯表情消息发给 AI 的正文：[表情]（sticker_tag 会由 _ai_user_content 补语义提示）
+        ai_text = "[表情]" if (not clean and tag) else (clean or "（发来一张图片）")
+        return self._call_ds(ai_text, user_sticker=tag, attachment=attachment)
 
     def _chat_out(self, text, save=True, user_text=None, streamed=False, sticker=None,
-                  user_sticker=None):
+                  user_sticker=None, meme=None):
         """主线程：鲸鱼娘回复 → 面板 + 气泡 (+ 历史/记忆)
         streamed=True 表示回复已在面板上流式逐字显示过，此处不再重复追加。
         sticker=表情文件名：写入历史条目并在聊天气泡下方渲染缩略图。
-        user_sticker=用户消息的表情标签：随 user 历史条目保存，供重渲染与 AI 上下文感知。"""
-        text, meme = pet_memes.parse_reply(text, self._meme_pool())
+        user_sticker=用户消息的表情标签：随 user 历史条目保存，供重渲染与 AI 上下文感知。
+        meme=FC 意图传来的表情包名：优先于正文 [图:] 标记解析（后者是 fallback）。"""
+        text, parsed_meme = pet_memes.parse_reply(text, self._meme_pool())
+        meme = meme or parsed_meme
         if user_text:
             with self._mem_lock:
                 item = {"role": "user", "content": user_text}
                 if user_sticker:
                     item["sticker_tag"] = user_sticker
                 self.chat_history.append(item)
-                self.chat_history = self.chat_history[-self.max_history:]
+                # 原地截断：重绑成切片会破坏「chat_history 就是会话 messages」的身份，
+                # 期间在飞的 Harness 回复会被 _persist 当成会话已清空而丢弃
+                if len(self.chat_history) > self.max_history:
+                    del self.chat_history[:len(self.chat_history) - self.max_history]
         if save:
             with self._mem_lock:
                 item = {"role": "assistant", "content": text}
                 if sticker:
                     item["sticker"] = sticker
                 self.chat_history.append(item)
-                self.chat_history = self.chat_history[-self.max_history:]
+                if len(self.chat_history) > self.max_history:
+                    del self.chat_history[:len(self.chat_history) - self.max_history]
                 self._save_mem()
         if user_text or save:
             self._save_current()   # 多会话持久化 + 自动命名 + 刷新会话栏
@@ -343,19 +349,32 @@ class ChatMixin:
         return c
 
     def _call_ds(self, user_msg, user_sticker=None, attachment=None):
+        """返回 True=已受理（发出或排队）；False=拒绝（无 Key / 排队已满）——调用方应保留输入。"""
         if self.ds_busy:
-            self._chat_out("等等，上一句还没回完呢", save=False)
-            return
+            # 不丢消息：进待发队列，上一句回来后由 tick 自动续发
+            pending = getattr(self, "_pending_msgs", None)
+            if pending is None:
+                pending = self._pending_msgs = []
+            if len(pending) < 3:
+                pending.append((user_msg, user_sticker, attachment))
+                self._chat_out("（前面还有 %d 句没回完，你的排队中…）"
+                               % len(pending), save=False)
+                return True
+            self._chat_out("排队已满（最多 3 条），稍等一下再发", save=False)
+            return False
         key = self.cfg.get("ds_api_key", "")
         if not key:
             self._chat_out("请先在右键菜单里设置 DeepSeek Key！", save=False)
-            return
+            return False
         self.ds_busy = True
         self.chat_panel.set_busy(True)
+        # 快照：请求飞期间用户可能切会话，迟到的回复必须写回发起时的会话
+        sid = self._current_sid
+        hist = self.chat_history   # 与发起会话共享同一 list，原地追加即写对地方
         with self._mem_lock:
-            hist = [dict(m) for m in self.chat_history[-12:]]
+            ctx = [dict(m) for m in hist[-12:]]
         messages = [{"role": "system", "content": self._build_system_prompt()}]
-        for m in hist:
+        for m in ctx:
             role = m.get("role")
             if role == "user":
                 messages.append({"role": "user", "content": self._ai_user_content(m)})
@@ -374,125 +393,117 @@ class ChatMixin:
             ]
         messages.append(last_user)
 
+        def _persist(item):
+            """后台线程落一条历史：原地追加到发起会话的 list（失败路径也走这里）。
+
+            发起会话的 messages 被换成新 list 只有一种可能——用户清空/按轮删除
+            （sessions._clear_session_messages / service_hooks._api_chat_delete）。
+            此时迟到的回复必须丢弃，无条件回填会把用户刚删的消息整批复活。"""
+            with self._mem_lock:
+                cur = next((s for s in self._sessions if s["id"] == sid), None)
+                if cur is None or cur["messages"] is not hist:
+                    return
+                hist.append(item)
+                if len(hist) > self.max_history:
+                    del hist[:-self.max_history]
+                # 注：_save_mem 落的是 self.chat_history（当前会话）；切会话场景下
+                # pet_memory.json 的 hist 镜像可能缺迟到那一条，仅影响旧文件迁移兜底
+                self._save_mem()
+                if not cur.get("title"):
+                    cur["title"] = self._auto_title(hist)
+                self._save_sessions()
+
         def worker():
-            url = f"{DS_BASE_URL}/chat/completions"
-            headers = {"Authorization": f"Bearer {key}",
-                       "Content-Type": "application/json"}
-            payload = {"model": DS_MODEL, "messages": messages,
-                       "max_tokens": 120, "temperature": 0.9,
-                       "thinking": {"type": "disabled"},
-                       "stream": True,
-                       "stream_options": {"include_usage": True}}
-            resp = None
             try:
-                resp = requests.post(url, json=payload, headers=headers,
-                                     timeout=25, stream=True)
-                if resp.status_code == 200:
-                    reply_parts = []
-                    usage = None
-                    # 逐行解析 SSE 流：data: {...}，data: [DONE] 结束
-                    for line in resp.iter_lines(decode_unicode=True):
-                        if not line:
-                            continue
-                        line = line.strip()
-                        if not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(data)
-                        except Exception:
-                            continue
-                        if obj.get("usage"):
-                            usage = obj["usage"]          # 流结束块带用量统计
-                        choices = obj.get("choices") or []
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta") or {}
-                        piece = delta.get("content")
-                        if piece:
-                            reply_parts.append(piece)
-                            # 入队增量，主线程 tick 逐段刷新面板 → 打字机效果
-                            self._stream_queue.append(piece)
-                    reply = "".join(reply_parts).strip()
-                    # 先解析表情标记，再统一收尾：优先取【最末尾】的 <sticker:标签>，
-                    # 避免后续文本截断把末尾标记切掉导致表情丢失
-                    sticker = None
+                uitem = {"role": "user", "content": user_msg}
+                if user_sticker:
+                    uitem["sticker_tag"] = user_sticker
+                if attachment and attachment.get("id"):
+                    uitem["attachment"] = attachment["id"]
+                _persist(uitem)      # 先落 user：超时/报错路径重载也不会「没发过」
+                # Harness：带思考 + 工具自主决策（检索/发送表情），≤3 跳后给正文
+                state = {"meme": None, "sticker": None}
+                reply, usage, state = pet_harness.run_turn(
+                    self, messages, key, state=state)
+                reply = (reply or "").strip()
+                # fallback：模型没调工具、仍按旧协议写 <sticker:> 标记时照样生效；
+                # FC 意图优先（标记协议已定位为 fallback）
+                sticker = state.get("sticker")
+                if not sticker:
                     m = re.search(r"<sticker:([^>]+)>\s*$", reply)
                     if m and m.group(1).strip() in stickers.MAP:
                         sticker = stickers.MAP[m.group(1).strip()]
-                    reply = re.sub(r"<sticker:[^>]+>", "", reply).strip()  # 剥离全部标记，避免明文
-                    reply = re.sub(r"\s+", " ", reply)
-                    if len(reply) > 90:
-                        reply = reply[:88] + "…"
-                    if not reply:
-                        reply = "（刚刚走神了…再说一次嘛）"
-                    with self._mem_lock:
-                        uitem = {"role": "user", "content": user_msg}
-                        if user_sticker:
-                            uitem["sticker_tag"] = user_sticker
-                        self.chat_history.append(uitem)
-                        item = {"role": "assistant", "content": reply}
-                        if sticker:
-                            item["sticker"] = sticker
-                        self.chat_history.append(item)
-                        self.chat_history = self.chat_history[-self.max_history:]
-                        self._save_mem()
-                        cur = self._find_session(self._current_sid)
-                        cur["messages"] = self.chat_history
-                        if not cur.get("title"):
-                            cur["title"] = self._auto_title(self.chat_history)
-                        self._save_sessions()   # 多会话持久化（后台线程只落盘，不碰 Qt）
-                    self._chat_queue.append((reply, False, sticker))  # 历史已存，主线程做流式收尾
-                    # 每轮消耗统计（Token 悬浮窗数据源；气泡提示仍受 show_turn_cost 控制）
-                    if usage:
-                        self._last_turn_cost = calc_turn_cost(DS_MODEL, usage) or 0.0
-                        self._last_turn_tokens = (int(usage.get("prompt_tokens") or 0)
-                                                  + int(usage.get("completion_tokens") or 0))
-                        self._token_stats_dirty = True
-                        self._record_tokens(self._last_turn_tokens)
-                        if self.cfg.get("show_turn_cost", False) and self._last_turn_cost > 0:
-                            self._queue_say(f"本轮消耗 ¥{self._last_turn_cost:.4f}")
-                    # 对话完成后顺带静默刷新一次余额（失败也不打扰）
-                    if key and not self._balance_busy:
-                        self._balance_busy = True
-                        threading.Thread(target=self._refresh_balance,
-                                         args=(key,), daemon=True).start()
-                    # 后台静默提取"关于主人的事实"
-                    threading.Thread(target=self._fact_extract,
-                                     args=(key, user_msg, reply), daemon=True).start()
-                else:
-                    try:
-                        error_msg = resp.json().get("error", {}).get("message",
-                                                                     str(resp.status_code))
-                    except Exception:
-                        error_msg = str(resp.status_code)
-                    print(f"[DeepSeek] 状态码: {resp.status_code}, 返回: {resp.text[:200]}")
-                    if attachment:
-                        err = "图片没发出去（当前模型可能不支持图片）：%s" % str(error_msg)[:16]
-                    else:
-                        err = f"API出错了：{str(error_msg)[:20]}"
-                    self._stream_queue.append(err)   # 错误也作为增量显示（若无流则以它开头）
-                    self._chat_queue.append((err, False, None))
+                reply = re.sub(r"<sticker:[^>]+>", "", reply).strip()  # 剥离全部标记，避免明文
+                reply = re.sub(r"\s+", " ", reply)
+                if not reply:
+                    reply = "（刚刚走神了…再说一次嘛）"
+                with self._mem_lock:
+                    item = {"role": "assistant", "content": reply}
+                    if sticker:
+                        item["sticker"] = sticker
+                    _persist(item)
+                # transport 非流式：正文分段重放补打字机节奏（总时长封顶 ~4s）
+                chunks = max(1, -(-len(reply) // 2))
+                delay = min(0.03, 4.0 / chunks)
+                for i in range(0, len(reply), 2):
+                    self._stream_queue.append(reply[i:i + 2])
+                    time.sleep(delay)
+                # 历史已存；主线程收尾（streamed=True 时重写为干净文本+表情）
+                self._chat_queue.append((reply, False, sticker, state.get("meme")))
+                # 每轮消耗统计（Token 悬浮窗数据源；气泡提示仍受 show_turn_cost 控制）
+                if usage:
+                    self._last_turn_cost = calc_turn_cost(DS_MODEL, usage) or 0.0
+                    self._last_turn_tokens = (int(usage.get("prompt_tokens") or 0)
+                                              + int(usage.get("completion_tokens") or 0))
+                    self._token_stats_dirty = True
+                    self._record_tokens(self._last_turn_tokens)
+                    if self.cfg.get("show_turn_cost", False) and self._last_turn_cost > 0:
+                        self._queue_say(f"本轮消耗 ¥{self._last_turn_cost:.4f}")
+                # 对话完成后顺带静默刷新一次余额（失败也不打扰）
+                if key and not self._balance_busy:
+                    self._balance_busy = True
+                    threading.Thread(target=self._refresh_balance,
+                                     args=(key,), daemon=True).start()
+                # 后台静默提取"关于主人的事实"
+                threading.Thread(target=self._fact_extract,
+                                 args=(key, user_msg, reply), daemon=True).start()
             except requests.exceptions.Timeout:
-                err = "请求超时了，网络不太好…"
-                self._stream_queue.append(err)
-                self._chat_queue.append((err, False, None))
+                self._fail("请求超时了，网络不太好…")
             except requests.exceptions.ConnectionError:
-                err = "连不上 DeepSeek，看看网络？"
-                self._stream_queue.append(err)
-                self._chat_queue.append((err, False, None))
+                self._fail("连不上 DeepSeek，看看网络？")
+            except requests.exceptions.HTTPError as e:
+                # 401/402 等要把服务端的真实原因带给用户（Key 失效/欠费），
+                # 别只剩一句「出错了：402 Client Error」
+                reason = ""
+                try:
+                    reason = str((e.response.json().get("error") or {})
+                                 .get("message") or "")[:40]
+                except Exception:
+                    reason = str(e)[:40]
+                if attachment:
+                    err = "图片没发出去（当前模型可能不支持图片）：%s" % reason
+                else:
+                    err = "API出错了：%s" % (reason or str(e)[:20])
+                self._fail(err)
             except Exception as e:
-                err = f"出错了：{str(e)[:20]}"
-                self._stream_queue.append(err)
-                self._chat_queue.append((err, False, None))
+                pet_log.error("聊天 Harness 失败: %s" % e)
+                self._fail(f"出错了：{str(e)[:20]}")
             finally:
                 self.ds_busy = False
-                if resp is not None:
-                    try:
-                        resp.close()
-                    except Exception:
-                        pass
 
-        threading.Thread(target=worker, daemon=True).start()
+        def _fail(text):
+            """错误上屏：同时进流式队列（重放已开始时面板不会停在半句话）。"""
+            self._stream_queue.append(text)
+            self._chat_queue.append((text, False, None, None))
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as e:
+            # start() 失败（线程资源耗尽）时 worker 的 finally 不会跑：必须在这里复位，
+            # 否则 ds_busy 永久卡 True，之后所有消息都进排队直到「排队已满」
+            self.ds_busy = False
+            self.chat_panel.set_busy(False)
+            pet_log.error("聊天工作线程启动失败: %s" % e)
+            self._fail("这会儿有点忙不过来，稍后再试…")
+            return False
+        return True

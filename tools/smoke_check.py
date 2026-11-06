@@ -232,7 +232,7 @@ def _():
     clean2, got2 = st.split("正文 <sticker:绝对不存在的标签>")
     assert got2 is None and "<sticker:" not in clean2, (got2, clean2)
     assert st.path_for(st.MAP[tag]).endswith(st.MAP[tag]), "表情路径拼错"
-    assert st.PROMPT_TEMPLATE.count("{groups}") == 1, "提示词占位符丢失"
+    assert any(emo == "开心" for emo, _ in st.GROUPS), "情绪组丢失"
 
 
 @check("logic: 峰谷时段（工作日峰/谷 + 周末全谷）")
@@ -366,7 +366,7 @@ def _():
         assert "奶茶" in f.read()
 
 
-@check("chat: 系统提示词包含人设/记忆/城市/表情规范")
+@check("chat: 系统提示词包含人设/记忆/城市/Harness 工具提示")
 def _():
     w = CTX["win"]
     w.cfg["city"] = "汕头"
@@ -377,7 +377,11 @@ def _():
     assert "小鱼" in sp, "称呼未注入"
     assert "喜欢喝奶茶" in sp, "记忆未注入"
     assert "汕头" in sp, "城市未注入"
-    assert "【表情使用规范】" in sp, "表情规范未注入"
+    assert "【表达工具】" in sp, "Harness 工具提示丢失"
+    assert "search_memes" in sp and "send_sticker" in sp
+    # 回归护栏：表情目录不再整份注入（改 FC 按需召回）
+    assert "【表情使用规范】" not in sp, "旧表情规范又回到提示词了"
+    assert "[配图]" not in sp, "旧表情包目录又回到提示词了"
     w.pet_name = ""
 
 
@@ -549,7 +553,7 @@ def _():
         "pet.sessions": ("_gen_sid", "_auto_title", "_load_sessions", "_find_session",
                          "_save_sessions", "_save_current", "_new_session", "_switch_session",
                          "_clear_session_messages"),
-        "pet.chat": ("_build_system_prompt", "_sticker_prompt_block", "_show_chat_dialog",
+        "pet.chat": ("_build_system_prompt", "_show_chat_dialog",
                      "_send_chat", "_chat_out", "_ai_user_content", "_call_ds"),
         "pet.motion": ("_tick_spring", "_tick_anim_clocks", "_tick_movement", "_pet_state",
                        "_sprite_key", "_set_dir", "_maybe_idle_action", "_start_emote",
@@ -2187,7 +2191,11 @@ def _():
         assert len(panel._msg_blocks) == 30, len(panel._msg_blocks)
         assert panel.earlier_btn.isHidden()
     finally:
-        w.chat_history = old_hist
+        # 恢复内容与身份（chat_history 必须仍是会话的同一个 list，
+        # 否则后续 Harness 用例的 _persist 会把回复当「会话已清空」丢弃）
+        cur = w._find_session(w._current_sid)
+        w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
         w._reload_panel()
 
 
@@ -2585,9 +2593,10 @@ def _():
         w.balance_result = None
 
 
-@check("memes: 提示词注入/回复标记/配图气泡/碎碎念配图")
+@check("memes: 回复标记/配图气泡/碎碎念配图/FC 检索")
 def _():
     import os
+    from pet import harness as H
     w = CTX["win"]
     path = os.path.join(CTX["tmpdir"], "meme.png")
     with open(path, "wb") as f:
@@ -2608,8 +2617,12 @@ def _():
         assert w._dsh_image_path == path
         assert w._dsh_custom_text == "嘿嘿", w._dsh_custom_text
         assert said and said[-1] == "嘿嘿", said
+        # 提示词不再注入目录；检索改走 FC 工具按需召回
         prompt = w._build_system_prompt()
-        assert "[图:" in prompt and "测试图" in prompt
+        assert "[图:" not in prompt and "测试图" not in prompt
+        hits = H.search_memes(w, "测试")
+        assert "测试图" in hits and "用来测试的图" in hits, hits
+        assert "没有找到" in H.search_memes(w, "不存在的关键词xyz")
         w._chat_out("没有标记", save=False)
         assert w._dsh_bubble_kind == "custom"
         w._chat_once = lambda p, system=None: "今天也要加油"
@@ -2624,6 +2637,320 @@ def _():
         w._dsh_bubble_kind = old_kind
         w._dsh_bubble_until = old_until
         w._dsh_image_path = None
+
+
+@check("harness: 两跳工具链路 + 意图收集 + messages 结构")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    m = CTX["mod"]
+    old_pool = getattr(w, "_meme_pool_cache", None)
+    w._meme_pool_cache = {"累瘫图": {"path": "x.png", "desc": "适合累瘫"}}
+    tag = next(iter(m.stickers.MAP))
+    hops = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        hops.append({"n": len(messages), "tools": bool(tools)})
+        if len(hops) == 1:
+            return ({"content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "search_memes", "arguments": '{"keyword": "累"}'}}]},
+                None, "tool_calls")
+        if len(hops) == 2:
+            return ({"content": "内心OS", "tool_calls": [
+                {"id": "c2", "type": "function", "function": {
+                    "name": "send_meme", "arguments": '{"name": "累瘫图"}'}},
+                {"id": "c3", "type": "function", "function": {
+                    "name": "send_sticker",
+                    "arguments": '{"tag": "%s"}' % tag}}]},
+                None, "tool_calls")
+        return ({"content": "主人辛苦啦，抱抱～"},
+                {"prompt_tokens": 20, "completion_tokens": 8}, "stop")
+
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "累死了"}]
+    state = {"meme": None, "sticker": None}
+    try:
+        reply, usage, state = H.run_turn(w, messages, "k", state=state,
+                                         transport=fake)
+    finally:
+        w._meme_pool_cache = old_pool
+    assert reply == "主人辛苦啦，抱抱～", reply
+    assert state["meme"] == "累瘫图" and state["sticker"] == m.stickers.MAP[tag], state
+    assert usage and usage["prompt_tokens"] == 20
+    assert [x["role"] for x in messages] == ["system", "user", "assistant", "tool",
+                                             "assistant", "tool", "tool"], messages
+    assert hops[0]["tools"] is True, "首跳必须带工具"
+    tool_msgs = [x for x in messages if x["role"] == "tool"]
+    assert all(x["tool_call_id"] for x in tool_msgs), "tool 消息缺 tool_call_id"
+    assert any("累瘫图" in x["content"] for x in tool_msgs), "检索结果未回喂"
+    assert messages[4]["content"] == "内心OS", "并发 content 应保留在结构里"
+
+
+@check("harness: 跳数用尽去掉工具逼正文")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    hops = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        hops.append(bool(tools))
+        if tools:
+            return ({"content": "", "tool_calls": [
+                {"id": "x", "type": "function", "function": {
+                    "name": "search_memes", "arguments": "{}"}}]}, None, "tool_calls")
+        return ({"content": "好吧，直接说"}, None, "stop")
+
+    reply, _usage, _state = H.run_turn(w, [{"role": "user", "content": "hi"}], "k",
+                                       transport=fake)
+    assert reply == "好吧，直接说", reply
+    assert len(hops) == H.MAX_HOPS + 1, hops
+    assert hops[-1] is False, "最后一次请求必须去掉工具"
+
+
+@check("harness: 工具边界（未入库/每轮上限/未知工具/坏参数）")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    old_pool = getattr(w, "_meme_pool_cache", None)
+    w._meme_pool_cache = {"累瘫图": {"path": "x.png", "desc": "适合累瘫"}}
+    try:
+        st = {"meme": None, "sticker": None}
+        assert "不在库中" in H.execute_tool(w, "send_meme", '{"name": "不存在"}', st)
+        assert st["meme"] is None, "未入库不能记意图"
+        assert "已准备" in H.execute_tool(w, "send_meme", '{"name": "累瘫图"}', st)
+        assert "已经发过" in H.execute_tool(w, "send_meme", '{"name": "累瘫图"}', st)
+        assert st["meme"] == "累瘫图"
+        assert "不存在" in H.execute_tool(w, "send_sticker", '{"tag": "不存在"}', st)
+        assert st["sticker"] is None
+        assert "未知工具" in H.execute_tool(w, "nope", "{}", st)
+        assert "不在库中" in H.execute_tool(w, "send_meme", "not-json",
+                                          {"meme": None, "sticker": None})
+        assert "库是空的" in H.search_memes(type("W", (), {"_meme_pool": lambda s: {}})(), "累")
+    finally:
+        w._meme_pool_cache = old_pool
+
+
+@check("harness: search_stickers 情绪组/子串/兜底")
+def _():
+    from pet import harness as H
+    out = H.search_stickers("开心")
+    assert "开心" in out and "嘻嘻" in out, out
+    assert "匹配标签" in H.search_stickers("嘻嘻")
+    fallback = H.search_stickers("绝对不存在的词xyz")
+    assert "没有匹配" in fallback and "委屈" in fallback, fallback
+
+
+@check("harness: _call_ds 全链路（假 transport + 意图入队 + 历史 + 标记 fallback）")
+def _():
+    import os
+    import time
+    from pet import harness as H
+    w, m = CTX["win"], CTX["mod"]
+    path = os.path.join(CTX["tmpdir"], "harness_meme.png")
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+    old_pool = getattr(w, "_meme_pool_cache", None)
+    w._meme_pool_cache = {"累瘫图": {"path": path, "desc": "适合累瘫"}}
+    tag = next(iter(m.stickers.MAP))
+    old_tr = H.deepseek_transport
+    old_fe, old_rb = w._fact_extract, w._refresh_balance
+    old_busy = w._balance_busy
+    old_sessions = w._sessions
+    old_sid = w._current_sid
+    old_hist = list(w.chat_history)
+    old_kind = getattr(w, "_dsh_bubble_kind", None)
+    w._fact_extract = lambda *a, **k: None
+    w._refresh_balance = lambda *a, **k: None
+    script = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        # 线程契约断言：Harness 不许跑在 GUI 线程（工具会越攒越多，迟早碰 Qt）
+        from PySide6.QtCore import QThread
+        assert QThread.currentThread() is not CTX["app"].thread(), \
+            "transport 跑在了 GUI 线程"
+        script.append(bool(tools))
+        if len(script) == 1:
+            return ({"content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "send_meme", "arguments": '{"name": "累瘫图"}'}}]},
+                None, "tool_calls")
+        return ({"content": "辛苦啦～"},
+                {"prompt_tokens": 5, "completion_tokens": 2}, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        del w._call_ds                 # 恢复类方法（setup 里被整体打桩）
+        # 重建身份不变式：前面的用例可能重绑过 chat_history（_persist 依赖
+        # 「chat_history 就是当前会话的 messages」判断会话是否被清空）
+        cur = w._find_session(w._current_sid)
+        w.chat_history = cur["messages"]
+        w.cfg["ds_api_key"] = "sk-test"
+        w.ds_busy = False
+        w._pending_msgs.clear()
+        assert w._call_ds("累死了") is True
+        deadline = time.time() + 10
+        while (w.ds_busy or not w._chat_queue) and time.time() < deadline:
+            CTX["app"].processEvents()
+            time.sleep(0.005)
+        assert not w.ds_busy and w._chat_queue, "worker 未在时限内完成"
+        item = w._chat_queue[-1]
+        assert item[0] == "辛苦啦～" and item[3] == "累瘫图", item
+        assert item[2] is None, "本轮没调 send_sticker，sticker 应为 None"
+        tail = w.chat_history[-2:]
+        assert [x["role"] for x in tail] == ["user", "assistant"], tail
+        assert tail[0]["content"] == "累死了" and tail[1]["content"] == "辛苦啦～"
+        assert all("tool_calls" not in x for x in tail), "tool 消息不能落历史"
+        w._tick_consume_queues()       # 消费 → _chat_out 渲染（含表情包上屏）
+        assert w._dsh_bubble_kind == "meme" and w._dsh_image_path == path
+        assert any("辛苦啦" in b for b in w.chat_panel._msg_blocks)
+        # fallback：模型不调工具、按旧协议写 <sticker:> 标记时照样生效
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        script.clear()
+
+        def fake2(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+            return ({"content": "主人最好啦 <sticker:%s>" % tag},
+                    {"prompt_tokens": 1, "completion_tokens": 1}, "stop")
+
+        H.deepseek_transport = fake2
+        assert w._call_ds("在吗") is True
+        deadline = time.time() + 10
+        while (w.ds_busy or not w._chat_queue) and time.time() < deadline:
+            CTX["app"].processEvents()
+            time.sleep(0.005)
+        assert not w.ds_busy and w._chat_queue, "fallback worker 未完成"
+        item = w._chat_queue[-1]
+        assert item[0] == "主人最好啦" and item[2] == m.stickers.MAP[tag], item
+        assert item[3] is None, "fallback 轮不应有 FC 意图"
+        w._tick_consume_queues()
+        assert "<sticker:" not in "".join(w.chat_panel._msg_blocks)
+    finally:
+        H.deepseek_transport = old_tr
+        w._fact_extract, w._refresh_balance = old_fe, old_rb
+        w._balance_busy = old_busy
+        w._meme_pool_cache = old_pool
+        w._dsh_bubble_kind = old_kind
+        w._call_ds = lambda *a, **k: None      # 恢复 setup 的全局断网桩
+        w._sessions = old_sessions
+        w._current_sid = old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]   # 恢复「chat_history is 会话 list」身份
+        w.chat_history[:] = old_hist
+        w._reload_panel()
+
+
+@check("harness: 飞行中清空会话，迟到回复不复活旧数据（H1 护栏）")
+def _():
+    import time
+    from pet import harness as H
+    w = CTX["win"]
+    old_tr = H.deepseek_transport
+    old_fe, old_rb = w._fact_extract, w._refresh_balance
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    w._fact_extract = lambda *a, **k: None
+    w._refresh_balance = lambda *a, **k: None
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        # 请求「飞行中」用户按了清空。只复现数据侧效果（_clear_session_messages
+        # 去掉 UI 调用后的部分）：会话 messages 被换成新 list。绝不能在这里调
+        # _clear_session_messages 本体——它内部碰 Qt，而 fake 跑在工作线程
+        with w._mem_lock:
+            s = w._find_session(w._current_sid)
+            s["messages"] = []
+            w.chat_history = s["messages"]
+            w._save_sessions()
+        return ({"content": "迟到的回复"}, None, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        del w._call_ds
+        w.cfg["ds_api_key"] = "sk-test"
+        w.ds_busy = False
+        w._pending_msgs.clear()
+        w.chat_history[:] = [{"role": "user", "content": "旧消息甲"},
+                             {"role": "assistant", "content": "旧消息乙"}]
+        assert w._call_ds("新消息") is True
+        deadline = time.time() + 10
+        while (w.ds_busy or not w._chat_queue) and time.time() < deadline:
+            CTX["app"].processEvents()
+            time.sleep(0.005)
+        assert not w.ds_busy, "worker 未在时限内结束"
+        assert w._chat_queue and w._chat_queue[-1][0] == "迟到的回复", \
+            "回复仍应上屏（显示层不受影响）"
+        assert w.chat_history == [], \
+            "迟到回复把用户清空掉的旧消息复活了：%s" % w.chat_history
+    finally:
+        H.deepseek_transport = old_tr
+        w._fact_extract, w._refresh_balance = old_fe, old_rb
+        w._call_ds = lambda *a, **k: None
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._reload_panel()
+
+
+@check("harness: 工具参数边界（dict 参数 / 缺 id / 坏 JSON）")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    old_pool = getattr(w, "_meme_pool_cache", None)
+    w._meme_pool_cache = {"累瘫图": {"path": "x.png", "desc": "适合累瘫"}}
+    try:
+        st = {"meme": None, "sticker": None}
+        # arguments 是 dict（非流式响应里两种形态都可能出现）
+        assert "已准备" in H.execute_tool(w, "send_meme", {"name": "累瘫图"}, st)
+        assert st["meme"] == "累瘫图"
+        # tool_call_id 缺失时 run_turn 侧兜底（协议不变量）
+        msgs = []
+        H.run_turn(w, msgs, "k", state={"meme": None, "sticker": None},
+                   transport=lambda m, key=None, model=None, max_tokens=None,
+                   tools=H.TOOLS: ({"content": "", "tool_calls": [
+                       {"type": "function", "function": {
+                           "name": "search_stickers", "arguments": "{}"}}]},
+                       None, "tool_calls")
+                   if len([x for x in m if x["role"] == "tool"]) == 0
+                   else ({"content": "好"}, None, "stop"))
+        tool_msgs = [x for x in msgs if x["role"] == "tool"]
+        assert tool_msgs and tool_msgs[0]["tool_call_id"], "缺 id 时必须有兜底值"
+    finally:
+        w._meme_pool_cache = old_pool
+
+
+@check("harness: DSML 文本调用兜底（模型把调用写进 content）")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    old_pool = getattr(w, "_meme_pool_cache", None)
+    w._meme_pool_cache = {"死掉了": {"path": "x.png", "desc": "翻肚皮"}}
+    hops = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        hops.append(len([x for x in messages if x["role"] == "tool"]))
+        if len(hops) == 1:
+            # 线上实测复现过的形态（注意标记内带空格，紧贴形态也要兼容）：
+            # 思考模型把调用写成文本 DSL，tool_calls 为空
+            return ({"content": '<|DSML| calls> <|DSML| invoke name="send meme"> '
+                               '<|DSML| parameter name="name" string="true">死掉了'
+                               '</|DSML| parameter> </|DSML| invoke> </|DSML| calls>'},
+                    None, "stop")
+        return ({"content": "拿去，代表你的状态"}, None, "stop")
+
+    try:
+        reply, _usage, state = H.run_turn(
+            w, [{"role": "user", "content": "累"}], "k",
+            state={"meme": None, "sticker": None}, transport=fake)
+    finally:
+        w._meme_pool_cache = old_pool
+    assert state["meme"] == "死掉了", state
+    assert "DSML" not in reply and "<|" not in reply, reply
+    assert reply == "拿去，代表你的状态", reply
+    # 解析失败的残留标记也必须被剥掉（不许到达用户界面）
+    assert H._strip_dsml("前奏 <|DSML| calls> 后奏") == "前奏 后奏"
+    assert H._strip_dsml("紧贴 <|DSML|calls> 形态") == "紧贴 形态"
 
 
 @check("notify: 外部通知帧（approval/question/session/error）")

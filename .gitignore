@@ -27,6 +27,7 @@ pet_memory.json
 pet_sessions.json
 usage_ledger.json
 attachments/
+memes/
 
 # 历史备份
 桌宠_backup_*.py

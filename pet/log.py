@@ -26,6 +26,9 @@ _REDACT = (
     re.compile(r"(?i)([#?&]token=)[^\s&\"']+"),
     re.compile(r"(?i)(\btoken\s*[:=]\s*)[^\s,;\"']+"),
     re.compile(r"(?i)(DSH_PET_SITE_URL=)\S+"),
+    # 兜底：将来任何一处误打印 Authorization 头或 sk- 形态 Key 不至于静默落盘
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}"),
+    re.compile(r"(?i)\bsk-[A-Za-z0-9\-]{16,}"),
 )
 
 _lock = threading.Lock()

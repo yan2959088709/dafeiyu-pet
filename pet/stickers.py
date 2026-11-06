@@ -14,9 +14,10 @@ from .storage import P
 
 THUMB_W = 110       # 聊天气泡内表情缩略图宽度(px)
 
-MAP = {}            # 标签 -> 文件名（ensure() 装载）
+MAP = {}            # 标签 -> 文件名（ensure() 装载）。仅启动期装配；后台线程只读，
+                    # 将来若要支持运行期重载，必须先解决 clear()+update() 的竞态
 
-# 情绪 -> 推荐标签 分组映射（注入系统提示词，让 AI 有据可依）
+# 情绪 -> 推荐标签 分组映射（Harness search_stickers 按组检索的素材）
 GROUPS = (
     ("开心", ("开心", "嘻嘻", "嘿嘿嘿", "哈哈哈", "豆包大笑", "傻笑", "眯眼笑", "微笑", "快哉快哉", "很好", "赞")),
     ("委屈", ("委屈巴巴", "呜呜", "呜哇", "快哭了", "哭", "大哭", "垂头丧气", "生无可恋", "低头不语", "自闭", "忧郁", "可怜")),
@@ -26,21 +27,6 @@ GROUPS = (
     ("思考疑问", ("思考", "仔细看", "看", "不知道啊", "啊原来这样呀", "hey?", "在干嘛", "怎么个事")),
     ("犯困疲惫", ("打哈欠", "趴桌边", "趴床上", "趴地上", "辛苦了", "长舒一口气")),
     ("坏笑耍宝", ("坏笑", "桀桀桀", "略", "噗", "阿巴阿巴", "不语", "看地板", "你个大笨蛋", "你能拿我怎样")),
-)
-
-# 表情使用规范提示词模板（注入 _build_system_prompt 末尾）
-PROMPT_TEMPLATE = (
-    "\n\n【表情使用规范】\n"
-    "你可以在回复的【最后一行】追加一个表情标记来表达当下的情绪，客户端会自动把对应表情图贴到这条消息下方，"
-    "不需要你在正文里解释或提及这个标记。\n"
-    "写法示例（标点收尾后另起一行）：\n"
-    "`.我这儿有办法啦 <sticker:开心>`\n"
-    "`.别难过嘛，抱抱你 <sticker:抱抱>`\n"
-    "参考「情绪→推荐标签」：\n{groups}\n"
-    "使用要点：\n"
-    "1. 这是你自带的能力，多数回复都值得在结尾配一个表情来贴合当下情绪（但别每句都刷），每轮最多 1 个；\n"
-    "2. 标记必须放在整条回复的【最末尾】、另起一行，格式为 ` <sticker:标签>`，前面不要有其他正文文字；\n"
-    "3. 只在确无合适情绪或对方明确不要时才省略；标签只能在上面的推荐列表里选取，不要发明不存在的标签。"
 )
 
 
@@ -66,9 +52,11 @@ def ensure():
             items = json.load(f)
         if isinstance(items, list):
             for it in items:
-                desc = str(it.get("description", "")).strip()
+                desc = str(it.get("description", "")).strip()[:80]
                 fn = str(it.get("fileName", "")).strip()
-                if desc and fn and os.path.exists(os.path.join(P.stickers, fn)):
+                # fileName 只允许单段文件名（防路径穿越）；描述截断进上下文
+                if desc and fn and fn == os.path.basename(fn) \
+                        and os.path.exists(os.path.join(P.stickers, fn)):
                     mapping[desc] = fn
     except Exception:
         pass
