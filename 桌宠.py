@@ -15,6 +15,18 @@ import threading
 import time
 
 
+# PySide6 wheel 不自带 icuuc.dll，Qt6Core 的依赖解析按 DLL 搜索路径找它。
+# 本机 anaconda 的 Library\bin 被注册进搜索路径且优先于 System32，其 icuuc.dll
+# 与 Qt6Core 不兼容（实测 import 报 WinError 127）；先按绝对路径加载 System32
+# 副本，后续依赖解析即按基名复用它。
+if sys.platform == "win32":
+    try:
+        ctypes.CDLL(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                 "System32", "icuuc.dll"))
+    except OSError:
+        pass
+
+
 from PySide6.QtCore import Qt, QTimer, QPoint, QObject, QEvent, QSize
 from PySide6.QtGui import QPixmap, QFont, QIcon, QMovie
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
@@ -42,7 +54,7 @@ from pet.lock import OccupancyLock                                  # noqa: E402
 from pet.petservice import PetService                               # noqa: E402
 from pet.apiserver import ApiServer, PREFIX as API_PREFIX           # noqa: E402
 from pet import runtime_state as pet_runtime                        # noqa: E402
-from pet.service_hooks import ServiceHooksMixin                     # noqa: E402
+from pet.service_hooks import ServiceHooksMixin, UiBridge           # noqa: E402
 from pet.desktop import DesktopMixin                                 # noqa: E402
 from pet.pointmove import PointPickMixin                              # noqa: E402
 from pet import lunar_table as pet_lunar                           # noqa: E402
@@ -1064,6 +1076,8 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             flags |= Qt.WindowType.WindowStaysOnTopHint
         super().__init__(None, flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # HTTP 服务线程 → GUI 线程封送桥：本地接口的窗口操作经它回主线程
+        self._ui_bridge = UiBridge(self)
         self.pet_name = str(self.pet_conf.get("name") or "").strip() or \
             str(self.cfg.get("pet_name", "")).strip()   # 可编辑名字（未配置回退默认）
 
@@ -1217,6 +1231,7 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         self.timer.timeout.connect(self.tick)
         self.timer.start(TICK)
 
+        self._whisper_busy = False
         self._whisper_timer = QTimer(self)
         self._whisper_timer.timeout.connect(self._whisper_tick)
         self._whisper_timer.start(30000)
@@ -1292,6 +1307,15 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         皮肤协议见 skins/base.py；后续新增皮肤（deepseek-girl）只需注册并保持协议即可。
         """
         self.character = name
+        # 工作态动画名绑皮肤：趁旧皮肤还在先走正常收尾（丢待播/结束当前演出）。
+        # 不清的话 _end_emote 会拿旧皮肤的动作名无限重排，新皮肤无此帧，
+        # emote 长期非空 → 不走位、不随机动作，宠物冻在原地。
+        # 必须在 load_skin 之前：_end_emote 里的 is_turn_anim(was) 要用旧皮肤判定
+        clear_work = getattr(self, "_clear_work_anim", None)
+        if callable(clear_work):
+            clear_work()
+        self._work_sig = None
+        self._work_text = None
         self.skin = load_skin(name)
         self.skin.load(self._skin_heights())
         self._auto_next_at = 0
@@ -1946,7 +1970,15 @@ def main():
         app._pet_window = w
         wins = [w]
     cfg = pet_config.load_config()
-    svc = PetService(cfg_provider=pet_config.load_config)
+
+    def _cfg_for_service():
+        # 服务层读配置必须解回明文：否则 GET /config 返回密文、
+        # PUT /config 与 AI 设置拿到 "dpapi:..." 当 Key
+        c = pet_config.load_config()
+        credentials.load_secrets(c)
+        return c
+
+    svc = PetService(cfg_provider=_cfg_for_service)
     for win in wins:
         svc.register_pet(win.pet_id, win._api_hooks())
     app._pet_service = svc

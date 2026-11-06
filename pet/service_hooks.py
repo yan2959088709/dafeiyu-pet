@@ -9,9 +9,10 @@
 的算法——不再另写一套插值，否则手感和拖拽抛掷会分叉。
 """
 import math
+import threading
 import time
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QObject, QThread, Signal, Slot, QTimer
 from PySide6.QtWidgets import QApplication
 
 from pet import chat_memory
@@ -24,8 +25,89 @@ NO_IMAGE_MSG = "当前模式不支持图片（缺少附件服务）"
 PUSH_MIN_SPEED = 30.0     # 碰撞轻推的最小速度：低于它不折腾（px/s）
 
 
+class _UiCall:
+    """一次封送到 GUI 线程的调用：携带返回值/异常与完成事件。"""
+
+    __slots__ = ("fn", "args", "kwargs", "done", "cancelled", "value", "error")
+
+    def __init__(self, fn, args, kwargs):
+        self.fn, self.args, self.kwargs = fn, args, kwargs
+        self.done = threading.Event()
+        self.cancelled = False
+        self.value = self.error = None
+
+    def run(self):
+        if self.cancelled:
+            # 调用方已超时放弃：GUI 线程恢复后不再补做这个过期动作，
+            # 否则会出现「接口报 500，几十秒后动作照样发生」的审计不一致
+            self.done.set()
+            return
+        try:
+            self.value = self.fn(*self.args, **self.kwargs)
+        except Exception as e:  # noqa: BLE001 - 原样抛回调用线程
+            self.error = e
+        finally:
+            self.done.set()
+
+    def wait(self, timeout=15.0):
+        if not self.done.wait(timeout):
+            self.cancelled = True
+            raise TimeoutError("GUI 线程 %ss 内未执行封送调用" % timeout)
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+class UiBridge(QObject):
+    """HTTP 工作线程 → GUI 线程封送桥。
+
+    Qt 控件只能由 GUI 线程触碰；本地接口跑在 ThreadingHTTPServer 的工作线程里，
+    直接调 move()/update()/QTimer.start() 是未定义行为（定时器甚至会完全不触发）。
+    跨线程 emit 信号会被 Qt 自动排成队列事件、在 GUI 线程执行——官方封送范式。
+    """
+
+    trigger = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.trigger.connect(self._drain)
+
+    def submit(self, fn, args, kwargs):
+        call = _UiCall(fn, args, kwargs)
+        self.trigger.emit(call)
+        return call.wait()
+
+    @Slot(object)
+    def _drain(self, call):
+        call.run()
+
+
 class ServiceHooksMixin:
     """PetWindow 的本地接口能力。"""
+
+    # 触达 Qt 的钩子：HTTP 工作线程调用时必须封送回 GUI 线程。
+    # whisper（长网络请求）与纯数据钩子不封送——前者不能占着 GUI 线程等 30s。
+    _UI_HOOKS = frozenset({"say", "clear_bubble", "anim", "position", "throw",
+                           "preempt", "notify", "reload", "quit", "display",
+                           "chat_send", "chat_delete", "roster"})
+
+    def _ui_call(self, fn, *args, **kwargs):
+        """把窗口操作封送回 GUI 线程执行并带回返回值；已在 GUI 线程则直接调。"""
+        app = QApplication.instance()
+        if app is None or QThread.currentThread() is app.thread():
+            return fn(*args, **kwargs)
+        bridge = getattr(self, "_ui_bridge", None)
+        if bridge is None:
+            # 不该发生（PetWindow.__init__ 恒建桥）：退回直调并留痕，
+            # 而不是静默回到「跨线程直接操作 Qt」的老路
+            pet_log.warn("UiBridge 缺失：窗口操作退回直调（跨线程风险）")
+            return fn(*args, **kwargs)
+        return bridge.submit(fn, args, kwargs)
+
+    def _wrap_ui(self, fn):
+        def wrapped(*args, **kwargs):
+            return self._ui_call(fn, *args, **kwargs)
+        return wrapped
 
     def _api_area(self):
         scr = (self.screen() or QApplication.primaryScreen()).availableGeometry()
@@ -35,7 +117,7 @@ class ServiceHooksMixin:
         return getattr(self, "pet_size", 0) or self.win_w
 
     def _api_hooks(self):
-        return {
+        hooks = {
             "say": self._api_say,
             "clear_bubble": self._api_clear_bubble,
             "anim": self._api_anim,
@@ -54,6 +136,8 @@ class ServiceHooksMixin:
             "menu_click": lambda owner, item_id: None,
             "roster": self._api_roster,
         }
+        return {name: (self._wrap_ui(fn) if name in self._UI_HOOKS else fn)
+                for name, fn in hooks.items()}
 
     def _api_roster(self):
         """本只宠物在选择列表里的信息（与上游 /pet 的 id/label/detail 对齐）。"""
@@ -261,8 +345,12 @@ class ServiceHooksMixin:
     def _api_reload(self):
         """重载：重新读配置并刷新字体/托盘（不写盘）。"""
         from pet import config as pet_config
+        from pet import credentials
         from pet import font_ui
         self.cfg = pet_config.load_config()
+        # 落盘的是 DPAPI 密文，内存必须解回明文：漏了这步，后续请求会带着
+        # "dpapi:..." 当 Key 用，且任何一次保存都会把密文再加密一层写坏
+        credentials.load_secrets(self.cfg)
         font_ui.apply_to_window(self)
         if hasattr(self, "set_tray_enabled"):
             self.set_tray_enabled(bool(self.cfg.get("trayEnabled", True)))
@@ -306,6 +394,11 @@ class ServiceHooksMixin:
         return {"ok": True}
 
     def _api_chat_delete(self, stamps=None):
+        if not stamps:
+            # 下游语义里空 stamps = 清空全部；接口必须显式带 ts，
+            # 否则忘带参数的调用方（或误触）会静默删光整个会话
+            return {"ok": False, "reason": "bad-request",
+                    "message": "ts 必填：按轮删除需要至少一个时间戳（或 idx:<n>）"}
         sid = getattr(self, "_current_sid", None)
         session = self._find_session(sid) if sid else None
         if not session:

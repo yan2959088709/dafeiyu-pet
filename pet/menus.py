@@ -526,12 +526,19 @@ class MenuMixin:
         self.cfg["topmost"] = bool(on)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(on))
         self.show()
+        # setWindowFlag + show 会重建原生窗口，_apply_passthrough 外部设置的
+        # WS_EX_TRANSPARENT 会随之丢失——开了穿透再切置顶会让穿透静默失效
+        if self.cfg.get("passthrough", False):
+            self._apply_passthrough(True)
         self._save_cfg()
 
     def set_autostart(self, on):
-        self.cfg["autostart"] = bool(on)
-        self._save_cfg()
-        lnk = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows",
+        # 先做再落盘：失败时配置不写，菜单勾选才不会和事实脱节
+        appdata = os.environ.get("APPDATA", "")
+        if not appdata:
+            QMessageBox.warning(self, "开机自启", "设置失败：找不到 APPDATA 环境变量")
+            return
+        lnk = os.path.join(appdata, "Microsoft", "Windows",
                            "Start Menu", "Programs", "Startup", "大肥鱼桌宠.lnk")
         try:
             if on:
@@ -542,13 +549,15 @@ class MenuMixin:
                               APP_DIR))
                 subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=True)
-                self.say("已开机自启，明天见～")
             else:
                 if os.path.exists(lnk):
                     os.remove(lnk)
-                self.say("已取消开机自启")
         except Exception as ex:
             QMessageBox.warning(self, "开机自启", f"设置失败：{ex}")
+            return
+        self.cfg["autostart"] = bool(on)
+        self._save_cfg()
+        self.say("已开机自启，明天见～" if on else "已取消开机自启")
 
     def toggle_visible(self):
         if self.isVisible():
@@ -560,5 +569,7 @@ class MenuMixin:
     def quit_app(self):
         self.cfg["x"], self.cfg["y"] = self.x(), self.y()
         self._save_cfg()
-        self.tray.hide()
+        # 多宠只有第一只有托盘；第 2..N 只与「关托盘图标」时 tray 为 None
+        if getattr(self, "tray", None) is not None:
+            self.tray.hide()
         QApplication.quit()

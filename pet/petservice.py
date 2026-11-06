@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 from pet import balance_providers
 from pet import config as pet_config
+from pet import credentials
 from pet import notify as pet_notify
 from pet import tooldetail
 from pet import tts
@@ -430,12 +431,25 @@ class PetService:
         return ok(delivered=delivered)
 
     # ------------------------------------------------------------ 配置
+    _SECRET_MASK = "***"
+
     def config_get(self):
-        return self._cfg()
+        # GET /config 是免令牌公开端点：服务层持有的是解密后配置，
+        # 凭据字段必须脱敏后才能出栈（DPAPI 只绑定本 Windows 用户，
+        # 明文出口会把异账号/本地进程零门槛读到 Key）
+        cfg = dict(self._cfg() or {})
+        for name in credentials.SECRET_FIELDS:
+            if cfg.get(name):
+                cfg[name] = self._SECRET_MASK
+        return cfg
 
     def config_put(self, body, force=False):
         cfg = self._cfg()
-        cfg.update(body or {})
+        for key, value in (body or {}).items():
+            # 外部「读-改-写」会把掩码原样带回：跳过脱敏值，避免把真 Key 抹成 ***
+            if key in credentials.SECRET_FIELDS and value == self._SECRET_MASK:
+                continue
+            cfg[key] = value
         return pet_config.save_config(cfg, force=force, declare_pets="pets" in (body or {}))
 
     def config_sync(self):

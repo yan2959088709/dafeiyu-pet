@@ -159,6 +159,7 @@ class MotionMixin:
         self.emote_t = 0.0
         self.emote_total = 0.0
         self._emote_prio = 0
+        self._work_anim = None    # 工作态动画名同属皮肤绑定状态
         self.prev_key = None
         self.cross_t = 0.0
 
@@ -802,6 +803,16 @@ class MotionMixin:
             self._queue_emote(name, dur, loops, say, value)
             self._alog("block drag name=%s prio=%s" % (name, value))
             return False
+        if self._sleeping and value < action_binding.PRIO_CLICK:
+            # 睡眠是长期状态：低于点击级只排队。若直接覆盖 emote，
+            # _tick_anim_clocks 的 sleep 判定（emote == "sleep"）不再成立，
+            # _sleeping 永久卡 True → 宠物不睡不醒不动
+            self._queue_emote(name, dur, loops, say, value)
+            self._alog("block sleep name=%s prio=%s" % (name, value))
+            return False
+        if self._sleeping:
+            # 点击级先唤醒；动作本身仍按后面的闸门排队接上（与 on_food 一致）
+            self._wake_up(natural=False)
         if not bypass_gate and self.emote is None:
             gate = max(getattr(self, "_auto_next_at", 0),
                        getattr(self, "rest_until", 0))
@@ -864,6 +875,12 @@ class MotionMixin:
             fps = self.skin.fps(name)
             cyc = max(0.2, len(self.wg_frames[(name, self.cur_h)]) / fps)
             dur = max(dur, cyc * loops)
+        # dur 兜底：<=0 会让 _tick_anim_clocks 的 emote_t > 0 判定不成立，
+        # _end_emote 永不被调用，该动作永久占住演出槽
+        try:
+            dur = max(0.05, float(dur))
+        except (TypeError, ValueError):
+            dur = 2.0
         self.emote = name
         self.emote_t = dur
         self.emote_total = dur

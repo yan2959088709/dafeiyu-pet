@@ -259,7 +259,11 @@ class ChatMixin:
         return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
 
     def _whisper_generate(self, _pet_id=None):
-        """生成一句碎碎念：失败只返回原因（不弹窗、不刷屏）。"""
+        """生成一句碎碎念：失败只返回原因（不弹窗、不刷屏）。
+
+        调用方在后台线程（定时一拍 / 本地接口 whisper 钩子）；
+        网络部分不挑线程，上屏动作经 _ui_call 回 GUI 线程。
+        """
         system, default_prompt = self._whisper_prompt()
         pool = self._meme_pool() if self.cfg.get("whisperImageEnabled", True) else {}
         picked = pet_memes.pick(pool) if pool else None
@@ -273,31 +277,59 @@ class ChatMixin:
         if not out.get("ok"):
             return (False, out.get("reason") or pet_whisper.LLM_FAILED)
         text, meme = pet_memes.parse_reply(out["text"], pool)
-        self.say(text, dur=6.0, prio=1)
         target = meme if meme in pool else picked
-        if target and pool:
-            self._show_meme(target, text)
-        self._play_event_anim("whisper")
+        self._ui_call(self._whisper_show, text, target)
         return (True, text)
 
+    def _whisper_show(self, text, meme):
+        """碎碎念上屏（只在 GUI 线程执行）。"""
+        self.say(text, dur=6.0, prio=1)
+        if meme:
+            self._show_meme(meme, text)
+        self._play_event_anim("whisper")
+
     def _whisper_tick(self):
-        """定时一拍：到点且未锁的宠物生成碎碎念，并落一行调度日志。"""
+        """定时一拍：到点且未锁的宠物生成碎碎念，并落一行调度日志。
+
+        同步 HTTP 最长 30s（独立模型通道 60s），放主线程会把整个 UI 冻住，
+        所以整拍挪到工作线程；上屏由 _whisper_generate 内部封送回来。
+        busy 闸门防重入：上一拍还没回来就跳过这一拍。
+        """
         if not self._whisper_enabled():
             return
         if not self.cfg.get("ds_api_key"):
             return
-        sched = getattr(self, "_whisper", None)
-        if sched is None:
-            sched = pet_whisper.WhisperScheduler()
-            self._whisper = sched
-        period = (self.cfg.get("eventsRefreshSec") or {}).get("whisper",
-                                                              pet_whisper.DEFAULT_PERIOD_SEC)
-        lock = getattr(self, "lock", None)
-        res = sched.tick([self.pet_id],
-                         lambda _pid: bool(lock and lock.is_locked()),
-                         self._whisper_generate, period)
-        if res["due"] or res["skipped"]:
-            pet_log.info(res["log"])
+        if getattr(self, "_whisper_busy", False):
+            return
+        self._whisper_busy = True
+
+        def _run():
+            try:
+                sched = getattr(self, "_whisper", None)
+                if sched is None:
+                    sched = pet_whisper.WhisperScheduler()
+                    self._whisper = sched
+                period = (self.cfg.get("eventsRefreshSec") or {}).get(
+                    "whisper", pet_whisper.DEFAULT_PERIOD_SEC)
+                lock = getattr(self, "lock", None)
+                res = sched.tick([self.pet_id],
+                                 lambda _pid: bool(lock and lock.is_locked()),
+                                 self._whisper_generate, period)
+                if res["due"] or res["skipped"]:
+                    pet_log.info(res["log"])
+            except Exception as e:
+                # daemon 线程的异常在 pythonw 下不可见：不落日志就成了无据可查的静默停摆
+                pet_log.error("碎碎念一拍失败: %s" % e)
+            finally:
+                self._whisper_busy = False
+
+        try:
+            threading.Thread(target=_run, daemon=True, name="whisper-tick").start()
+        except Exception as e:
+            # start() 失败（线程资源耗尽）时 finally 不会跑：必须在这里复位，
+            # 否则 busy 永久卡 True，碎碎念停摆至重启
+            self._whisper_busy = False
+            pet_log.error("碎碎念工作线程启动失败: %s" % e)
 
     def _ai_user_content(self, msg):
         """把历史 user 消息转成发给 AI 的内容：纯文字 + 用户表情的语义提示。

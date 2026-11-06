@@ -90,6 +90,8 @@ def protect(text):
     """明文 → 落盘用字符串（已加密则带 dpapi: 前缀）。失败时原样返回。"""
     if not text or not _AVAILABLE:
         return text
+    if str(text).startswith(PREFIX):
+        return text      # 已是密文：重复加密会让下次启动只能剥一层，真 Key 永久丢失
     try:
         return PREFIX + base64.b64encode(_protect_bytes(str(text).encode("utf-8"))).decode("ascii")
     except Exception:

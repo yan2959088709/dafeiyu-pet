@@ -377,7 +377,10 @@ def validate(cfg):
 
 def _write_default_file():
     tmp = P.config + ".tmp"
-    credentials.dump_config(tmp, DEFAULT_CFG)
+    # 不落 pets 键：pets_declared() 以「文件里有没有 pets」判定多宠模式，
+    # 首启就写入会让第二次启动从单窗跳进 PetManager，尺寸档位随之漂移
+    payload = {k: v for k, v in DEFAULT_CFG.items() if k != "pets"}
+    credentials.dump_config(tmp, payload)
     os.replace(tmp, P.config)
 
 

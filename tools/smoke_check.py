@@ -422,6 +422,29 @@ def _():
     assert m.load_json(p, {"a": 1}) == {"a": 1}, "顶层类型不符也应回落"
 
 
+@check("config: 首启落盘的默认配置不含 pets（不误入多宠模式）")
+def _():
+    import json as _json
+    import shutil
+    from pet import config as C
+    from pet.storage import P
+    old_cfg, old_jsonc = P.config, P.config_jsonc
+    tmpdir = os.path.join(CTX["tmpdir"], "first-run")
+    os.makedirs(tmpdir, exist_ok=True)
+    try:
+        P.config = os.path.join(tmpdir, "config.json")
+        P.config_jsonc = os.path.join(tmpdir, "config.jsonc")
+        C.load_config()                      # 首启路径：文件不存在 → 写默认文件
+        assert os.path.exists(P.config), "首启应落盘默认配置"
+        disk = _json.load(open(P.config, encoding="utf-8"))
+        assert "pets" not in disk, \
+            "默认文件含 pets：二启会被 pets_declared() 判成多宠，尺寸档位漂移"
+        assert C.pets_declared() is False
+    finally:
+        P.config, P.config_jsonc = old_cfg, old_jsonc
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 @check("credentials: DPAPI 往返 + 落盘不含明文")
 def _():
     from pet import credentials
@@ -1609,6 +1632,19 @@ def _():
     old_say = w.say
     had_lock = hasattr(w, "lock")
     old_lock = getattr(w, "lock", None)
+
+    def _drain_whisper(timeout=5.0):
+        # 碎碎念整拍跑在工作线程：既要等 busy 落低，也要替主线程泵事件，
+        # UiBridge 的队列事件才有机会被 drain（测试主线程不跑 app.exec()）
+        deadline = time.time() + timeout
+        while getattr(w, "_whisper_busy", False) and time.time() < deadline:
+            CTX["app"].processEvents()
+            time.sleep(0.005)
+        assert not getattr(w, "_whisper_busy", False), "碎碎念工作线程未在时限内结束"
+        for _ in range(20):
+            CTX["app"].processEvents()
+            time.sleep(0.005)
+
     w.say = lambda text, **k: said.append(text)
     w.cfg["ds_api_key"] = "k"
     w.cfg["eventsRefreshSec"] = {"whisper": 60, "balance": 1800}
@@ -1621,13 +1657,16 @@ def _():
             return True
     try:
         w._whisper_tick()
+        _drain_whisper()
         assert said == ["今天也要加油呀"], said
         said.clear()
         w._whisper_tick()
+        _drain_whisper()
         assert not said, "未到点不应生成"
         w._whisper._last["main"] = int(time.time() * 1000) - 61000
         w.lock = L()
         w._whisper_tick()
+        _drain_whisper()
         assert not said, "占用锁生效时应跳过"
         assert w._whisper._last["main"] < int(time.time() * 1000) - 60000, "锁跳过不推进时间"
     finally:
@@ -1641,6 +1680,79 @@ def _():
         elif hasattr(w, "lock"):
             del w.lock
     assert W.normalize_period(30) == 60
+
+
+@check("ui: 封送把窗口操作搬回 GUI 线程并带回返回值/异常")
+def _():
+    import threading
+    from PySide6.QtCore import QThread
+    w = CTX["win"]
+    app_thread = CTX["app"].thread()
+    box, result = {}, {}
+
+    def _probe():
+        box["thread"] = QThread.currentThread()
+        return 42
+
+    def _caller():
+        result["value"] = w._ui_call(_probe)
+        result["caller"] = QThread.currentThread()
+
+    t = threading.Thread(target=_caller)
+    t.start()
+    # 真实应用里 GUI 线程始终跑着事件循环；测试主线程必须自己泵，
+    # 否则封送的队列事件没人消费（这正是线上不会发生、测试才会的场景）
+    import time as _t
+    deadline = _t.time() + 10
+    while t.is_alive() and _t.time() < deadline:
+        CTX["app"].processEvents()
+        _t.sleep(0.005)
+    assert not t.is_alive(), "工作线程未被及时放回（GUI 线程未消费封送事件？）"
+    assert result.get("value") == 42, result
+    assert box.get("thread") is app_thread, "封送执行必须落在 GUI 线程"
+    assert result.get("caller") is not app_thread, "调用方应停留在工作线程"
+
+    def _boom():
+        raise ValueError("boom")
+
+    try:
+        w._ui_call(_boom)          # 当前就在 GUI 线程：短路直调，异常原地抛
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("异常应原样抛回调用方")
+    assert w._ui_call(lambda: 7) == 7, "GUI 线程内应短路直调"
+
+
+@check("api: chat_delete 空 stamps 拒绝，带 ts 才删")
+def _():
+    w = CTX["win"]
+    session = w._find_session(getattr(w, "_current_sid", None))
+    old = list((session or {}).get("messages") or [])
+    old_reload = w._reload_panel
+    w._reload_panel = lambda reset=True: None      # 测试环境没有真实聊天面板
+    try:
+        res = w._api_chat_delete(None)
+        assert res.get("ok") is False, res
+        assert list((session or {}).get("messages") or []) == old, \
+            "空 stamps 不应动会话数据（下游语义是清空全部）"
+        res2 = w._api_chat_delete(["idx:999999"])
+        assert res2.get("ok") is True, res2
+        assert list((session or {}).get("messages") or []) == old, \
+            "不存在的 idx 不应删掉任何消息"
+    finally:
+        w._reload_panel = old_reload
+
+
+@check("credentials: protect 幂等，密文不可二次加密")
+def _():
+    from pet import credentials
+    plain = "sk-test-idempotent"
+    once = credentials.protect(plain)
+    assert once.startswith(credentials.PREFIX), once
+    twice = credentials.protect(once)
+    assert twice == once, "密文被二次加密：下次启动只能剥一层，真 Key 永久丢失"
+    assert credentials.unprotect(twice) == plain
 
 
 @check("chat: 系统提示词含人设与时间背景")
@@ -3751,6 +3863,83 @@ def _():
         w.emote_t = 0.0
         w._emote_prio = 0
         w.sleep_until = 0
+        _reset_motion_state(w)
+
+
+@check("api: config_get 脱敏凭据，config_put 跳过掩码值")
+def _():
+    from pet.petservice import PetService
+    from pet import config as C
+    svc = PetService(cfg_provider=lambda: {"ds_api_key": "sk-live-123",
+                                           "city": "汕头"})
+    got = svc.config_get()
+    assert got["ds_api_key"] == "***", got
+    assert got["city"] == "汕头", got
+    saved = {}
+    old_save = C.save_config
+    C.save_config = lambda cfg, **kw: (saved.update(cfg), {"ok": True})[1]
+    try:
+        svc.config_put({"ds_api_key": "***", "city": "北京"})
+    finally:
+        C.save_config = old_save
+    assert saved.get("ds_api_key") == "sk-live-123", "掩码值不得回写覆盖真 Key"
+    assert saved.get("city") == "北京", saved
+
+
+@check("action: 睡眠中低优先级动作只排队，点击级先唤醒")
+def _():
+    from pet import action_binding
+    w = CTX["win"]
+    _reset_motion_state(w)
+    w._enter_sleep()
+    # 构造真正的危险态：_sleeping=True 但 emote 已被收尾清空。
+    # （只留 emote=="sleep" 的话，旧的分支也会排队，用例就没有判别力了）
+    w._end_emote()
+    w._auto_next_at = 0
+    w.rest_until = 0
+    try:
+        assert w._sleeping and w.emote is None, (w._sleeping, w.emote)
+        # 低于点击级：只排队，睡眠态不被点播动作覆盖
+        # （直接覆盖会让 _sleeping 永久卡 True：不睡不醒不动）
+        got = w._start_emote("play", dur=2.0, loops=1, prio="random")
+        assert got is False, "睡眠中的随机级动作应排队"
+        assert w.emote is None, w.emote
+        assert w._sleeping is True
+        assert w._emote_queue and w._emote_queue[0][0] == "play", w._emote_queue
+        # 点击级：先唤醒（wake 演出），请求动作按闸门排队接上
+        w._start_emote("play", dur=2.0, loops=1, prio="click")
+        assert w._sleeping is False, "点击级应唤醒"
+        assert w.emote == "wake", w.emote
+    finally:
+        w._wake_up(natural=False)
+        w._sleeping = False
+        w.emote = None
+        w.emote_t = 0.0
+        w._emote_prio = 0
+        w._emote_queue = []
+        w.sleep_until = 0
+        w._auto_next_at = 0
+        w.rest_until = 0
+        _reset_motion_state(w)
+
+
+@check("action: 切换皮肤清空工作态动画（不拿旧名字无限重排）")
+def _():
+    w = CTX["win"]
+    old_character = w.character
+    w._work_anim = "工作状态-忙碌点按"
+    w._work_sig = "busy"
+    w._work_text = "忙碌"
+    try:
+        w._bind_skin("whale-girl")
+        assert getattr(w, "_work_anim", None) is None, w._work_anim
+        assert w._work_sig is None and w._work_text is None
+        assert w.character == "whale-girl"
+    finally:
+        w._bind_skin(old_character)
+        w._work_anim = None
+        w._work_sig = None
+        w._work_text = None
         _reset_motion_state(w)
 
 
