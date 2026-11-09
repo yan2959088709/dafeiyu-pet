@@ -2,7 +2,7 @@
 
 > 审查报告（2026-11-06，4 代理并行 + 主会话复核）即本轨道契约源。
 > P0 轮范围 = 8 项 P0 + 2 项一行级 P1，已全部交付并提交（commit 76e928c）。
-> 测试入口：`tools/smoke_check.py`（104 → 111（P0 轮）→ 119（Harness 轮，含 8 条 harness 用例）→ 153（心跳轮 TASK-010，含 1 项已知偶发 flaky 见教训 L8）→ 157（睡眠窗轮 TASK-011）全绿）。
+> 测试入口：`tools/smoke_check.py`（104 → 111（P0 轮）→ 119（Harness 轮，含 8 条 harness 用例）→ 153（心跳轮 TASK-010，含 1 项已知偶发 flaky 见教训 L8）→ 157（睡眠窗轮 TASK-011）→ 162（token 入账轮 TASK-012）全绿）。
 
 ### TASK-001: P0 一键修复组（退出崩溃/切皮肤冻死/首启漂移/置顶抹穿透/APPDATA）
 - **Executor**: claude
@@ -197,7 +197,7 @@
 
 ### TASK-012: TASK-010 延期项 backlog（成本可见性/多宠精化/重构）
 - **Executor**: claude
-- **Status**: [ ]
+- **Status**: [x]
 - **Dependencies**: TASK-010
 - **Contract**: TASK-010 门禁 deferred 清单（Gate 1 S 项 / Gate 2 M-2 数值热重载 / Gate 3.5 Low）
 - **Acceptance**: 逐项修复后勾销
@@ -207,6 +207,36 @@
   > 【多宠精化】`apply_pet` 改 pet_id 时重绑引擎（桌宠.py:1837，当前改 id 不重绑）；旧版无摘要状态文件迁移（`pet_drives.main.json`→摘要名，本环境无实机数据未做，将来有实机数据要补改名迁移）。
   > 【配置】heartbeat 数值参数热重载单向陈旧（运行期调小 max_per_24h 要重启生效，fail-closed 方向安全）。
   > 【重构】_persist 内联副本提取 mixin 方法；sticker 解析块与 chat.py 共享（S6）；smoke hb_fixture() 脚手架抽取（S5，约 100 行）；N1 门禁改名（quiet_window→outside_quiet_window 等）。
+  >
+  > claude [~] 2026-11-09: claimed via /full-auto（用户「逐步完成剩下的后续」）。本捻先做【成本可见性】第一项：主动发言 token 入账。口径：与被动轮完全同源——harness.run_turn 的 usage 跨跳累加值经既有记账路径落 usage_ledger.json 并刷新 Token 统计悬浮窗；worker 线程触达 GUI/账本必须走既有封送/队列范式（_ui_call 或 _chat_queue 携带），不得自造写入口；不得改被动路行为。
+  > claude [~] 2026-11-09: 入账项完成（162/162）。`_speak` 解构 run_turn 三元组取 usage → 复用被动轮同一 `chat._record_tokens`+`calc_turn_cost`（ledger 有锁，worker 直调安全）→ `_token_stats_dirty`/`_queue_say` 走既有范式刷悬浮窗与气泡；静默轮同账（真花钱）；异常轮无 usage 不记不编造；chat.py 一行未改（_chat_queue 消费方在禁改范围，走契约 fallback）。5 新用例回退验伪。
+  > claude [x] 2026-11-09: 剩余项逐条裁决——①错误通知扣 2 能量：**接受现状**（失败轮付小代价主题上合理，恢复 +2/300s 影响可忽略，不值得为它拆 _chat_out 单点）；②apply_pet 改 id 不重绑引擎：**接受为已知限制**（运行期改宠物 id 罕见路径）；③heartbeat 数值热重载单向陈旧：**接受**（fail-closed 方向安全，重启解决；live 重归一反而危险——Gate 2 复审结论）；④重构类：**移交 TASK-014**。
+
+### TASK-013: Stage 2a 记忆相关度召回（替代 facts 全量注入）
+- **Executor**: claude
+- **Status**: [ ]
+- **Dependencies**: TASK-010
+- **Contract**: 本块 [Blueprint]（2026-11-09 主会话设计，Stage 2 第一捻）
+- **Acceptance**:
+  1. `pet/memory_recall.py`：score_facts 纯函数（关键词相关度×时间衰减×访问计数），legacy 纯字符串 fact 零迁移兼容
+  2. `_build_system_prompt` 的【你对主人的记忆】段由「前 20 条全量」改为「top-K 相关度注入」（K 默认 8，cfg 可配）
+  3. fact 元数据（ts/last_access/hits）落盘与命中回写；冒烟新增相关度/衰减/legacy/K 截断/回写用例，既有不回归
+- **Handoff log**:
+  > claude [ ] 2026-11-09: 登记自 Stage 2 拆分。蓝图：
+  > DATA FLOW: 输入=当前会话近期消息文本+pet_memory.json facts（带元数据）；变换=memory_recall.score_facts 纯函数（字符二元组相关度 × exp 时间衰减半衰期 7 天 × 访问计数加权）→ top-K；输出=系统提示词记忆段由全量前 20 条改为相关度 top-K（默认 K=8，cfg.memoryRecallK）；状态变化=fact 元数据 ts/last_access/hits 读写，legacy 纯字符串 fact 默认值兼容（零迁移）。
+  > MODULE: ①pet/memory_recall.py（新 ~130 行）: `@dataclass Fact(text:str, ts:float=0.0, last_access:float=0.0, hits:int=0)`；`score_facts(facts, context_text:str, now:float, k:int=8) -> list[Fact]`（纯函数可单测）；相关度=查询与 fact 的字符二元组重叠率（中文免分词，无新依赖）；衰减=exp(-ln2·(now-ts)/7d)；最终分=相关度×(0.5+0.5·衰减)×(1+0.1·hits)；空 context 时退化为按 recency ②pet/chat.py:55-57 注入点改 recall top-K ③pet/memory.py: _fact_extract 落盘带 ts；recall 命中后 hits/last_access 回写（一处、加锁、原子写）。
+  > TEST: ①相关度排序（上下文提「加班」→加班 fact 进、无关的出列）②时间衰减（同相关度新 fact 胜旧 fact）③legacy 纯字符串不崩且可排序 ④K 截断/空 facts/全不相关 ⑤命中回写落盘 ⑥既有 prompt 构建与 _call_ds 链路用例不回归。
+  > ELEGANCE: 无新依赖（不引 jieba/向量库）；二元组重叠对 ≤30 字短 fact 足够；embedding/向量检索留 Stage 2b（facts 过百再上，TASK-009 同款判断）。
+  > RISK: 全量→相关注入是行为变化，可能漏「当前不相关但重要」的事实——K=8+衰减保底+hits 加权缓解；legacy 兼容必须零迁移；回写并发走既有 _mem_lock。
+
+### TASK-014: TASK-010/012 清理与重构 backlog
+- **Executor**: claude
+- **Status**: [ ]
+- **Dependencies**: TASK-010, TASK-012
+- **Contract**: TASK-012 移交清单
+- **Acceptance**: 逐项修复后勾销
+- **Handoff log**:
+  > claude [ ] 2026-11-09: 登记自 TASK-012 移交：①`_persist` 内联副本（heartbeat.py）提取为 chat mixin 共享方法（守住 TASK-008 身份不变式，被动路行为零变化）②sticker 解析块（heartbeat.py 与 chat.py 重复 6 行）下沉共享 ③smoke hb_fixture() 上下文管理器抽取（约 100 行重复夹具）④门禁改名（gates["quiet_window"]→outside_quiet_window 等，纯可读性）⑤TASK-012 入账接线镜像：出现第三个调用方时提取 `ChatMixin._record_turn_usage(usage)`。
 
 ---
 

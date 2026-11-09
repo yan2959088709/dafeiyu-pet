@@ -6023,6 +6023,378 @@ def _():
         w._reload_panel()
 
 
+@check("heartbeat: 主动发言 token 入账（与被动轮同一记账入口）")
+def _():
+    import time as _t
+    from pet import harness as H
+    from pet.pricing import DS_MODEL, calc_turn_cost
+    from PySide6.QtCore import QThread
+    w = CTX["win"]
+    eng = w._heartbeat
+    usage = {"prompt_tokens": 1200, "completion_tokens": 300}
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    old_show_cost = w.cfg.get("show_turn_cost", False)
+    old_refresh = w._refresh_token_stats
+    old_vis = w.token_window.isVisible
+    refreshed = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        assert QThread.currentThread() is not CTX["app"].thread(), \
+            "发言跑在了 GUI 线程"
+        return ({"content": "在干嘛呢，理我一下嘛"}, dict(usage), "stop")
+
+    H.deepseek_transport = fake
+    # 悬浮窗刷新是 GUI 侧动作：换记录器，验证 worker 不直接触达 GUI
+    w._refresh_token_stats = lambda: refreshed.append(
+        (w._last_turn_tokens, w._last_turn_cost))
+    w.token_window.isVisible = lambda: True
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        w.cfg["show_turn_cost"] = True
+        before = w._load_ledger()["today_tokens"]
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]   # 空窗
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._say_queue.clear()
+        w._pending_msgs.clear()
+        eng.on_tick()
+        deadline = _t.time() + 10
+        while eng._busy and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not eng._busy, "发言 worker 未在时限内结束"
+        assert w._chat_queue and w._chat_queue[-1][0] == "在干嘛呢，理我一下嘛"
+        # 账本：主动轮烧的 token 与假 transport 提供的一致（被动轮同一入口）
+        assert w._load_ledger()["today_tokens"] - before == 1500
+        # Token 悬浮窗数据源：本轮 token/金额就位，刷新只打脏标记交 tick
+        want_cost = calc_turn_cost(DS_MODEL, usage)
+        assert w._last_turn_tokens == 1500
+        assert w._last_turn_cost == want_cost
+        assert w._token_stats_dirty is True
+        # 封送路径：worker 不触达 GUI（悬浮窗刷新一次都没发生），
+        # 本轮消耗气泡也只入 _say_queue，由 tick 弹出
+        assert refreshed == [], refreshed
+        assert w._say_queue == [f"本轮消耗 ¥{want_cost:.4f}"], w._say_queue
+        # tick 消费：回复上屏后按脏标记刷新悬浮窗（此时才读 GUI）
+        w._tick_consume_queues()
+        assert refreshed == [(1500, want_cost)], refreshed
+        assert w._token_stats_dirty is False
+        w._chat_queue.clear()
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        w.cfg["show_turn_cost"] = old_show_cost
+        w._refresh_token_stats = old_refresh
+        w.token_window.isVisible = old_vis
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._say_queue.clear()
+        w._reload_panel()
+
+
+@check("heartbeat: 静默轮 token 同样入账（真花了钱）")
+def _():
+    import time as _t
+    from pet import harness as H
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        return ({"content": "「（静默）」"},
+                {"prompt_tokens": 60, "completion_tokens": 40}, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        before = w._load_ledger()["today_tokens"]
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        eng.on_tick()
+        deadline = _t.time() + 10
+        while eng._busy and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not eng._busy, "发言 worker 未在时限内结束"
+        # 静默 = 这轮没发生：无历史、无上屏、无成功配额、无连发（既有语义不变）
+        assert w.chat_history == old_hist, w.chat_history[-2:]
+        assert not w._chat_queue, w._chat_queue
+        assert eng._hb["last_speak_time"] == 0.0
+        assert eng._hb["timestamps_24h"] == []
+        assert eng._hb["consecutive_speaks"] == 0
+        # 但静默轮照样打了请求、真花了钱：token 入账 + 尝试配额照记
+        assert w._load_ledger()["today_tokens"] - before == 100
+        assert w._last_turn_tokens == 100
+        assert w._token_stats_dirty is True
+        assert len(eng._hb["attempts_24h"]) == 1
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._reload_panel()
+
+
+@check("heartbeat: 跨跳 usage 累加入账（不是只记最后一跳）")
+def _():
+    import time as _t
+    from pet import harness as H
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    script = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        script.append(bool(tools))
+        if len(script) == 1:
+            return ({"content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "search_stickers",
+                    "arguments": '{"keyword": "开心"}'}}]},
+                    {"prompt_tokens": 500, "completion_tokens": 100}, "tool_calls")
+        return ({"content": "找到好多开心表情～"},
+                {"prompt_tokens": 700, "completion_tokens": 200}, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        before = w._load_ledger()["today_tokens"]
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        eng.on_tick()
+        deadline = _t.time() + 10
+        while eng._busy and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not eng._busy, "发言 worker 未在时限内结束"
+        assert len(script) == 2, script
+        assert w._chat_queue and w._chat_queue[-1][0] == "找到好多开心表情～"
+        # 两跳 usage 都要入账：只记最后一跳会少记 600（harness 已跨跳累加）
+        assert w._load_ledger()["today_tokens"] - before == 1500
+        assert w._last_turn_tokens == 1500
+        w._chat_queue.clear()
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._reload_panel()
+
+
+@check("heartbeat: run_turn 抛异常 → 不入账不编造、busy 释放")
+def _():
+    import time as _t
+    from pet import harness as H
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    script = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        script.append(1)
+        if len(script) == 1:
+            # 第一跳真花了钱（usage 已产生），但第二跳炸：run_turn 直接抛，
+            # 调用方拿不到 usage——拿不到就不记，不得编造
+            return ({"content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "search_stickers", "arguments": "{}"}}]},
+                    {"prompt_tokens": 999, "completion_tokens": 999}, "tool_calls")
+        raise RuntimeError("第二跳网络炸了")
+
+    H.deepseek_transport = fake
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        before = w._load_ledger()["today_tokens"]
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        eng.on_tick()
+        deadline = _t.time() + 10
+        while eng._busy and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not eng._busy, "异常后 busy 未释放（心跳将停摆至重启）"
+        assert len(script) == 2, script
+        # 账本一分不加：异常轮次 harness 不返回 usage，绝不编造数字
+        assert w._load_ledger()["today_tokens"] == before
+        assert w._last_turn_tokens == 0
+        assert w.chat_history == old_hist and not w._chat_queue
+        # 失败仍推进 attempt 并计入尝试配额（防 30s 无限重试，既有语义）
+        assert eng._hb["last_attempt_time"] > 0.0
+        assert len(eng._hb["attempts_24h"]) == 1
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._reload_panel()
+
+
+@check("chat: 被动轮 usage 记账不变（_call_ds 回归护栏）")
+def _():
+    import time as _t
+    from pet import harness as H
+    from pet.pricing import DS_MODEL, calc_turn_cost
+    w = CTX["win"]
+    old_tr = H.deepseek_transport
+    old_fe, old_rb = w._fact_extract, w._refresh_balance
+    old_busy = w._balance_busy
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_key = w.cfg.get("ds_api_key")
+    usage = {"prompt_tokens": 800, "completion_tokens": 200}
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        return ({"content": "被动回复来啦"}, dict(usage), "stop")
+
+    H.deepseek_transport = fake
+    try:
+        del w._call_ds                 # 恢复类方法（setup 里被整体打桩）
+        cur = w._find_session(w._current_sid)
+        w.chat_history = cur["messages"]   # 重建「chat_history is 会话 list」身份
+        w.cfg["ds_api_key"] = "sk-test"
+        w.ds_busy = False
+        w._pending_msgs.clear()
+        before = w._load_ledger()["today_tokens"]
+        assert w._call_ds("在吗") is True
+        deadline = _t.time() + 10
+        while (w.ds_busy or not w._chat_queue) and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not w.ds_busy and w._chat_queue, "worker 未在时限内完成"
+        # 被动轮记账行为零变化：usage 落账本 + 悬浮窗数据源 + 脏标记
+        assert w._load_ledger()["today_tokens"] - before == 1000
+        assert w._last_turn_tokens == 1000
+        assert w._last_turn_cost == calc_turn_cost(DS_MODEL, usage)
+        assert w._token_stats_dirty is True
+        w._chat_queue.clear()
+    finally:
+        H.deepseek_transport = old_tr
+        w._fact_extract, w._refresh_balance = old_fe, old_rb
+        w._balance_busy = old_busy
+        w._call_ds = lambda *a, **k: None      # 恢复 setup 的全局断网桩
+        w.cfg["ds_api_key"] = old_key
+        w._sessions = old_sessions
+        w._current_sid = old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._reload_panel()
+
+
 @check("chat: 心跳开关分流（enabled 走心跳 / 关闭回退碎碎念）")
 def _():
     import time as _t

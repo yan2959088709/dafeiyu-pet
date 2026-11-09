@@ -30,6 +30,7 @@ from pet import persona as pet_persona
 from pet import stickers
 from pet import time_context as pet_time
 from pet.drives import cfg_num
+from pet.pricing import DS_MODEL, calc_turn_cost
 from pet.sleep_window import get_user_sleep_window
 from pet.storage import load_json
 
@@ -299,10 +300,21 @@ class HeartbeatEngine:
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": HB_NUDGE}]
         state = {"meme": None, "sticker": None}
-        reply, _usage, state = pet_harness.run_turn(
+        reply, usage, state = pet_harness.run_turn(
             chat, messages, key, state=state, transport=self.transport)
         # 真的跑了 LLM 的这一轮：占一份 24h 尝试配额（含随后判定的静默）
         self._note_attempt(now)
+        # 主动搭话的 token 走被动轮同一记账入口（_record_tokens 自带账本锁，
+        # worker 直调即被动路同款姿势）；静默轮也真花了钱，同样入账。
+        # UI 侧只借既有封送范式：_queue_say 入队、_token_stats_dirty 交 tick 消费
+        if usage:
+            chat._last_turn_cost = calc_turn_cost(DS_MODEL, usage) or 0.0
+            chat._last_turn_tokens = (int(usage.get("prompt_tokens") or 0)
+                                      + int(usage.get("completion_tokens") or 0))
+            chat._token_stats_dirty = True
+            chat._record_tokens(chat._last_turn_tokens)
+            if chat.cfg.get("show_turn_cost", False) and chat._last_turn_cost > 0:
+                chat._queue_say(f"本轮消耗 ¥{chat._last_turn_cost:.4f}")
         reply = (reply or "").strip()
         sticker = state.get("sticker")
         if not sticker:
