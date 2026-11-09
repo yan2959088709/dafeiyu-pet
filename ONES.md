@@ -2,7 +2,7 @@
 
 > 审查报告（2026-11-06，4 代理并行 + 主会话复核）即本轨道契约源。
 > P0 轮范围 = 8 项 P0 + 2 项一行级 P1，已全部交付并提交（commit 76e928c）。
-> 测试入口：`tools/smoke_check.py`（104 → 111（P0 轮）→ 119（Harness 轮，含 8 条 harness 用例）全绿）。
+> 测试入口：`tools/smoke_check.py`（104 → 111（P0 轮）→ 119（Harness 轮，含 8 条 harness 用例）→ 153（心跳轮 TASK-010，含 1 项已知偶发 flaky 见教训 L8）全绿）。
 
 ### TASK-001: P0 一键修复组（退出崩溃/切皮肤冻死/首启漂移/置顶抹穿透/APPDATA）
 - **Executor**: claude
@@ -130,10 +130,11 @@
   > 【Phase 3 自主意识】mood/energy 状态机驱动主动搭话（whisper 调度器升级）；目标队列（待办提醒）；时段策略（夜间静默）；跨会话长期记忆检索（facts 过多时按相关度注入而非全量前 20 条）。
   >
   > claude [~] 2026-11-09: 拆分——Stage 1（drives 状态机 + 心跳门禁 + 主动说话链路）拆为 TASK-010 实施中；M4 学习睡眠窗口拆为 TASK-011 待办。
+  > claude [~] 2026-11-09: Stage 1 已交付（TASK-010 [x]，commit 5e6031b，真机演示在角色）。Phase 3 剩余主菜 = Stage 2 记忆生命周期（相关度检索替代全量 facts / 每日摘要 / 巩固遗忘）；Stage 3 = 反思引擎 + Persona Evolution。Phase 2 工具扩容（remember_fact 收编等）建议与 Stage 2 合并排期。TASK-010 延期项见 TASK-012。
 
 ### TASK-010: Stage 1 心跳引擎 + 驱动状态机（自主循环/内在驱动/主动说话）
 - **Executor**: claude
-- **Status**: [~]
+- **Status**: [x]
 - **Dependencies**: TASK-008
 - **Contract**: 2026-11-09 设计对话蓝图（本条 Handoff log [Blueprint]，用户经 /full-auto「试着实现一下」批准）。算法源：Shikigami-Protocol（AGPL-3.0）——**只搬算法不拷码**；dafeiyu-pet 仓库公开，严禁 AGPL 代码混入。
 - **Acceptance**:
@@ -162,6 +163,10 @@
   > claude [Gate-2] 2026-11-09: 安全门 FAIL。**H-1 阻塞**：_speak 异常路径不推进 last_attempt_time → not_silent/cooldown/24h/consecutive 四道门禁全失效 → 持续传输失败（过期 key/网络抖动/5xx）时 ~120 次/小时无限重试（探针 6/6 实证）。M-1 静默轮与 4 跳工具轮计费不入配额（真实上限 ~60 请求/天 vs 配置暗示 15）；M-2 运行期改 heartbeat 配置被忽略（PUT /config 无法热关）；M-3 固定 .tmp 名并发写损坏（探针 179/300）；M-4 多宠成本 ×N。L-1 time_bonus 非 dict 静默杀死特性；L-2 数值无边界；L-3 last_speak_content 无定界符升权系统提示词；L-4 .gitignore 漏两个状态文件。正面：无状态组合可绕过门禁、无路径遍历、无除零、无密钥泄漏、输出消毒全继承 harness、主动路径注入面小于被动路径。
   > claude [Gate-3.5] 2026-11-09: 对抗测试无阻塞。12 探针矩阵：门禁边界零 off-by-one、时钟滥用（10 年回拨/ year 3000/非单调）、状态文件滥用（截断/类型错/NaN/目录/只读/6 线程并发）、重入（20 连 tick 仅 1 调用）、提示词构建（无 format-string 注入）、输入滥用（100k 字符/NUL/RTL）全部幸存。MEDIUM：time_bonus 崩溃（同 L-1）、前拨时钟后回拨→时间戳只钳下限→永久静默、_speak 非事务序（_save 抛则回复存而不显/队列抛则冷却失效）。LOW：静默标记泄漏（(silence)!、全角(Ｓilence)、小写 dsml）。
   > claude [~] 2026-11-09: 修正轮 3 dispatched：P0×3（H-1 异常记账/M1 游标只前进/多宠按 pet_id 分文件）+ P1×10（time_bonus 守卫/时间戳双端钳/活配置读取/事务序/数值下限/标记泄漏/attempts 配额/last_speak_content 落盘/gitignore/死代码清理），逐项判别力用例。
+  >
+  > claude [Gate-2-Pass] 2026-11-09: 安全门复审 PASS——H-1 闭环并经独立探针复证（恒抛 transport 三连 tick 仅 1 次外呼）；M-1/M-2/M-4/L-1/L-4 FIXED；M-3（文件名单射）与 L-2（配额上限）残余 + N-1（log.py redact IndexError，被 H-1 新错误路径激活）转终轮微修正。
+  > claude [~] 2026-11-09: 终轮微修正完成（N-1 捕获组/M-3 sha1 摘要保单射/L-2 配额上限，153/153）。门禁 3.5 新增发现经路径可达性分析确认不影响本轮范围。
+  > claude [x] 2026-11-09: Stage 1 完成。commit 5e6031b（10 文件 +2477/-13；桌宠.py 未提交 WIP 未带入）。验收 5 项全达：①drives 三轴状态机+原子落盘+游标只前进 ②六门禁 decide 纯函数 ③主动说话全链路（静默语义/身份不变式/sid 快照/FC 表情可用）④状态段 prompt+config 化 ⑤冒烟 119→153。ADR: docs/decisions/2026-11-09-heartbeat-engine-stage1.md。门禁：0-ARCH PASS / 1-QUALITY PASS / 2-SEC FAIL→复审 PASS / 3-TEST 153/153（L8 已知 flaky 复跑确认）/ 3.5-ADVERSARIAL 12 探针矩阵幸存。真机沙箱演示（真实 key 一次调用，urgency 0.615，sha256 验证零污染）：「主人，今晚去亲戚家吃饭，别又加班忘了～」——融合真实记忆（亲戚聚餐/常加班/喜欢被催吃饭）在角色主动发言。延期项登记 TASK-012。Unblocks: TASK-011。
 
 ### TASK-011: M4 学习式睡眠窗口 + 时段权重
 - **Executor**: claude
@@ -173,6 +178,20 @@
   2. 判别力用例：数据不足回退默认；纯白天安静段不选；跨午夜窗口
 - **Handoff log**:
   > claude [ ] 2026-11-09: 自 TASK-010 蓝图拆出。TASK-010 期间 G7 用 config 硬编码 quiet_window=(23,6)。
+  > claude [Notify] 2026-11-09: 依赖 TASK-010 已 [x]（commit 5e6031b）。可开工：30 天回溯学习式睡眠窗口接入 G7 + time_context 抑制；注意沿用 TASK-010 的 pet_id 分文件命名（sha1 摘要）。
+
+### TASK-012: TASK-010 延期项 backlog（成本可见性/多宠精化/重构）
+- **Executor**: claude
+- **Status**: [ ]
+- **Dependencies**: TASK-010
+- **Contract**: TASK-010 门禁 deferred 清单（Gate 1 S 项 / Gate 2 M-2 数值热重载 / Gate 3.5 Low）
+- **Acceptance**: 逐项修复后勾销
+- **Handoff log**:
+  > claude [ ] 2026-11-09: 登记待办：
+  > 【成本可见性】主动发言 token 用量入账本/悬浮窗（heartbeat `_usage` 被丢弃，被动路有记账）；错误通知（queue-full/no-key/_fail）走 _chat_out 也扣 2 能量的边界裁定。
+  > 【多宠精化】`apply_pet` 改 pet_id 时重绑引擎（桌宠.py:1837，当前改 id 不重绑）；旧版无摘要状态文件迁移（`pet_drives.main.json`→摘要名，本环境无实机数据未做，将来有实机数据要补改名迁移）。
+  > 【配置】heartbeat 数值参数热重载单向陈旧（运行期调小 max_per_24h 要重启生效，fail-closed 方向安全）。
+  > 【重构】_persist 内联副本提取 mixin 方法；sticker 解析块与 chat.py 共享（S6）；smoke hb_fixture() 脚手架抽取（S5，约 100 行）；N1 门禁改名（quiet_window→outside_quiet_window 等）。
 
 ---
 
