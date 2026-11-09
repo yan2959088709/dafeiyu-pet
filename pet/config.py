@@ -20,6 +20,7 @@ import re
 import threading
 
 from pet import credentials
+from pet.drives import DEFAULT_HEARTBEAT
 from pet.storage import P, backup_corrupt
 
 MAX_PET_ID_LENGTH = 64
@@ -162,6 +163,7 @@ DEFAULT_CFG = {
     "animations": DEFAULT_ANIMATIONS,
     "eventsRefreshSec": {"balance": 1800, "whisper": 300},
     "animationWeights": {"idle": 10, "turn": 5, "move": 5},
+    "heartbeat": DEFAULT_HEARTBEAT,
 }
 
 # 整段替换的对象键：缺子键 = 整段非法，告警后回退默认（与上游合并器一致）
@@ -327,6 +329,19 @@ def validate(cfg):
     rounds = cfg.get("chatMemoryRounds")
     if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 0:
         bad("chatMemoryRounds", "记忆轮数必须是非负整数", 5)
+
+    # 心跳段：非对象（手改配置写成字符串/数组）时整段回落默认；
+    # 缺子键不在这里补——合并时按顶层整段替换，子键由引擎侧 setdefault 兜底
+    if not isinstance(cfg.get("heartbeat"), dict):
+        bad("heartbeat", "心跳配置必须是对象，已取默认值",
+            copy.deepcopy(DEFAULT_HEARTBEAT))
+    else:
+        # enabled 写了但不是布尔（手滑写成 "false" 字符串）：truthy 值会把
+        # 「想关心跳」的用户一路送进心跳路径。强制成布尔，非布尔按关闭处理
+        enabled = cfg["heartbeat"].get("enabled")
+        if enabled is not None and not isinstance(enabled, bool):
+            warn_once("heartbeat", "enabled 必须是布尔值，已按关闭处理")
+            cfg["heartbeat"]["enabled"] = False
 
     limit = cfg.get("chatImageLimit")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:

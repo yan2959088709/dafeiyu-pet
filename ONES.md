@@ -128,6 +128,51 @@
   > claude [ ] 2026-11-06: 登记待办：
   > 【Phase 2 工具扩容】remember_fact / query_balance / play_animation / check_time——把现有「本地技能」（balance.py:_local_skill）收编为 FC，AI 自主决定何时查余额/记事/做动作；流式 transport + reasoning_content 实时「思考中」指示；search 升级为标签分类 + embedding（库过百后）。
   > 【Phase 3 自主意识】mood/energy 状态机驱动主动搭话（whisper 调度器升级）；目标队列（待办提醒）；时段策略（夜间静默）；跨会话长期记忆检索（facts 过多时按相关度注入而非全量前 20 条）。
+  >
+  > claude [~] 2026-11-09: 拆分——Stage 1（drives 状态机 + 心跳门禁 + 主动说话链路）拆为 TASK-010 实施中；M4 学习睡眠窗口拆为 TASK-011 待办。
+
+### TASK-010: Stage 1 心跳引擎 + 驱动状态机（自主循环/内在驱动/主动说话）
+- **Executor**: claude
+- **Status**: [~]
+- **Dependencies**: TASK-008
+- **Contract**: 2026-11-09 设计对话蓝图（本条 Handoff log [Blueprint]，用户经 /full-auto「试着实现一下」批准）。算法源：Shikigami-Protocol（AGPL-3.0）——**只搬算法不拷码**；dafeiyu-pet 仓库公开，严禁 AGPL 代码混入。
+- **Acceptance**:
+  1. `pet/drives.py`：mood/energy/affinity 三轴状态机；时间衰减/恢复/消息消耗；`pet_drives.json` 原子落盘；衰减基准 = `last_user_message_time`（判别力用例：频繁刷 `last_updated` 不阻衰减）
+  2. `pet/heartbeat.py`：tick→衰减→urgency（纯 Python 0 token）→门禁链（urgency≥0.35 / 沉默≥600s / 加权冷却 / 24h≤15 / 连续≤2 / busy 闸门 / 23-06 静默）；仅全过才调 LLM
+  3. 主动说话全链路：复用 `harness.run_turn`（FC 表情可用）；「（静默）」回复不存储/不显示/不计配额；历史只落 assistant 条（走既有 append+persist 路径，守住 TASK-008「chat_history 即会话 messages」身份不变式 + M5 sid 快照）；出口复用 _chat_out/say/TTS
+  4. `pet/heartbeat_prompt.py`：状态段注入（情绪/能量/亲密度，指令式 header）+ 主动场景 hint + 静默选项说明；默认参数 config 化（config.py DEFAULT_CFG 增 heartbeat 段）
+  5. 冒烟新增（假 transport，只桩最外层网络出口）：urgency 跳转/放行/加权冷却/24h 配额/静默回复/历史只落 assistant；现有 119 条不回归
+- **Handoff log**:
+  > claude [~] 2026-11-09: claimed via /full-auto。PRD.md 缺失→合同源 = TASK-009 预登记 + 2026-11-09 设计对话（用户逐节确认后批准实施）。git 注意：pet/chat.py、tools/smoke_check.py、桌宠.py 任务开始前即带未提交历史改动，Gate 5 只暂存本任务文件并显式声明。
+  >
+  > claude [Blueprint] 2026-11-09:
+  > DATA FLOW: 输入=30s QTimer tick（既有 _whisper_timer 升级）+ 用户消息事件；变换=HeartbeatEngine.on_tick → DrivesEngine.tick（纯 Python 衰减/恢复）→ urgency 计算 → 门禁链 → [仅全过] worker 线程调 harness.run_turn（system=心跳 prompt，含驱动状态段+静默选项）→ 静默则丢弃；输出=主动发言经既有 _chat_out/say/TTS 上屏；状态变化=pet_drives.json + heartbeat_state.json 落盘、chat_history 仅追加 assistant 条、energy-2/consecutive+1。
+  > MODULE: ①pet/drives.py（新）：DrivesEngine——load/save（tmp+replace 原子写 pet_drives.json）/tick(now)/apply_user_message/apply_ai_reply/urgency(st,now)/state_segments(st)；三轴 mood(str)+intensity/energy(0-100)/affinity(0-100) ②pet/heartbeat.py（新）：HeartbeatEngine——on_tick（GUI 线程，忙闸门 _hb_busy）/ _decide(now)→Decision(action,reason) 纯函数可单测 / _speak（worker 线程：run_turn→静默检测→_ui_call 封送出口）/ 持久化 heartbeat_state.json（last_speak_time/timestamps_24h/consecutive_speaks）③pet/heartbeat_prompt.py（新）：build_heartbeat_system(drives_st, persona_text, time_line, facts, cfg)→str ④pet/chat.py：_whisper_tick 委托（heartbeat.enabled 时心跳全权，关闭时回退 legacy whisper）；ChatMixin 内构造引擎（存储目录取 storage 既有路径，config 取 cfg）⑤config.py：DEFAULT_CFG 增 heartbeat 段 + validate ⑥桌宠.py：仅当 ChatMixin 构造不可行时最小 glue。
+  > INTERFACE: `DrivesEngine(storage_dir, cfg=None)`；`DrivesState(mood:str, mood_intensity:float, energy:float, affinity:float, last_user_message_time:float, last_decay_time:float)`；`HeartbeatEngine(chat_mixin, drives, cfg)`；`Decision(action:Literal["speak","skip"], reason:str, urgency:float, gates:dict)`；`build_heartbeat_system(...)->str`。
+  > 参数默认：min_silent=600 / min_interval=1800 / urgency_threshold=0.35 / max_per_24h=15 / max_consecutive=2 / quiet_window=(23,6) / energy_recovery=2 per 300s / energy_full_secs=14400 / mood_decay_secs=14400 / msg_energy_cost=2 / affinity_gain=0.2 per 用户消息 / affinity_decay=0.5 per hour。urgency = (0.45·clamp(silence/3600,0,1) + 0.25·time_bonus + 0.20·affinity·clamp((silence-1800)/7200,0,1)) · (1-(1-energy/100)·0.5)；cooldown_required = min_interval·(1-urgency·0.85)。
+  > INTEGRATION: 既有锚点——chat.py:298 _whisper_tick / chat.py:38 _build_system_prompt（段结构复用：persona+time_line+facts）/ chat.py:194 _speak_reply / harness.py:252 run_turn（可注入 transport）/ service_hooks.py:94 _ui_call / storage.py（原子写范式）/ memory.py facts / time_context.py:170 time_line / 桌宠.py:1408-1410 _whisper_timer。历史写入必须走 chat.py 既有 append+_persist 路径（身份不变式）。
+  > TEST: 单元=DrivesEngine 衰减/恢复/消耗（含 last_updated 陷阱判别力用例）/ _decide 全门禁分支（假 transport，只桩网络出口）；集成=on_tick→speak 全链路（静默回复/历史只落 assistant/energy 扣除/24h 配额）；edge=时钟回拨、drives 文件损坏、run_turn 抛异常、静默标记变体（（静默）/「（静默）」/(Silence).）。
+  > ELEGANCE: 无新依赖；新逻辑全在新模块；whisper 保留为 fallback 通道可回滚；复用 harness/ui_call/原子写既有范式。
+  > RISK: ①历史写错会话→sid 快照+既有 append 路径 ②token 成本→门禁全 Python+默认配额+静默不计费 ③QTimer 跨线程静默失效（教训L5）→tick 永在 GUI 线程，worker 只包 LLM 调用 ④AGPL 污染→算法重写不拷码。
+  >
+  > claude [Blueprint-Approved] 2026-11-09: 用户以 /full-auto（ARGUMENTS: 试着实现一下看看怎么样）批准，进入实现。
+  >
+  > claude [~] 2026-11-09: 实现+修正轮 1/2 完成（141/141）。Gate 0 架构门 PASS（9 项硬 criterion；AGPL 扫描最大相同 2 行样板；D1 并发流/ds_busy 守卫等 3 廉价项已修）。
+  > claude [Gate-1] 2026-11-09: 质量门 PASS（有条件）。必修：M1 衰减游标时钟回拨后退→已结算时段二次结算（现有回拨用例 elapsed=0 未覆盖该分支，需 1 行 max()+补用例）；M2 多宠共享 pet_drives.json/heartbeat_state.json 互相覆盖、24h 配额 guard 打穿（与 Gate-2 M-4/Gate-3.5 HIGH 同根）。建议：S1 _api_reload 后 cfg 冻结/S3 数值无下限/S4 提示词把被动回复说成「上次你主动说过」/S5 测试脚手架重复/S6 sticker 解析重复。N1-N9 nits（含 N9：urgency 公式 (affinity/100) 归一化偏离已批准蓝图，实现侧有充分理由+判别力用例，在此登记为已批准偏离）。
+  > claude [Gate-2] 2026-11-09: 安全门 FAIL。**H-1 阻塞**：_speak 异常路径不推进 last_attempt_time → not_silent/cooldown/24h/consecutive 四道门禁全失效 → 持续传输失败（过期 key/网络抖动/5xx）时 ~120 次/小时无限重试（探针 6/6 实证）。M-1 静默轮与 4 跳工具轮计费不入配额（真实上限 ~60 请求/天 vs 配置暗示 15）；M-2 运行期改 heartbeat 配置被忽略（PUT /config 无法热关）；M-3 固定 .tmp 名并发写损坏（探针 179/300）；M-4 多宠成本 ×N。L-1 time_bonus 非 dict 静默杀死特性；L-2 数值无边界；L-3 last_speak_content 无定界符升权系统提示词；L-4 .gitignore 漏两个状态文件。正面：无状态组合可绕过门禁、无路径遍历、无除零、无密钥泄漏、输出消毒全继承 harness、主动路径注入面小于被动路径。
+  > claude [Gate-3.5] 2026-11-09: 对抗测试无阻塞。12 探针矩阵：门禁边界零 off-by-one、时钟滥用（10 年回拨/ year 3000/非单调）、状态文件滥用（截断/类型错/NaN/目录/只读/6 线程并发）、重入（20 连 tick 仅 1 调用）、提示词构建（无 format-string 注入）、输入滥用（100k 字符/NUL/RTL）全部幸存。MEDIUM：time_bonus 崩溃（同 L-1）、前拨时钟后回拨→时间戳只钳下限→永久静默、_speak 非事务序（_save 抛则回复存而不显/队列抛则冷却失效）。LOW：静默标记泄漏（(silence)!、全角(Ｓilence)、小写 dsml）。
+  > claude [~] 2026-11-09: 修正轮 3 dispatched：P0×3（H-1 异常记账/M1 游标只前进/多宠按 pet_id 分文件）+ P1×10（time_bonus 守卫/时间戳双端钳/活配置读取/事务序/数值下限/标记泄漏/attempts 配额/last_speak_content 落盘/gitignore/死代码清理），逐项判别力用例。
+
+### TASK-011: M4 学习式睡眠窗口 + 时段权重
+- **Executor**: claude
+- **Status**: [ ]
+- **Dependencies**: TASK-010
+- **Contract**: TASK-010 蓝图 sleep_window 算法（30 天回溯/安静小时统计/含 0-6 点约束/4-14h/默认 23-06 回退）
+- **Acceptance**:
+  1. `pet/sleep_window.py`：从 pet_sessions.json 用户消息时间戳学习安静时段，喂给 heartbeat G7 门禁 + time_context 抑制
+  2. 判别力用例：数据不足回退默认；纯白天安静段不选；跨午夜窗口
+- **Handoff log**:
+  > claude [ ] 2026-11-09: 自 TASK-010 蓝图拆出。TASK-010 期间 G7 用 config 硬编码 quiet_window=(23,6)。
 
 ---
 

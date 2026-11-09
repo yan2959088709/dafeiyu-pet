@@ -26,7 +26,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAIN_PATH = os.path.join(ROOT, "桌宠.py")
 REAL_DATA = ("config.json", "pet_memory.json", "pet_sessions.json", "usage_ledger.json",
              "logs.txt", "config.jsonc", "ui_layout.json", "ui_layout_pending.json",
-             "action_binding.json")
+             "action_binding.json", "pet_drives.json", "heartbeat_state.json",
+             # 默认 pet_id="main" 的状态文件名带 sha1 短摘要（drives.state_file_name）
+             "pet_drives.main.%s.json" % hashlib.sha1(b"main").hexdigest()[:10],
+             "heartbeat_state.main.%s.json" % hashlib.sha1(b"main").hexdigest()[:10])
 BASELINE_PATH = os.path.join(ROOT, "tools", "smoke_baseline.json")
 
 CHECKS = []
@@ -662,6 +665,34 @@ def _():
         assert os.path.getsize(path) <= L.MAX_BYTES
         with open(path, encoding="utf-8") as f:
             assert "after-trim" in f.read()
+    finally:
+        L.reset()
+
+
+@check("log: sk- 形态 Key 脱敏不抛（异常文本里的裸 Key 可达 redact）")
+def _():
+    from pet import log as L
+    # H-1 起心跳异常日志会把 requests 异常文本（URL 带 key-in-query）送到
+    # redact：旧实现 sk- 正则无捕获组，sub 读 group(1) 直接 IndexError
+    out = L.redact("心跳发言失败: 401 for key sk-0123456789abcdefgh")
+    assert "sk-0123456789abcdefgh" not in out and "***" in out, out
+    assert "sk-01234" in out, out                  # 留前几位便于对账
+    out2 = L.redact("keys sk-aaaaaaaaaaaaaaaa and sk-bbbbbbbbbbbbbbbb done")
+    assert out2.count("***") == 2, out2
+    assert "aaaaaaaaaaaaaaaa" not in out2 and "bbbbbbbbbbbbbbbb" not in out2, out2
+    # 既有脱敏规则不回归
+    assert L.redact("x-dsh-pet-token: SECRET123") == "x-dsh-pet-token: ***"
+    assert L.redact("GET /v1?token=tok987654321") == "GET /v1?token=***"
+    assert "abcdefghijklmnop" not in L.redact("Authorization: Bearer abcdefghijklmnop")
+    assert "SECRET_URL" not in L.redact("DSH_PET_SITE_URL=https://x/SECRET_URL")
+    # 落盘路径同样不能抛（write → redact → flush）
+    p = os.path.join(CTX["tmpdir"], "redact.log")
+    L.configure(p)
+    try:
+        L.error("心跳发言失败: 401 for key sk-0123456789abcdefgh")
+        L.flush()
+        text = open(p, encoding="utf-8").read()
+        assert "sk-0123456789abcdefgh" not in text and "***" in text, text
     finally:
         L.reset()
 
@@ -1636,6 +1667,12 @@ def _():
     old_say = w.say
     had_lock = hasattr(w, "lock")
     old_lock = getattr(w, "lock", None)
+    old_hb = getattr(w, "_heartbeat", None)
+    # 启动问候是 3.5s 的 singleShot：本用例之前只有一处 processEvents，
+    # 它只会在本用例的 drain 里首次获得触发机会，说的那句话会混进 said。
+    # 与本用例断言无关，先摘掉（suite 耗时跨过 3.5s 时是必踩不是偶发）。
+    old_greet = w._startup_greet
+    w._startup_greet = lambda: None
 
     def _drain_whisper(timeout=5.0):
         # 碎碎念整拍跑在工作线程：既要等 busy 落低，也要替主线程泵事件，
@@ -1660,6 +1697,7 @@ def _():
         def is_locked(self):
             return True
     try:
+        w._heartbeat = None    # 本用例测 legacy 碎碎念：显式摘掉心跳接管
         w._whisper_tick()
         _drain_whisper()
         assert said == ["今天也要加油呀"], said
@@ -1679,6 +1717,8 @@ def _():
         w.cfg["ds_api_key"] = ""
         w._whisper = None
         w._chat_once = old_chat_once
+        w._heartbeat = old_hb
+        w._startup_greet = old_greet
         if had_lock:
             w.lock = old_lock
         elif hasattr(w, "lock"):
@@ -2197,6 +2237,82 @@ def _():
         w.chat_history = cur["messages"]
         w.chat_history[:] = old_hist
         w._reload_panel()
+
+
+@check("chat_ui: QQ 气泡结构（头像/尖角/限宽/时间分隔/媒体内嵌）+ 回车链路")
+def _():
+    import os
+    import time
+    from PySide6.QtCore import Qt, QEvent
+    from PySide6.QtGui import QKeyEvent
+    w, mod = CTX["win"], CTX["mod"]
+    panel = w.chat_panel
+
+    # 结构：AI=logo 头像+左尖角+白气泡；用户=右尖角+蓝气泡+「主」头像+整体右对齐
+    pet_html = mod.chat_bubble_html("你好", "pet")
+    user_html = mod.chat_bubble_html("你好", "user")
+    assert mod._file_url(mod.LOGO_PATH) in pet_html, "AI 气泡缺 logo 头像"
+    assert "tail_left.png" in pet_html and "tail_right.png" in user_html, "缺 PNG 尖角"
+    assert "#ffffff" in pet_html and "#5b8cff" in user_html
+    assert 'align="right"' in user_html, "用户气泡应整体右对齐"
+
+    # 时间分隔：间隔 > 300s 才插，且与消息同块（「一块=一条」契约不能破）
+    panel.clear_view()
+    now = time.time()
+    panel.append_msg("pet", "早", ts=now - 4000)
+    assert len(panel._msg_blocks) == 1, "分隔行不能单独成块"
+    assert "border-top:1px solid #e6eaf2" in panel._msg_blocks[-1], "跨时段缺时间分隔"
+    assert "早" in panel._msg_blocks[-1]
+    panel.append_msg("user", "接着聊", ts=now - 4000 + 30)
+    assert len(panel._msg_blocks) == 2
+    assert "border-top:1px solid #e6eaf2" not in panel._msg_blocks[-1], \
+        "5 分钟内不该再插分隔（注意别用 border-top 裸串断言：气泡圆角里也有）"
+
+    # 媒体内嵌：表情/图片 <img> 与文字同一个块；纯媒体消息不留占位文字
+    sticker = "_smoke_sticker.png"
+    spath = os.path.join(mod.P.stickers, sticker)
+    with open(spath, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+    img = os.path.join(CTX["tmpdir"], "_smoke_attach.png")
+    with open(img, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+    try:
+        panel.append_msg("user", "[表情]", sticker=sticker, ts=now)
+        blk = panel._msg_blocks[-1]
+        assert sticker in blk and "[表情]" not in blk, "纯表情消息应只留表情不留占位"
+        panel.append_msg("user", "看图", image=img, ts=now)
+        blk = panel._msg_blocks[-1]
+        assert "_smoke_attach.png" in blk and "看图" in blk, "图片应内嵌在气泡里"
+        # 流式块也是同一套气泡（不能退回旧的整段 span 高亮）
+        panel.stream_begin()
+        panel.stream_delta("打宇")
+        assert "eef1f8" not in panel._msg_blocks[-1], "流式块不该用旧高亮"
+        assert "打宇" in panel._msg_blocks[-1]
+        panel.stream_finalize("打字")
+        panel.stream_end()
+    finally:
+        os.remove(spath)
+
+    # 回车链路：Enter → 发送并清空；Shift+Enter → 放行换行不发送
+    sent = []
+    old_send = w._send_chat
+    w._send_chat = lambda text, attachment=None: sent.append(text) or True
+    try:
+        panel.input.setPlainText("回车发送我")
+        ev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                       Qt.KeyboardModifier.NoModifier)
+        assert panel._enter_catcher.eventFilter(panel.input, ev) is True
+        assert sent == ["回车发送我"], sent
+        assert panel.input.toPlainText() == "", "发送后输入框应清空"
+        panel.input.setPlainText("第二行")
+        ev2 = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                        Qt.KeyboardModifier.ShiftModifier)
+        assert panel._enter_catcher.eventFilter(panel.input, ev2) is False
+        assert sent == ["回车发送我"], "Shift+回车不该发送"
+        assert panel.input.toPlainText() == "第二行", "Shift+回车应保留内容换行"
+    finally:
+        w._send_chat = old_send
+        panel.clear_view()
 
 
 @check("menu: 第三方菜单项平铺与点击回传")
@@ -4670,6 +4786,1384 @@ def _():
     finally:
         w._stop_move_drivers()
         w._flight, w.flight_velocity, w._flight_timer = saved
+
+
+# ---------------------------------------------------------------- 心跳/驱动
+@check("drives: 衰减/恢复/消耗三则 + 关键词情绪")
+def _():
+    import time as _t
+    from pet import drives as D
+    d = os.path.join(CTX["tmpdir"], "drives_unit")
+    os.makedirs(d, exist_ok=True)
+    eng = D.DrivesEngine(d)
+    now = _t.time()
+
+    def msg_ago(sec, energy=None, affinity=None, text=""):
+        """模拟「sec 秒前主人说过一句话」：基准与结算游标一起锚定。"""
+        eng.apply_user_message(now - sec, text)
+        if energy is not None:
+            eng.st.energy = energy
+        if affinity is not None:
+            eng.st.affinity = affinity
+
+    # 恢复：脱离活跃期后按 elapsed/300s*2.0 线性回精力
+    msg_ago(1800, energy=10.0)
+    assert abs(eng.tick(now).energy - 22.0) < 1e-6, eng.st.energy
+    # 活跃期（<300s）不恢复也不侵蚀亲密度
+    msg_ago(100, energy=10.0, affinity=5.0)
+    st = eng.tick(now)
+    assert st.energy == 10.0 and st.affinity == 5.0
+    # 沉默满 4h 直接满精力
+    msg_ago(14400, energy=0.0)
+    assert eng.tick(now).energy == 100.0
+    # 情绪满 mood_decay_secs 才回平静；差 1 秒都不重置
+    msg_ago(14400, text="开心")
+    st = eng.tick(now)
+    assert st.mood == "calm" and st.mood_intensity == 1.0
+    msg_ago(14399, text="开心")
+    assert eng.tick(now).mood == "happy"
+    # 亲密度每小时 -0.5，下限 0（按距上次互动的 elapsed 计，重复 tick 不叠加）
+    msg_ago(7200, affinity=10.0)
+    assert abs(eng.tick(now).affinity - 9.0) < 1e-6, eng.st.affinity
+    assert abs(eng.tick(now).affinity - 9.0) < 1e-6, "同一 now 重复 tick 又在衰减"
+    msg_ago(7200, affinity=0.2)
+    assert eng.tick(now).affinity == 0.0
+    # 消耗下限 0；关键词取最后一个命中；无命中不动
+    msg_ago(0, energy=1.0)
+    eng.apply_ai_reply(now)
+    assert eng.st.energy == 0.0
+    eng.st.affinity = 99.9
+    eng.apply_user_message(now, "今天好累啊")
+    assert abs(eng.st.affinity - 100.0) < 1e-6
+    assert eng.st.last_user_message_time == now
+    assert eng.st.mood == "tired"
+    eng.st.mood = "calm"
+    eng.apply_user_message(now, "开心过后又有点难过")
+    assert eng.st.mood == "sad"
+    eng.st.mood = "calm"
+    eng.apply_user_message(now, "在吗")
+    assert eng.st.mood == "calm"
+    # save/load 往返
+    eng.save(eng.st)
+    again = D.DrivesEngine(d)
+    assert again.st.mood == "calm" and again.st.last_user_message_time == now
+
+
+@check("drives: 连续 save 不刷新衰减基准（last_updated 陷阱）")
+def _():
+    import json as _json
+    import time as _t
+    from pet import drives as D
+    d = os.path.join(CTX["tmpdir"], "drives_save")
+    os.makedirs(d, exist_ok=True)
+    eng = D.DrivesEngine(d)
+    now = _t.time()
+    eng.apply_user_message(now - 1800)      # 基准：30 分钟前互动过
+    eng.st.energy = 10.0
+    eng.st.affinity = 10.0
+    for _i in range(5):
+        eng.save(eng.st)      # 反复落盘：任何「刷新基准字段」的实现都会在这里现形
+        eng.tick(now)
+    assert abs(eng.st.energy - 22.0) < 1e-6, eng.st.energy
+    assert abs(eng.st.affinity - 9.75) < 1e-6, eng.st.affinity
+    # 增量结算：再过的 600s 只回 600/300*2=4，不会把全量 elapsed 重复加一遍
+    eng.tick(now + 600)
+    assert abs(eng.st.energy - 26.0) < 1e-6, eng.st.energy
+    with open(eng.path, "r", encoding="utf-8") as f:
+        disk = _json.load(f)
+    assert set(disk) == {"mood", "mood_intensity", "energy", "affinity",
+                         "last_user_message_time", "last_decay_time"}, disk
+    assert disk["last_user_message_time"] == now - 1800, disk
+
+
+@check("drives: urgency 钳制与 energy_brake")
+def _():
+    import time as _t
+    from pet import drives as D
+    d = os.path.join(CTX["tmpdir"], "drives_urg")
+    os.makedirs(d, exist_ok=True)
+    eng = D.DrivesEngine(d, {"time_bonus": {h: 0.4 for h in range(24)}})
+    now = _t.time()
+    st = D.DrivesState(mood="calm", energy=100.0, affinity=0.0,
+                       last_user_message_time=now - 3600)
+    # 沉默度拉满（1h）+ brake=1：0.45*1 + 0.25*0.4 = 0.55
+    assert abs(eng.urgency(st, now) - 0.55) < 1e-6, eng.urgency(st, now)
+    st.energy = 0.0       # brake 0.5 → 整体减半
+    assert abs(eng.urgency(st, now) - 0.275) < 1e-6
+    st.energy = 50.0      # brake 0.75
+    assert abs(eng.urgency(st, now) - 0.4125) < 1e-6
+    st.energy = 100.0     # 亲密度想念归一化：(50/100)·clamp((3600-1800)/7200)=0.125
+    st.affinity = 50.0
+    assert abs(eng.urgency(st, now) - 0.575) < 1e-6, eng.urgency(st, now)
+    # 时钟回拨：沉默度与想念都钳 0，只剩时段加成，不抛不负
+    back = eng.urgency(st, now - 100000)
+    assert abs(back - 0.25 * 0.4) < 1e-6, back
+
+
+@check("drives: urgency 亲密度想念归一化（高亲密不再饱和顶满）")
+def _():
+    import time as _t
+    from pet import drives as D
+    d = os.path.join(CTX["tmpdir"], "drives_miss_norm")
+    os.makedirs(d, exist_ok=True)
+    eng = D.DrivesEngine(d, {"time_bonus": {h: 0.8 for h in range(24)}})
+    now = _t.time()
+    # 旧公式 affinity * clamp(...)：affinity≥30 且沉默≥2.5h 时该项自己就破 1，
+    # urgency 被顶到 1、加权公式失去分辨力。归一化 (affinity/100) 后落在 0..1
+    st = D.DrivesState(energy=100.0, affinity=100.0,
+                       last_user_message_time=now - 9000)
+    # (0.45·1 + 0.25·0.8 + 0.20·(100/100)·1)·1 = 0.85，不再钳到 1
+    assert abs(eng.urgency(st, now) - 0.85) < 1e-6, eng.urgency(st, now)
+    # 分辨力：同一沉默下不同亲密度给出不同紧迫度（旧公式两者都=1）
+    st.affinity = 30.0
+    assert abs(eng.urgency(st, now) - 0.71) < 1e-6, eng.urgency(st, now)
+    st.affinity = 0.0
+    assert abs(eng.urgency(st, now) - 0.65) < 1e-6, eng.urgency(st, now)
+    # 想念起点（沉默恰 30min）不出力；拉到一半行程线性出力
+    st.affinity = 100.0
+    st.last_user_message_time = now - 1800
+    assert abs(eng.urgency(st, now) - 0.425) < 1e-6, eng.urgency(st, now)
+    st.last_user_message_time = now - 5400
+    assert abs(eng.urgency(st, now) - 0.75) < 1e-6, eng.urgency(st, now)
+
+
+@check("heartbeat: 静默回复识别变体")
+def _():
+    from pet.heartbeat import is_silence_reply as sil
+    for text in ("（静默）", "「（静默）」", "(Silence).", "  （ 静默 ）  ",
+                 "【静默】", "静默。", "『（silence）』",
+                 "(silence)!", "(Ｓilence)", "（静默),", "[SILENCE]?;",
+                 "(Silence):", "（silence）…"):
+        assert sil(text) is True, text
+    for text in ("今天静默了", "（静默）我来啦", "silence please", "", None,
+                 "静默模式"):
+        assert sil(text) is False, text
+
+
+@check("heartbeat: 静默标记集合钉死（拼接构造防手滑）")
+def _():
+    from pet.heartbeat import _SILENCE_SET
+    # 行为由上面的变体用例覆盖；这里钉集合本身——拼接构造（推导式套格式串）
+    # 写漏一个标记不会报错，只会静默少认一种弃权
+    assert _SILENCE_SET == {"静默", "(静默)", "[静默]",
+                            "silence", "(silence)", "[silence]"}, _SILENCE_SET
+
+
+@check("heartbeat: 提示词含状态段/场景段/避复述")
+def _():
+    from pet import drives as D
+    from pet.heartbeat_prompt import build_heartbeat_system as build
+    st = D.DrivesState(mood="happy", mood_intensity=1.0, energy=80.0,
+                       affinity=12.0, last_user_message_time=0.0)
+    sp = build(st, "你是桌宠", "现在是下午 3 点", ["喜欢喝奶茶"], {"city": "汕头"},
+               "昨天也说过类似的话")
+    assert "【人设】你是桌宠" in sp
+    assert "现在是下午 3 点" in sp
+    assert "喜欢喝奶茶" in sp
+    assert "汕头" in sp
+    assert "【当前状态：情绪开心（强度100%）｜精力80/100｜亲密度12/100" in sp, sp
+    assert "只回复「（静默）」" in sp
+    assert "上次你主动说过：「昨天也说过类似的话」，这次换个话题" in sp
+    assert "沉默超过 2 小时" in sp
+    # 空段自动过滤 + proactive_hint 可关
+    sp2 = build(st, "", "", [], {"proactive_hint": False}, "")
+    assert "【主动搭话提示】" not in sp2
+    assert "【人设】" not in sp2 and "记忆" not in sp2 and "城市" not in sp2
+    assert "【当前状态：" in sp2, "状态段任何情况下都要在"
+
+
+@check("heartbeat: 门禁全分支（含冷却加权公式）")
+def _():
+    import time as _t
+    from pet import drives as D
+    from pet.heartbeat import HeartbeatEngine
+
+    def at(hour, minute=30):
+        return _t.mktime(_t.strptime("2026-11-09 %02d:%02d:00" % (hour, minute),
+                                     "%Y-%m-%d %H:%M:%S"))
+
+    d = os.path.join(CTX["tmpdir"], "hb_gates")
+    os.makedirs(d, exist_ok=True)
+    empty_hb = {"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                "timestamps_24h": [], "consecutive_speaks": 0}
+
+    def engine(cfg):
+        return HeartbeatEngine(object(), D.DrivesEngine(d, cfg), cfg)
+
+    bonus = {h: 0.8 for h in range(24)}
+    cfg = {"quiet_window": [23, 6], "time_bonus": bonus}
+    eng = engine(cfg)
+    # 安静窗（23..6 左闭右开，跨午夜）
+    st = D.DrivesState(energy=100.0, affinity=0.0,
+                       last_user_message_time=at(14) - 4000)
+    dec = eng.decide(st, empty_hb, at(23))
+    assert dec.action == "skip" and dec.reason == "quiet_window", dec
+    assert dec.gates["quiet_window"] is False
+    now6 = at(6)
+    st6 = D.DrivesState(energy=100.0, affinity=0.0,
+                        last_user_message_time=now6 - 4000)
+    dec6 = eng.decide(st6, empty_hb, now6)
+    assert dec6.action == "speak" and dec6.reason == "ok", dec6
+    now5 = at(5)
+    st5 = D.DrivesState(energy=100.0, affinity=0.0,
+                        last_user_message_time=now5 - 4000)
+    assert eng.decide(st5, empty_hb, now5).reason == "quiet_window"
+    # 低紧迫度
+    low_u = engine({"quiet_window": [23, 6],
+                    "time_bonus": {h: 0.1 for h in range(24)}})
+    now = at(14)
+    st = D.DrivesState(energy=100.0, affinity=0.0,
+                       last_user_message_time=now - 600)
+    dec = low_u.decide(st, empty_hb, now)
+    assert dec.action == "skip" and dec.reason == "low_urgency", dec
+    # 紧迫度过线但沉默不够
+    noisy = engine({"quiet_window": [23, 6], "urgency_threshold": 0.2,
+                    "time_bonus": {h: 1.0 for h in range(24)}})
+    st = D.DrivesState(energy=100.0, affinity=0.0,
+                       last_user_message_time=now - 100)
+    dec = noisy.decide(st, empty_hb, now)
+    assert dec.action == "skip" and dec.reason == "not_silent", dec
+    # 冷却加权：同一 elapsed，高紧迫度放行、低紧迫度拦截
+    st = D.DrivesState(energy=100.0, affinity=0.0,
+                       last_user_message_time=now - 4000)
+    hb = {"last_speak_time": now - 1000, "last_attempt_time": 0.0,
+          "timestamps_24h": [], "consecutive_speaks": 0}
+    assert abs(eng.drives.urgency(st, now) - 0.65) < 1e-6
+    dec = eng.decide(st, hb, now)     # required=805.5 ≤ elapsed 1000
+    assert dec.action == "speak" and dec.reason == "ok", dec
+    dec2 = low_u.decide(st, hb, now)  # urgency 0.475 → required 1073 > 1000
+    assert dec2.action == "skip" and dec2.reason == "cooldown", dec2
+    # 日配额（按 attempts_24h 计：静默/失败轮也占份，timestamps_24h 只记成功发言）
+    hb["attempts_24h"] = [now - 60 - 3600 * i for i in range(15)]
+    dec = eng.decide(st, hb, now)
+    assert dec.action == "skip" and dec.reason == "24h_limit", dec
+    hb["attempts_24h"] = [now - 60 - 3600 * i for i in range(14)]
+    assert eng.decide(st, hb, now).action == "speak"
+    # 24h 窗口外的不计：第 15 次Attempt 超过一天就重新计数
+    hb["attempts_24h"] = [now - 60 - 3600 * i for i in range(15)]
+    hb["attempts_24h"][-1] = now - D.DAY_SEC - 60
+    assert eng.decide(st, hb, now).action == "speak"
+    hb["attempts_24h"] = []
+    # 连发上限
+    hb["timestamps_24h"] = []
+    hb["consecutive_speaks"] = 2
+    dec = eng.decide(st, hb, now)
+    assert dec.action == "skip" and dec.reason == "max_consecutive", dec
+    hb["consecutive_speaks"] = 1
+    dec = eng.decide(st, hb, now)
+    assert dec.action == "speak" and all(dec.gates.values()), dec
+    assert set(dec.gates) == {"quiet_window", "low_urgency", "not_silent",
+                              "cooldown", "24h_limit", "max_consecutive"}
+
+
+@check("heartbeat: 用户回复后 consecutive 重置")
+def _():
+    import time as _t
+    from pet import drives as D
+    from pet.heartbeat import HeartbeatEngine
+    d = os.path.join(CTX["tmpdir"], "hb_reset")
+    os.makedirs(d, exist_ok=True)
+    eng = HeartbeatEngine(object(), D.DrivesEngine(d), {})
+    now = _t.time()
+    hb = {"last_speak_time": now - 100, "last_attempt_time": 0.0,
+          "timestamps_24h": [], "consecutive_speaks": 2}
+    eng._drives_st = D.DrivesState(last_user_message_time=now - 50)
+    eng._reset_consecutive_if_user_replied(hb, now)
+    assert hb["consecutive_speaks"] == 0
+    hb["consecutive_speaks"] = 2
+    eng._drives_st = D.DrivesState(last_user_message_time=now - 500)
+    eng._reset_consecutive_if_user_replied(hb, now)
+    assert hb["consecutive_speaks"] == 2
+
+
+@check("heartbeat: on_tick→_speak 全链路（假 transport）")
+def _():
+    import json as _json
+    import time as _t
+    from pet import harness as H
+    from PySide6.QtCore import QThread
+    w = CTX["win"]
+    eng = w._heartbeat
+    assert eng is not None, "窗口未构造心跳引擎"
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    seen = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        assert QThread.currentThread() is not CTX["app"].thread(), \
+            "发言跑在了 GUI 线程"
+        seen.append(messages[0]["content"])
+        return ({"content": "在干嘛呢，理我一下嘛"}, None, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]   # 空窗
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        eng.on_tick()
+        deadline = _t.time() + 10
+        while eng._busy and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not eng._busy, "发言 worker 未在时限内结束"
+        assert len(seen) == 1, seen
+        # 身份不变式：只追加 assistant 条，不伪造 user 轮次
+        tail = w.chat_history[-1:]
+        assert tail and tail[0]["role"] == "assistant", tail
+        assert tail[0]["content"] == "在干嘛呢，理我一下嘛", tail
+        # 上屏走既有出口（_chat_queue → tick → _chat_out）
+        assert w._chat_queue and w._chat_queue[-1][0] == "在干嘛呢，理我一下嘛"
+        assert eng._hb["last_speak_time"] > 0.0
+        assert eng._hb["timestamps_24h"] == [eng._hb["last_speak_time"]]
+        assert eng._hb["consecutive_speaks"] == 1
+        # 计费唯一挂点是 _chat_out：worker 封送阶段不扣（旧实现在此先扣一次）
+        assert eng.drives.st.energy == 100.0, eng.drives.st.energy
+        with open(eng._hb_path(), encoding="utf-8") as f:
+            disk = _json.load(f)
+        assert disk["consecutive_speaks"] == 1 and len(disk["timestamps_24h"]) == 1
+        with open(eng.drives.path, encoding="utf-8") as f:
+            assert _json.load(f)["energy"] == 100.0
+        w._stream_queue.clear()
+        w._tick_consume_queues()   # 消费 _chat_queue → _chat_out 渲染 + 计费
+        # 主动发言恰好扣 2：能耗在上屏出口结算，随下一拍 tick 落盘
+        assert eng.drives.st.energy == 98.0, eng.drives.st.energy
+        w._chat_queue.clear()
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._reload_panel()
+
+
+@check("heartbeat: 主动发言恰好扣 2 能量（_chat_out 唯一计费点）")
+def _():
+    import time as _t
+    from pet import harness as H
+    from PySide6.QtCore import QThread
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    seen = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        assert QThread.currentThread() is not CTX["app"].thread(), \
+            "发言跑在了 GUI 线程"
+        seen.append(1)
+        return ({"content": "扣费验证专用句"}, None, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]   # 空窗
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        eng.on_tick()
+        deadline = _t.time() + 10
+        while eng._busy and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not eng._busy and len(seen) == 1, seen
+        # worker 只封送不计费：能量还是 100（旧实现在此先扣 2，上屏再扣 = -4）
+        assert eng.drives.st.energy == 100.0, eng.drives.st.energy
+        assert w._chat_queue and w._chat_queue[-1][0] == "扣费验证专用句"
+        # 消费上屏 → _chat_out 唯一计费点：恰好 -2（不是 -4、不是 0）
+        w._tick_consume_queues()
+        assert eng.drives.st.energy == 98.0, eng.drives.st.energy
+        # 被动回复走同一挂点：再 -2（主动/被动两条路共用唯一计费点）
+        w._chat_out("被动回复", save=False)
+        assert eng.drives.st.energy == 96.0, eng.drives.st.energy
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._reload_panel()
+
+
+@check("heartbeat: 静默回复只推进 attempt 且防立即重复触发")
+def _():
+    import time as _t
+    from pet import harness as H
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        return ({"content": "「（静默）」"}, None, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        eng.on_tick()
+        deadline = _t.time() + 10
+        while eng._busy and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not eng._busy
+        # 静默 = 这轮没发生：无历史、无上屏、无成功配额、无连发、精力不扣
+        assert w.chat_history == old_hist, w.chat_history[-2:]
+        assert not w._chat_queue, w._chat_queue
+        assert eng._hb["last_speak_time"] == 0.0
+        assert eng._hb["timestamps_24h"] == []
+        assert eng._hb["consecutive_speaks"] == 0
+        assert eng._hb["last_attempt_time"] > 0.0
+        # 但静默轮照样打了请求：计入 24h 尝试配额（P1-7）
+        assert len(eng._hb["attempts_24h"]) == 1
+        assert eng.drives.st.energy == 100.0
+        # 防立即重复触发：同一紧迫度下再判一次，attempt 刚推进 → not_silent 拦截
+        dec = eng.decide(eng.drives.st, eng._hb, _t.time())
+        assert dec.action == "skip" and dec.reason == "not_silent", dec
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._reload_panel()
+
+
+@check("heartbeat: run_turn 抛异常 → busy 释放不崩")
+def _():
+    import time as _t
+    from pet import harness as H
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    calls = []
+
+    def boom(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        calls.append(1)
+        raise RuntimeError("网络炸了")
+
+    H.deepseek_transport = boom
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        eng.on_tick()
+        deadline = _t.time() + 10
+        while eng._busy and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not eng._busy, "异常后 busy 未释放（心跳将停摆至重启）"
+        assert calls, "worker 没跑到 transport"
+        assert w.chat_history == old_hist and not w._chat_queue
+        assert eng._hb["last_speak_time"] == 0.0
+        # 传输失败也推进 attempt 并计入尝试配额：否则 30s 一拍无限重试
+        assert eng._hb["last_attempt_time"] > 0.0
+        assert len(eng._hb["attempts_24h"]) == 1
+        assert eng.drives.st.energy == 100.0
+        # 定时器不崩：换回好 transport 再来一拍照样能说。
+        # 失败那一拍已推进 attempt（P0-1），先把 attempt 拨回旧值模拟
+        # 「冷却已满」——否则这一拍会被 not_silent 正确挡住（那正是修复点）
+        H.deepseek_transport = lambda *a, **k: ({"content": "恢复啦"}, None, "stop")
+        eng._hb["last_attempt_time"] = now - 4000
+        eng.on_tick()
+        deadline = _t.time() + 10
+        while eng._busy and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not eng._busy
+        assert w._chat_queue and w._chat_queue[-1][0] == "恢复啦"
+        assert eng._hb["consecutive_speaks"] == 1
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._reload_panel()
+
+
+@check("heartbeat: 被动对话飞行中（ds_busy）不插话")
+def _():
+    import json as _json
+    import time as _t
+    from pet import harness as H
+    from pet.heartbeat import Decision
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_busy = w.ds_busy
+    seen = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        seen.append(1)
+        return ({"content": "不该出现的主动搭话"}, None, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        w.ds_busy = True          # 主人正在对话：被动流式飞行中
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        before = _t.time()
+        eng._speak(Decision("speak", "ok", 0.5, {}))
+        # 飞行中不插话：无网络调用、无历史写入、无上屏，只推进 attempt 时间
+        assert not seen, "ds_busy 期间发起了 LLM 调用"
+        assert w.chat_history == old_hist, w.chat_history[-2:]
+        assert not w._chat_queue, w._chat_queue
+        assert eng._hb["last_attempt_time"] >= before, eng._hb
+        assert eng._hb["last_speak_time"] == 0.0
+        assert eng._hb["timestamps_24h"] == []
+        assert eng._hb["consecutive_speaks"] == 0
+        with open(eng._hb_path(), encoding="utf-8") as f:
+            disk = _json.load(f)
+        assert disk["last_attempt_time"] >= before and disk["last_speak_time"] == 0.0
+        # 判别力：ds_busy 让开后同一拍照常能说（守卫只挡飞行中，不永久屏蔽）
+        w.ds_busy = False
+        eng._speak(Decision("speak", "ok", 0.5, {}))
+        assert seen, "ds_busy 让开后主动发言被永久屏蔽"
+        assert w._chat_queue and w._chat_queue[-1][0] == "不该出现的主动搭话"
+        w._chat_queue.clear()
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        w.ds_busy = old_busy
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._stream_queue.clear()
+        w._reload_panel()
+
+
+@check("heartbeat: now 回拨不崩、elapsed 钳 0")
+def _():
+    import time as _t
+    from pet import drives as D
+    from pet.heartbeat import HeartbeatEngine
+    d = os.path.join(CTX["tmpdir"], "hb_rollback")
+    os.makedirs(d, exist_ok=True)
+    now = _t.time()
+    hour = _t.localtime(now).tm_hour
+    cfg = {"quiet_window": [(hour + 1) % 24, (hour + 1) % 24],
+           "time_bonus": {h: 0.8 for h in range(24)}}
+    eng = HeartbeatEngine(object(), D.DrivesEngine(d, cfg), cfg)
+    # last_* 全在未来：elapsed 钳 0 → 沉默门禁拦截（G2 基准含全部 last_*，
+    # 未来时间戳永远先被它挡住；冷却门里的 max(0, …) 只是纵深防御），
+    # 关键是绝不抛异常、绝不由负数 elapsed 放行
+    st = D.DrivesState(energy=100.0, affinity=0.0,
+                       last_user_message_time=now - 4000)
+    hb = {"last_speak_time": now + 500, "last_attempt_time": 0.0,
+          "timestamps_24h": [now + 500], "consecutive_speaks": 0}
+    dec = eng.decide(st, hb, now)
+    assert dec.action == "skip" and dec.reason == "not_silent", dec
+    # tick / urgency 回拨：不恢复、不衰减、不抛不负
+    d2 = os.path.join(CTX["tmpdir"], "hb_rollback2")
+    os.makedirs(d2, exist_ok=True)
+    drives = D.DrivesEngine(d2)
+    drives.st = D.DrivesState(mood="happy", mood_intensity=0.5, energy=42.0,
+                              affinity=7.0, last_user_message_time=now)
+    out = drives.tick(now - 100000)
+    assert out.energy == 42.0 and out.affinity == 7.0 and out.mood == "happy"
+    assert drives.urgency(drives.st, now - 100000) >= 0.0
+
+
+@check("heartbeat: 状态文件损坏 → 默认值不抛")
+def _():
+    import json as _json
+    from pet import drives as D
+    from pet.heartbeat import HeartbeatEngine
+    d = os.path.join(CTX["tmpdir"], "hb_corrupt")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "pet_drives.json"), "w", encoding="utf-8") as f:
+        f.write("{ 坏了")
+    eng = D.DrivesEngine(d)
+    assert eng.st.mood == "calm" and eng.st.energy == 80.0 and eng.st.affinity == 0.0
+    assert os.path.exists(os.path.join(d, "pet_drives.json.corrupt")), "损坏原文未备份"
+    with open(os.path.join(d, "pet_drives.json"), "w", encoding="utf-8") as f:
+        f.write("[1, 2]")      # 顶层类型不符也回落
+    assert D.DrivesEngine(d).st.energy == 80.0
+    with open(os.path.join(d, "heartbeat_state.json"), "w", encoding="utf-8") as f:
+        f.write("not json")
+    hb = HeartbeatEngine(object(), D.DrivesEngine(d), {}).state
+    assert hb == {"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                  "timestamps_24h": [], "attempts_24h": [],
+                  "consecutive_speaks": 0, "last_speak_content": ""}, hb
+    # 半合法 JSON：字段类型不对逐项回落，其余照用
+    with open(os.path.join(d, "heartbeat_state.json"), "w", encoding="utf-8") as f:
+        _json.dump({"last_speak_time": "x", "consecutive_speaks": "y",
+                    "timestamps_24h": "z", "attempts_24h": "z",
+                    "last_speak_content": 42, "last_attempt_time": 12.5}, f)
+    st = HeartbeatEngine(object(), D.DrivesEngine(d), {}).state
+    assert st["last_speak_time"] == 0.0 and st["consecutive_speaks"] == 0
+    assert st["timestamps_24h"] == [] and st["last_attempt_time"] == 12.5
+    assert st["attempts_24h"] == [] and st["last_speak_content"] == ""
+
+
+@check("heartbeat: 全新安装首 tick 不开口（attempt 锚定初始化时刻）")
+def _():
+    import json as _json
+    import time as _t
+    from pet import drives as D
+    from pet.heartbeat import HeartbeatEngine
+    d = os.path.join(CTX["tmpdir"], "hb_fresh")
+    os.makedirs(d, exist_ok=True)
+    assert not os.path.exists(os.path.join(d, "heartbeat_state.json")), "用例目录必须全新"
+    hour = _t.localtime().tm_hour
+    cfg = {"quiet_window": [(hour + 1) % 24, (hour + 1) % 24],   # 空窗：屏蔽时段依赖
+           "time_bonus": {h: 0.8 for h in range(24)}}
+    t0 = _t.time()
+    eng = HeartbeatEngine(object(), D.DrivesEngine(d, cfg), cfg)
+    anchor = eng.state["last_attempt_time"]
+    # attempt 锚定在初始化时刻；speak 保持 0（从未主动说过）
+    assert t0 <= anchor <= _t.time(), anchor
+    assert eng.state["last_speak_time"] == 0.0
+    # 首 tick：G2 看到 silent≈0 → not_silent 拦截。
+    # 旧实现 last_* 全 0 → elapsed 巨大 → 启动第一拍就 speak（判别力在此）
+    eng.on_tick()
+    dec = eng.decide(eng.drives.st, eng.state, _t.time())
+    assert dec.action == "skip" and dec.reason == "not_silent", dec
+    assert eng.state["last_speak_time"] == 0.0
+    # 等满 min_silent + 加权冷却后放行：锚定只是「第一次要守规矩」，不是永久屏蔽
+    dec2 = eng.decide(eng.drives.st, eng.state, anchor + 1000)
+    assert dec2.action == "speak" and dec2.reason == "ok", dec2
+    # 落盘的 attempt 就是锚点（不是 0）：重启后时钟延续，不会重新「首拍即开口」
+    with open(os.path.join(d, "heartbeat_state.json"), encoding="utf-8") as f:
+        disk = _json.load(f)
+    assert disk["last_attempt_time"] == anchor and disk["last_speak_time"] == 0.0
+
+
+@check("heartbeat: 传输持续失败也推进 attempt（不再 30s 无限重试）")
+def _():
+    import time as _t
+    from pet import harness as H
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    calls = []
+
+    def boom(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        calls.append(1)
+        raise RuntimeError("401 key 过期")
+
+    H.deepseek_transport = boom
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        # 连续三拍：旧实现 except 只记日志不推进 attempt → not_silent/cooldown
+        # 永远看不出败迹 → 三拍全打出（探针实测 ~120 次/小时）
+        for _i in range(3):
+            eng.on_tick()
+            deadline = _t.time() + 10
+            while eng._busy and _t.time() < deadline:
+                CTX["app"].processEvents()
+                _t.sleep(0.005)
+            assert not eng._busy, "异常后 busy 未释放"
+        assert len(calls) == 1, calls
+        assert eng._hb["last_attempt_time"] > 0.0
+        assert len(eng._hb["attempts_24h"]) == 1
+        # attempt 已落盘：同一紧迫度下再判被 not_silent 挡住（冷却生效）
+        dec = eng.decide(eng.drives.st, eng._hb, _t.time())
+        assert dec.action == "skip" and dec.reason == "not_silent", dec
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+
+
+@check("drives: 时钟回拨不二次结算（游标只前进）")
+def _():
+    import tempfile as _tf
+    import time as _t
+    from pet import drives as D
+    base = os.path.join(CTX["tmpdir"], "drives_rollback")
+    os.makedirs(base, exist_ok=True)
+    T = _t.time()
+
+    def run(seq):
+        d = _tf.mkdtemp(dir=base)
+        eng = D.DrivesEngine(d)
+        eng.apply_user_message(T)          # 基准与结算游标一起锚在 T
+        eng.st.energy = 50.0
+        eng.st.affinity = 10.0
+        for t in seq:
+            eng.tick(t)
+        return eng.st
+
+    ref = run([T + 1000, T + 1200])            # 无回拨参考序列
+    back = run([T + 1000, T + 400, T + 1200])  # 中间回拨 800s 再恢复
+    # 回拨那一拍 elapsed 钳 0 不结算，但游标不能后退：否则恢复后
+    # 400..1200 这一段被二次结算（精力多回、亲密度多扣）
+    assert abs(ref.energy - back.energy) <= 1e-9, (ref.energy, back.energy)
+    assert abs(ref.affinity - back.affinity) <= 1e-9, (ref.affinity, back.affinity)
+    assert back.last_decay_time == T + 1200, back.last_decay_time
+    # 死代码已删除（heartbeat_prompt 用的是模块级 state_segments）
+    assert not hasattr(D.DrivesEngine, "state_segments")
+    from pet.heartbeat_prompt import build_heartbeat_system as build
+    assert ("精力%.0f/100" % back.energy) in build(back, "", "", [], {}, "")
+
+
+@check("heartbeat: 多宠状态文件按 pet_id 分份（配额/状态互不占用）")
+def _():
+    import json as _json
+    import time as _t
+    from pet import drives as D
+    from pet.heartbeat import HeartbeatEngine
+    d = os.path.join(CTX["tmpdir"], "hb_multipet")
+    os.makedirs(d, exist_ok=True)
+    hour = _t.localtime().tm_hour
+    cfg = {"quiet_window": [(hour + 1) % 24, (hour + 1) % 24],
+           "time_bonus": {h: 0.8 for h in range(24)}}
+    ea = HeartbeatEngine(object(), D.DrivesEngine(d, cfg, pet_id="alpha"), cfg,
+                         pet_id="alpha")
+    eb = HeartbeatEngine(object(), D.DrivesEngine(d, cfg, pet_id="beta"), cfg,
+                         pet_id="beta")
+    HeartbeatEngine(object(), D.DrivesEngine(d, cfg), cfg)   # 无 id：单例共享
+    # 文件名分份：每宠一份 drives + 一份心跳状态（旧实现共写一份互相覆盖）；
+    # 名字带原始 id 的 sha1 短摘要（state_file_name），这里按前缀认领
+    names = os.listdir(d)
+    for prefix in ("pet_drives.alpha.", "heartbeat_state.alpha.",
+                   "pet_drives.beta.", "heartbeat_state.beta."):
+        hits = [n for n in names if n.startswith(prefix) and n.endswith(".json")]
+        assert len(hits) == 1, (prefix, hits)
+    assert "pet_drives.json" in names and "heartbeat_state.json" in names
+    assert ea._hb_path() != eb._hb_path()
+    assert ea.drives.path != eb.drives.path
+    assert "/" not in D.state_file_name("pet_drives.json", "../evil")
+    # alpha 打满尝试额度：落 alpha 的文件，beta 重读还是空的
+    now = _t.time()
+    ea._hb["attempts_24h"] = [now - 60 - 3600 * i for i in range(15)]
+    ea._save_hb()
+    eb._save_hb()
+    ea2 = HeartbeatEngine(object(), D.DrivesEngine(d, cfg, pet_id="alpha"), cfg,
+                          pet_id="alpha")
+    eb2 = HeartbeatEngine(object(), D.DrivesEngine(d, cfg, pet_id="beta"), cfg,
+                          pet_id="beta")
+    assert len(ea2.state["attempts_24h"]) == 15, ea2.state
+    assert eb2.state["attempts_24h"] == [], eb2.state
+    with open(eb2._hb_path(), encoding="utf-8") as f:
+        assert _json.load(f)["attempts_24h"] == []
+    # 配额按宠计：alpha 满额 skip，beta 照常放行
+    st = D.DrivesState(energy=100.0, affinity=0.0, last_user_message_time=now - 4000)
+    zero = {"last_speak_time": 0.0, "last_attempt_time": 0.0,
+            "timestamps_24h": [], "attempts_24h": [], "consecutive_speaks": 0}
+    full = dict(zero, attempts_24h=[now - 60 - 3600 * i for i in range(15)])
+    assert ea2.decide(st, full, now).reason == "24h_limit"
+    assert eb2.decide(st, zero, now).reason == "ok"
+
+
+@check("drives: 状态文件名单射（大小写/空白/非 ASCII id 不互踩）")
+def _():
+    from pet import drives as D
+    ids = ["main", "main.", " main ", "Main", "小鱼", "小猫"]
+    names = [D.state_file_name("pet_drives.json", pid) for pid in ids]
+    assert len(set(names)) == len(ids), names
+    # 大小写不敏感的文件系统（Windows）上也不能撞同一文件
+    assert len({n.lower() for n in names}) == len(ids), names
+    # 全非 ASCII id 不得退化成共享单例（旧实现 safe 后是空串 → 回 base 互覆）
+    for pid in ("小鱼", "小猫"):
+        assert D.state_file_name("pet_drives.json", pid) != "pet_drives.json"
+    # 取不到 id 仍是单例共享（老路径行为不变）
+    assert D.state_file_name("pet_drives.json", None) == "pet_drives.json"
+    assert D.state_file_name("pet_drives.json", "  ") == "pet_drives.json"
+    # 路径穿越仍被堵
+    evil = D.state_file_name("pet_drives.json", "../evil")
+    assert "/" not in evil and "\\" not in evil and ".." not in evil, evil
+    # clobber 实证：两个非 ASCII id 共目录，各落各的文件、读不到对方的状态
+    d = os.path.join(CTX["tmpdir"], "drives_injective")
+    os.makedirs(d, exist_ok=True)
+    ea = D.DrivesEngine(d, {}, pet_id="小鱼")
+    ea.st.energy = 42.0
+    ea.save()
+    eb = D.DrivesEngine(d, {}, pet_id="小猫")
+    assert ea.path != eb.path, (ea.path, eb.path)
+    assert eb.st.energy == 80.0, "小猫读到了小鱼落盘的状态"
+
+
+@check("config: heartbeat time_bonus 非字典不抛（回落默认时段表）")
+def _():
+    from pet import drives as D
+    for bad in ("x", [1, 2], 7, True, ("a",)):
+        norm = D.normalize_heartbeat_cfg({"time_bonus": bad})
+        assert norm["time_bonus"] == D.DEFAULT_TIME_BONUS, (bad, norm["time_bonus"])
+    # 字典（含字符串键）照常按用户表走
+    norm = D.normalize_heartbeat_cfg({"time_bonus": {"7": 0.9}})
+    assert norm["time_bonus"] == {7: 0.9}, norm["time_bonus"]
+
+
+@check("config: 门禁数值越界钳制（负静默/零冷却不透传）")
+def _():
+    from pet import drives as D
+    norm = D.normalize_heartbeat_cfg({"min_silent": -5, "min_interval": 0,
+                                      "urgency_threshold": -1,
+                                      "max_per_24h": 0,
+                                      "max_consecutive": 0})
+    assert norm["min_silent"] == 30.0, norm["min_silent"]
+    assert norm["min_interval"] == 60.0, norm["min_interval"]
+    assert norm["urgency_threshold"] == 0.0, norm["urgency_threshold"]
+    assert norm["max_per_24h"] == 1.0, norm["max_per_24h"]
+    assert norm["max_consecutive"] == 1.0, norm["max_consecutive"]
+    norm2 = D.normalize_heartbeat_cfg({"urgency_threshold": 2.0})
+    assert norm2["urgency_threshold"] == 1.0, norm2["urgency_threshold"]
+    # 合法值不被钳动
+    ok = D.normalize_heartbeat_cfg({"min_silent": 600, "min_interval": 1800,
+                                    "urgency_threshold": 0.35,
+                                    "max_per_24h": 15, "max_consecutive": 2})
+    assert ok["min_silent"] == 600.0 and ok["min_interval"] == 1800.0
+    assert ok["urgency_threshold"] == 0.35 and ok["max_per_24h"] == 15.0
+
+
+@check("config: 门禁数值上限钳制（1e9 不让每日消费闸门失效）")
+def _():
+    from pet import drives as D
+    norm = D.normalize_heartbeat_cfg({"max_per_24h": 1e9, "max_consecutive": 1e9})
+    assert norm["max_per_24h"] == 200.0, norm["max_per_24h"]
+    assert norm["max_consecutive"] == 10.0, norm["max_consecutive"]
+    # 合法值不被钳动：贴上限的 200/10 与默认 15/2 都原样透传
+    edge = D.normalize_heartbeat_cfg({"max_per_24h": 200, "max_consecutive": 10})
+    assert edge["max_per_24h"] == 200.0 and edge["max_consecutive"] == 10.0, edge
+    mid = D.normalize_heartbeat_cfg({"max_per_24h": 15, "max_consecutive": 2})
+    assert mid["max_per_24h"] == 15.0 and mid["max_consecutive"] == 2.0, mid
+    dft = D.normalize_heartbeat_cfg(None)
+    assert dft["max_per_24h"] == 15.0 and dft["max_consecutive"] == 2.0, dft
+
+
+@check("heartbeat: 时间戳双端钳（前拨时钟不永久 not_silent）")
+def _():
+    import json as _json
+    import time as _t
+    from pet import drives as D
+    from pet.heartbeat import HeartbeatEngine
+    d = os.path.join(CTX["tmpdir"], "hb_future_ts")
+    os.makedirs(d, exist_ok=True)
+    hour = _t.localtime().tm_hour
+    cfg = {"quiet_window": [(hour + 1) % 24, (hour + 1) % 24],
+           "time_bonus": {h: 0.8 for h in range(24)}}
+    now = _t.time()
+    future = now + 3600 * 24 * 365 * 200        # 前拨时钟留下的「year 3000+」
+    with open(os.path.join(d, "heartbeat_state.json"), "w", encoding="utf-8") as f:
+        _json.dump({"last_speak_time": 0.0, "last_attempt_time": future,
+                    "timestamps_24h": [], "consecutive_speaks": 0}, f)
+    eng = HeartbeatEngine(object(), D.DrivesEngine(d, cfg), cfg)
+    # 只钳下限时 attempt 留在未来 → elapsed 恒负 → silent 恒 0 → 永久 skip
+    assert 0.0 < eng.state["last_attempt_time"] <= _t.time(), eng.state
+    st = D.DrivesState(energy=100.0, affinity=0.0, last_user_message_time=now - 4000)
+    dec = eng.decide(st, eng.state, now + 1000)
+    assert dec.action == "speak" and dec.reason == "ok", dec
+    # drives 侧同款双端钳
+    with open(os.path.join(d, "pet_drives.json"), "w", encoding="utf-8") as f:
+        _json.dump({"energy": 50.0, "affinity": 10.0, "mood": "calm",
+                    "mood_intensity": 1.0, "last_user_message_time": now - 4000,
+                    "last_decay_time": future}, f)
+    d2 = D.DrivesEngine(d)
+    assert d2.st.last_decay_time <= _t.time(), d2.st
+    assert d2.st.last_user_message_time <= _t.time(), d2.st
+
+
+@check("heartbeat: 结算事务序（上屏先于落盘，attempt 任何出口都落盘）")
+def _():
+    import json as _json
+    import time as _t
+    from pet import harness as H
+    from pet.heartbeat import Decision
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    old_save_mem, old_queue = w._save_mem, w._chat_queue
+    hb_file = eng._hb_path()
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        return ({"content": "事务序验证句"}, None, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        w._chat_queue.clear()
+        # 场景 1：_save_mem 抛桩 → 回复仍上屏（封送先于落盘），attempt 落盘
+        def boom_save():
+            raise OSError("磁盘满了")
+        w._save_mem = boom_save
+        before = _t.time()
+        eng._speak(Decision("speak", "ok", 0.5, {}))
+        assert w._chat_queue and w._chat_queue[-1][0] == "事务序验证句", w._chat_queue
+        assert eng._hb["last_speak_time"] == 0.0, "落盘失败的发言不计成功配额"
+        assert eng._hb["last_attempt_time"] >= before
+        with open(hb_file, encoding="utf-8") as f:
+            assert _json.load(f)["last_attempt_time"] >= before
+        w._chat_queue.clear()
+        w._save_mem = old_save_mem
+        # 场景 2：_chat_queue.append 抛桩 → 回复没上屏，attempt 仍落盘（冷却生效）
+        class BoomQueue(list):
+            def append(self, *a, **k):
+                raise OSError("出口不可用")
+        w._chat_queue = BoomQueue()
+        before2 = _t.time()
+        eng._speak(Decision("speak", "ok", 0.5, {}))
+        assert eng._hb["last_speak_time"] == 0.0, "没上屏不算成功发言"
+        assert eng._hb["last_attempt_time"] >= before2
+        with open(hb_file, encoding="utf-8") as f:
+            assert _json.load(f)["last_attempt_time"] >= before2
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._save_mem, w._chat_queue = old_save_mem, old_queue
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._reload_panel()
+
+
+@check("heartbeat: 静默轮计入 24h 尝试配额（配额不再形同虚设）")
+def _():
+    import time as _t
+    from pet import harness as H
+    from pet.heartbeat import Decision
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    old_max = eng.cfg["max_per_24h"]
+    calls = []
+
+    def silent(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        calls.append(1)
+        return ({"content": "（静默）"}, None, "stop")
+
+    H.deepseek_transport = silent
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.cfg["max_per_24h"] = 3
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        for _i in range(3):
+            eng._speak(Decision("speak", "ok", 0.5, {}))
+        assert len(calls) == 3, calls
+        # 三次静默：成功发言表空着，尝试配额已打满
+        assert eng._hb["timestamps_24h"] == []
+        assert len(eng._hb["attempts_24h"]) == 3
+        # G4 按尝试计：第 4 次直接 skip（旧实现看 timestamps_24h → 永远放行）
+        st = eng.drives.st
+        hb = {"last_speak_time": 0.0, "last_attempt_time": 0.0,
+              "timestamps_24h": [],
+              "attempts_24h": list(eng._hb["attempts_24h"]),
+              "consecutive_speaks": 0}
+        dec = eng.decide(st, hb, _t.time())
+        assert dec.action == "skip" and dec.reason == "24h_limit", dec
+        hb["attempts_24h"] = hb["attempts_24h"][:2]
+        assert eng.decide(st, hb, _t.time()).action == "speak"
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng.cfg["max_per_24h"] = old_max
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+
+
+@check("heartbeat: 避复述用上次主动发言（不是被动回复）")
+def _():
+    import time as _t
+    from pet import harness as H
+    from pet.heartbeat import Decision
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_quiet, old_bonus = eng.cfg["quiet_window"], eng.cfg["time_bonus"]
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_hist = list(w.chat_history)
+    seen = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        seen.append(messages[0]["content"])
+        return ({"content": "主动说过的话"}, None, "stop")
+
+    H.deepseek_transport = fake
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        now = _t.time()
+        hour = _t.localtime(now).tm_hour
+        eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]
+        eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+        eng.drives.apply_user_message(now - 4000)
+        eng.drives.st.energy = 100.0
+        eng.drives.st.affinity = 0.0
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._drives_st = eng.drives.st
+        w._chat_queue.clear()
+        # 历史里躺着一条被动回复：旧实现把它当「上次你主动说过」传进提示词
+        w.chat_history.append({"role": "assistant", "content": "被动回复", "ts": 0})
+        eng._speak(Decision("speak", "ok", 0.5, {}))
+        assert "上次你主动说过" not in seen[-1], seen[-1]
+        # 发言成功才落 last_speak_content，第二次的提示词才引用它
+        assert eng._hb["last_speak_content"] == "主动说过的话"
+        w._chat_queue.clear()
+        eng._speak(Decision("speak", "ok", 0.5, {}))
+        assert "上次你主动说过：「主动说过的话」" in seen[-1], seen[-1]
+        w._chat_queue.clear()
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        eng.cfg["quiet_window"], eng.cfg["time_bonus"] = old_quiet, old_bonus
+        eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                        "timestamps_24h": [], "attempts_24h": [],
+                        "consecutive_speaks": 0, "last_speak_content": ""})
+        eng._save_hb()
+        eng.drives.st.energy = 80.0
+        eng.drives.st.affinity = 0.0
+        eng.drives.st.last_user_message_time = 0.0
+        eng.drives.save(eng.drives.st)
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._chat_queue.clear()
+        w._reload_panel()
+
+
+@check("chat: 心跳开关分流（enabled 走心跳 / 关闭回退碎碎念）")
+def _():
+    import time as _t
+    w = CTX["win"]
+    old_hb, old_cfg = w._heartbeat, w._heartbeat_cfg
+    old_seg = w.cfg.get("heartbeat")
+    old_gen = w._whisper_generate
+    old_busy = getattr(w, "_whisper_busy", False)
+    old_key = w.cfg.get("ds_api_key")
+    old_conf = w.pet_conf
+    calls = []
+
+    class FakeHB:
+        def on_tick(self):
+            calls.append("hb")
+
+    def _gen(*a, **k):
+        calls.append("legacy")
+        return (True, "ok")
+
+    w._whisper_generate = _gen
+    w._whisper_busy = False
+    try:
+        w._heartbeat = FakeHB()
+        # 路由读活配置（self.cfg["heartbeat"]）：_hb_init 缓存的段引用会被
+        # _api_reload / PUT /config 整体替换，读陈旧引用则热改开关不生效
+        w.cfg["heartbeat"] = {"enabled": True}
+        w._whisper_tick()
+        assert calls == ["hb"], calls
+        calls.clear()
+        w.cfg["heartbeat"] = {"enabled": False}
+        w.cfg["ds_api_key"] = ""      # legacy 前置条件不满足：直接返回
+        w._whisper_tick()
+        assert calls == [], calls
+        w.cfg["ds_api_key"] = "k"
+        w.pet_conf = {"id": "main", "whisperEnabled": True}
+        w._whisper_tick()             # legacy 真正跑起来（worker 线程内生成）
+        deadline = _t.time() + 10
+        while getattr(w, "_whisper_busy", False) and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not w._whisper_busy, "legacy worker 未结束"
+        assert "legacy" in calls, calls
+        assert "hb" not in calls, calls
+        # 判别力：热替换整段（模拟 PUT /config）后立即按新开关分流，
+        # 不等重启——旧实现读 _hb_init 缓存的引用，这里仍是 legacy
+        calls.clear()
+        w.cfg["heartbeat"] = {"enabled": True}
+        w._whisper_tick()
+        assert calls == ["hb"], calls
+    finally:
+        w._heartbeat = old_hb
+        w._heartbeat_cfg = old_cfg
+        w.cfg["heartbeat"] = old_seg
+        w._whisper_generate = old_gen
+        w._whisper_busy = old_busy
+        w.cfg["ds_api_key"] = old_key
+        w.pet_conf = old_conf
+        w._whisper = None
+
+
+@check("chat: heartbeat enabled 非布尔按关闭处理（回退 legacy）")
+def _():
+    import time as _t
+    from pet import config as C
+    w = CTX["win"]
+    old_seg = w.cfg.get("heartbeat")
+    old_hb, old_cfg = w._heartbeat, w._heartbeat_cfg
+    old_drives = w._drives
+    old_gen = w._whisper_generate
+    old_busy = getattr(w, "_whisper_busy", False)
+    old_key = w.cfg.get("ds_api_key")
+    old_conf = w.pet_conf
+    calls = []
+
+    class FakeHB:
+        def on_tick(self):
+            calls.append("hb")
+
+    def _gen(*a, **k):
+        calls.append("legacy")
+        return (True, "ok")
+
+    w._whisper_generate = _gen
+    w._whisper_busy = False
+    try:
+        # 手改 config 写成字符串 "false"：truthy，旧代码把「想关心跳」的用户
+        # 一路送进心跳路径（validate 不拒、路由读原始值）
+        w.cfg["heartbeat"] = {"enabled": "false"}
+        C.validate(w.cfg)
+        assert w.cfg["heartbeat"]["enabled"] is False, w.cfg["heartbeat"]
+        w._hb_init()                      # 重走初始化时的读取路径
+        assert w._heartbeat_cfg.get("enabled") is False
+        w._heartbeat = FakeHB()           # 误入心跳分支会立刻记 "hb"
+        w.cfg["ds_api_key"] = "k"
+        w.pet_conf = {"id": "main", "whisperEnabled": True}
+        w._whisper_tick()             # legacy 真正跑起来（worker 线程内生成）
+        deadline = _t.time() + 10
+        while getattr(w, "_whisper_busy", False) and _t.time() < deadline:
+            CTX["app"].processEvents()
+            _t.sleep(0.005)
+        assert not w._whisper_busy, "legacy worker 未结束"
+        # 恰好一条 legacy：进了心跳分支的话这里会是 ["hb"] 且不起 worker
+        assert calls == ["legacy"], calls
+        # 判别力：换成真布尔 True，心跳分支照旧接管（证明上面不是「反正都不跑」）
+        calls.clear()
+        w.cfg["heartbeat"] = {"enabled": True}
+        C.validate(w.cfg)
+        w._hb_init()
+        assert w._heartbeat_cfg.get("enabled") is True
+        w._heartbeat = FakeHB()
+        w._whisper_tick()
+        assert calls == ["hb"], calls
+    finally:
+        w._heartbeat = old_hb
+        w._heartbeat_cfg = old_cfg
+        w._drives = old_drives
+        w._whisper_generate = old_gen
+        w._whisper_busy = old_busy
+        w.cfg["ds_api_key"] = old_key
+        w.pet_conf = old_conf
+        w.cfg["heartbeat"] = old_seg
+        w._whisper = None
+
+
+@check("chat: 用户消息与回复挂驱动状态")
+def _():
+    import time as _t
+    w = CTX["win"]
+    assert w._drives is not None and w._drives is w._heartbeat.drives
+    st = w._drives.st
+    st.affinity, st.energy, st.mood = 10.0, 50.0, "calm"
+    st.last_user_message_time = 0.0
+    before = _t.time()
+    w._send_chat("今天有点累")
+    assert st.last_user_message_time >= before
+    assert abs(st.affinity - 10.2) < 1e-6, st.affinity
+    assert st.mood == "tired", st.mood
+    # 回复出口扣精力（save=False 的系统提示也走同一出口，属已知取舍）
+    w._chat_out("知道啦", save=False)
+    assert st.energy == 48.0, st.energy
+    st.affinity, st.energy, st.mood = 0.0, 80.0, "calm"
+    st.last_user_message_time = 0.0
+
+
+@check("config: heartbeat 段默认值与 validate 兜底")
+def _():
+    from pet import config as C
+    from pet import drives as D
+    hb = C.DEFAULT_CFG["heartbeat"]
+    assert hb["enabled"] is True and hb["min_silent"] == 600
+    assert hb["min_interval"] == 1800 and hb["urgency_threshold"] == 0.35
+    assert hb["max_per_24h"] == 15 and hb["max_consecutive"] == 2
+    assert hb["quiet_window"] == [23, 6] and hb["msg_energy_cost"] == 2
+    assert hb["mood_keywords"]["累"] == "tired" and hb["time_bonus"][7] == 0.8
+    # validate：非对象整段回落默认
+    cfg = dict(C.DEFAULT_CFG)
+    cfg["heartbeat"] = "oops"
+    warns = C.validate(cfg)
+    assert isinstance(cfg["heartbeat"], dict)
+    assert cfg["heartbeat"]["min_interval"] == 1800
+    assert any("heartbeat" in x for x in warns), warns
+    # 旧 config 缺省：合并按顶层整段替换，子键由引擎侧兜底
+    merged = C.merge(C.DEFAULT_CFG, {"heartbeat": {"enabled": False}})
+    assert merged["heartbeat"] == {"enabled": False}
+    norm = D.normalize_heartbeat_cfg(merged["heartbeat"])
+    assert norm["enabled"] is False and norm["min_silent"] == 600
+    assert D.normalize_heartbeat_cfg(None)["max_per_24h"] == 15
 
 
 # ---------------------------------------------------------------- 运行器

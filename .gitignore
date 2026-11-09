@@ -26,6 +26,9 @@ __pycache__/
 pet_memory.json
 pet_sessions.json
 usage_ledger.json
+pet_drives*.json
+heartbeat_state*.json
+*.corrupt
 attachments/
 memes/
 

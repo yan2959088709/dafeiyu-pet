@@ -8,6 +8,7 @@
 边界：_react_to_reply（回复文本 → 表情动作的映射）留在主窗界面层，
 因为它只调用 _start_emote，属于表现层职责。
 """
+import os
 import re
 import threading
 import time
@@ -15,7 +16,9 @@ import time
 import requests
 
 from . import chat_attach
+from . import drives as pet_drives
 from . import harness as pet_harness
+from . import heartbeat as pet_heartbeat
 from . import stickers
 from . import log as pet_log
 from . import memes as pet_memes
@@ -34,6 +37,36 @@ HARNESS_HINT = ("【表达工具】想发表情包或小表情时用工具：先
 
 class ChatMixin:
     """PetWindow 的对话能力。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hb_init()
+
+    def _hb_init(self):
+        """心跳引擎 + 驱动状态机：构造失败整体降级（回退 legacy 碎碎念）。
+
+        状态目录跟随 pet_memory.json 所在目录（沙箱/多宠都只改 P 即可重定向），
+        状态文件名按 pet_id 分份（pet_drives.<pet_id>.json /
+        heartbeat_state.<pet_id>.json）：多宠每窗一个引擎实例却共用一个存储
+        目录，不分份就会互相覆盖——drives 状态乒乓、24h 配额/冷却/连发按实例
+        计（上限变 15N/2N）。取不到 pet_id 时退回单例共享（见
+        drives.state_file_name）。
+        """
+        self._drives = None
+        self._heartbeat = None
+        self._heartbeat_cfg = {}
+        try:
+            hb_cfg = (self.cfg or {}).get("heartbeat") or {}
+            self._heartbeat_cfg = hb_cfg
+            pet_id = getattr(self, "pet_id", None)
+            self._drives = pet_drives.DrivesEngine(os.path.dirname(P.memory),
+                                                   hb_cfg, pet_id=pet_id)
+            self._heartbeat = pet_heartbeat.HeartbeatEngine(
+                self, self._drives, hb_cfg, pet_id=pet_id)
+        except Exception as e:
+            pet_log.error("心跳引擎初始化失败，回退传统碎碎念: %s" % e)
+            self._drives = None
+            self._heartbeat = None
 
     def _build_system_prompt(self):
         head = ("【PERSONA_LOAD】\n\n"
@@ -127,7 +160,9 @@ class ChatMixin:
         # 用户气泡：文字 + 表情缩略图 + 图片缩略图（右对齐）
         self.chat_panel.append_msg("user", shown,
                                    sticker=stickers.MAP.get(tag) if tag else None,
-                                   image=img)
+                                   image=img, ts=int(time.time()))
+        if self._drives is not None:
+            self._drives.apply_user_message(time.time(), text)
         local = self._local_skill(clean) if clean else None
         if local is not None:
             self._chat_out(local, user_text=shown, user_sticker=tag)
@@ -143,11 +178,13 @@ class ChatMixin:
         sticker=表情文件名：写入历史条目并在聊天气泡下方渲染缩略图。
         user_sticker=用户消息的表情标签：随 user 历史条目保存，供重渲染与 AI 上下文感知。
         meme=FC 意图传来的表情包名：优先于正文 [图:] 标记解析（后者是 fallback）。"""
+        if self._drives is not None:
+            self._drives.apply_ai_reply(time.time())
         text, parsed_meme = pet_memes.parse_reply(text, self._meme_pool())
         meme = meme or parsed_meme
         if user_text:
             with self._mem_lock:
-                item = {"role": "user", "content": user_text}
+                item = {"role": "user", "content": user_text, "ts": int(time.time())}
                 if user_sticker:
                     item["sticker_tag"] = user_sticker
                 self.chat_history.append(item)
@@ -157,7 +194,7 @@ class ChatMixin:
                     del self.chat_history[:len(self.chat_history) - self.max_history]
         if save:
             with self._mem_lock:
-                item = {"role": "assistant", "content": text}
+                item = {"role": "assistant", "content": text, "ts": int(time.time())}
                 if sticker:
                     item["sticker"] = sticker
                 self.chat_history.append(item)
@@ -167,7 +204,8 @@ class ChatMixin:
         if user_text or save:
             self._save_current()   # 多会话持久化 + 自动命名 + 刷新会话栏
         if self.chat_panel.isVisible() and not streamed:
-            self.chat_panel.append_msg("pet", text, sticker=sticker)
+            self.chat_panel.append_msg("pet", text, sticker=sticker,
+                                       ts=int(time.time()))
         self.say(stickers.strip_marks(text), dur=4.2, prio=1)  # 气泡只显示文字，不显示标记
         self._react_to_reply(text)               # 根据回复内容做出相应动作（缺陷4）
         self._speak_reply(text)                  # 语音播报（voiceEnabled 时）
@@ -301,6 +339,16 @@ class ChatMixin:
         所以整拍挪到工作线程；上屏由 _whisper_generate 内部封送回来。
         busy 闸门防重入：上一拍还没回来就跳过这一拍。
         """
+        if self._heartbeat is not None:
+            # 心跳引擎接管这一拍（仍在 GUI 线程；关闭时 legacy 路径原样不动）。
+            # 开关读活配置（self.cfg）：_hb_init 缓存的段引用会被 _api_reload /
+            # PUT /config 整体替换成新 dict，读陈旧引用则用户热改开关不生效。
+            # enabled 必须是布尔 True：非布尔（手滑 "false"）一律 fail-closed
+            # 当关闭处理，与 config.validate 的口径一致
+            hb = (self.cfg or {}).get("heartbeat")
+            if isinstance(hb, dict) and hb.get("enabled", True) is True:
+                self._heartbeat.on_tick()
+                return
         if not self._whisper_enabled():
             return
         if not self.cfg.get("ds_api_key"):

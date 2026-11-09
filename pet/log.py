@@ -21,14 +21,18 @@ FLUSH_MS = 1000
 FLUSH_LINES = 64
 PENDING_MAX = 1000
 
+# (模式, group(1) 保留前几个字符；None = 整段保留)。前几种的 group(1) 是标签
+# 前缀；sk- 兜底种的 group(1) 就是 Key 本体，只留前几位便于对账。
 _REDACT = (
-    re.compile(r"(?i)(x-dsh-pet-token\s*[:=]\s*)[^\s,;\"']+"),
-    re.compile(r"(?i)([#?&]token=)[^\s&\"']+"),
-    re.compile(r"(?i)(\btoken\s*[:=]\s*)[^\s,;\"']+"),
-    re.compile(r"(?i)(DSH_PET_SITE_URL=)\S+"),
+    (re.compile(r"(?i)(x-dsh-pet-token\s*[:=]\s*)[^\s,;\"']+"), None),
+    (re.compile(r"(?i)([#?&]token=)[^\s&\"']+"), None),
+    (re.compile(r"(?i)(\btoken\s*[:=]\s*)[^\s,;\"']+"), None),
+    (re.compile(r"(?i)(DSH_PET_SITE_URL=)\S+"), None),
     # 兜底：将来任何一处误打印 Authorization 头或 sk- 形态 Key 不至于静默落盘
-    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}"),
-    re.compile(r"(?i)\bsk-[A-Za-z0-9\-]{16,}"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}"), None),
+    # sk- 形态 Key 在异常文本里是裸奔的（无标签前缀）：捕获组必须圈住整串，
+    # 替换只留前几位，其余抹掉
+    (re.compile(r"(?i)(\bsk-[A-Za-z0-9\-]{16,})"), 8),
 )
 
 _lock = threading.Lock()
@@ -54,8 +58,11 @@ def is_configured():
 def redact(text):
     """抹掉令牌一类的敏感串，其余原样。"""
     out = str(text)
-    for pat in _REDACT:
-        out = pat.sub(lambda m: m.group(1) + "***", out)
+    for pat, keep in _REDACT:
+        if keep is None:
+            out = pat.sub(lambda m: m.group(1) + "***", out)
+        else:
+            out = pat.sub(lambda m: m.group(1)[:keep] + "***", out)
     return out
 
 
