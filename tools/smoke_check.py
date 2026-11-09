@@ -5760,6 +5760,33 @@ def _():
     assert dft["max_per_24h"] == 15.0 and dft["max_consecutive"] == 2.0, dft
 
 
+@check("drives: normalize 安静窗口径（auto 透传 / [23,6] 迁移 / 显式值不动）")
+def _():
+    from pet import drives as D
+    # "auto" 原样透传：学习窗模式经 normalize 供给，不再靠 heartbeat __init__ 补丁
+    assert D.normalize_heartbeat_cfg({"quiet_window": "auto"})["quiet_window"] == "auto"
+    # 缺键（None / 空段）同样归一为 auto：默认段的 [23,6] 按旧默认迁移
+    assert D.normalize_heartbeat_cfg(None)["quiet_window"] == "auto"
+    assert D.normalize_heartbeat_cfg({})["quiet_window"] == "auto"
+    # 旧配置里的 [23,6]（TASK-010 硬编码默认）→ auto：数据不足仍回退 23-06
+    assert D.normalize_heartbeat_cfg({"quiet_window": [23, 6]})["quiet_window"] == "auto"
+    # 显式其他值原样不动（含跨午夜形态）
+    for pair in ([1, 2], [0, 23], [22, 5]):
+        norm = D.normalize_heartbeat_cfg({"quiet_window": pair})
+        assert norm["quiet_window"] == pair, (pair, norm["quiet_window"])
+    # 畸形值维持既有归一（[23,6]），不被迁移规则误伤
+    for bad in ("23-6", [23], [23, 6, 9], ["23", 6], ["a", "b"], 5):
+        norm = D.normalize_heartbeat_cfg({"quiet_window": bad})
+        assert norm["quiet_window"] == [23, 6], (bad, norm["quiet_window"])
+    # F1: 空窗 [a,a]（start==end）→ decide 的 pair 分支 start<=hour<end 永假，
+    # 安静窗永久敞开（G7 fail-open）。与 config.validate 拒绝 start==end 对齐，
+    # 按畸形值归一到 [23,6]（不迁移 auto：用户显式写了这对相同小时）
+    for empty_win in ([3, 3], [0, 0], [23, 23]):
+        norm = D.normalize_heartbeat_cfg({"quiet_window": empty_win})
+        assert norm["quiet_window"] == [23, 6], (empty_win, norm["quiet_window"])
+        assert norm["quiet_window"] != empty_win, empty_win
+
+
 @check("heartbeat: 时间戳双端钳（前拨时钟不永久 not_silent）")
 def _():
     import json as _json
@@ -6141,6 +6168,267 @@ def _():
     st.last_user_message_time = 0.0
 
 
+@check("sleep_window: 学习算法（不足/白天段/跨午夜/真实形态/健壮性）")
+def _():
+    import time as _t
+    from pet import sleep_window as SW
+
+    now = _t.time()
+
+    def stamps(hours, days=30, minute=5):
+        out = []
+        for back in range(days):
+            lt = _t.localtime(now - back * 86400)
+            for hour in hours:
+                out.append(_t.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                      hour, minute, 0, 0, 0, -1)))
+        return out
+
+    # 观测不足 7 天 → 默认窗（learned=False）
+    win = SW.compute_sleep_window(stamps([9, 22], days=6))
+    assert win == SW.DEFAULT_SLEEP_WINDOW, win
+    assert (win.start_hour, win.end_hour, win.learned) == (23, 6, False)
+    # 纯白天安静段不选：每天只有 7:00 / 22:00 两条消息，办公 8-21（14h）全安静
+    # 且长于夜间段（23-07，8h）。按规则「保留 touches_night 的最长段」，入选的是
+    # 夜间段而不是更长的白天段——白天安静是忙不是睡
+    win = SW.compute_sleep_window(stamps([7, 22]))
+    assert (win.start_hour, win.end_hour, win.learned) == (23, 7, True), win
+    assert win.contains(2) is True and win.contains(12) is False
+    # 跨午夜：7-22 点有消息、23-07 全静 → 学到 23-07（左闭右开）
+    win = SW.compute_sleep_window(stamps(range(7, 23)))
+    assert (win.start_hour, win.end_hour, win.learned) == (23, 7, True), win
+    assert win.contains(23) and win.contains(0) and win.contains(6)
+    assert win.contains(7) is False and win.contains(22) is False
+    # contains 环形：手工 23-02 窗
+    wrap = SW.SleepWindow(23, 2, True)
+    assert [wrap.contains(h) for h in (22, 23, 0, 1, 2)] == \
+        [False, True, True, True, False]
+    # 真实形态：消息集中 9-22 点 → 学到 23-09
+    win = SW.compute_sleep_window(stamps(range(9, 23)))
+    assert (win.start_hour, win.end_hour, win.learned) == (23, 9, True), win
+    assert win.contains(23) is True and win.contains(2) is True
+    assert win.contains(9) is False and win.contains(12) is False
+    assert win.label() == "23:00–09:00"
+    # F2: 起始小时约束（start ∈ {18..23, 0..5}）。22 点起始的傍晚段仍可选
+    win = SW.compute_sleep_window(stamps(range(7, 22)))
+    assert (win.start_hour, win.end_hour, win.learned) == (22, 7, True), win
+    assert win.contains(22) and win.contains(2) and win.contains(6)
+    assert win.contains(7) is False and win.contains(21) is False
+    # 夜猫子：0-2 点醒、3-11 点睡、12 点起醒 → 学到午夜后起始的 03-12（仍可学）
+    win = SW.compute_sleep_window(stamps(list(range(0, 3)) + list(range(12, 24))))
+    assert (win.start_hour, win.end_hour, win.learned) == (3, 12, True), win
+    # 03:00/14:00 有消息：修改前按「最长 touches_night 段」学到 15-03（12h 静默，
+    # 盖住用户活跃的傍晚）。加起始约束后 15-03 落选（起始 15 属下午），幸存的是
+    # 午夜后起始的 04-14 段（夜猫作息：3 点醒、14 点醒，4-14 点睡）
+    win = SW.compute_sleep_window(stamps([3, 14]))
+    assert (win.start_hour, win.end_hour) != (15, 3), win   # 不再学到盖住傍晚的 15-03
+    assert (win.start_hour, win.end_hour, win.learned) == (4, 14, True), win
+    # 健壮性：空/坏值/只覆盖 1 天/远古/None 都不抛，回默认
+    assert SW.compute_sleep_window([]) == SW.DEFAULT_SLEEP_WINDOW
+    assert SW.compute_sleep_window([None, "x", -1.0, float("nan"),
+                                    float("inf"), True]) == SW.DEFAULT_SLEEP_WINDOW
+    assert SW.compute_sleep_window(stamps([3])) == SW.DEFAULT_SLEEP_WINDOW
+    assert SW.compute_sleep_window(
+        [now - 40 * 86400 + i * 60 for i in range(200)]) == SW.DEFAULT_SLEEP_WINDOW
+    assert SW.compute_sleep_window(None) == SW.DEFAULT_SLEEP_WINDOW
+    assert SW.DEFAULT_SLEEP_WINDOW.label() == "23:00–06:00"
+
+
+@check("sleep_window: 读盘与缓存（脏数据/坏文件/空目录/root=None/只读一次）")
+def _():
+    import json as _json
+    import os
+    import time as _t
+    from pet import sleep_window as SW
+
+    SW.reset_cache()
+    now = _t.time()
+    sname = os.path.basename(SW.P.session)
+
+    def write_sessions(dirpath, payload):
+        os.makedirs(dirpath, exist_ok=True)
+        with open(os.path.join(dirpath, sname), "w", encoding="utf-8") as f:
+            _json.dump(payload, f, ensure_ascii=False)
+
+    def user_msgs(hours, days=30):
+        out = []
+        for back in range(days):
+            lt = _t.localtime(now - back * 86400)
+            for hour in hours:
+                out.append({"role": "user", "content": "在吗",
+                            "ts": int(_t.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                                 hour, 5, 0, 0, 0, -1)))})
+        return out
+
+    root = os.path.join(CTX["tmpdir"], "sw_ok")
+    write_sessions(root, {"current_id": "s1", "sessions": [
+        {"id": "s1", "title": "t", "ts": now, "messages": user_msgs(range(9, 23))}]})
+    win = SW.get_user_sleep_window(root)
+    assert (win.start_hour, win.end_hour, win.learned) == (23, 9, True), win
+
+    # 脏数据逐条跳过：缺 ts / ts 字符串 / 负数 / 远古 / 非 user / 非对象
+    # （空 content 不再跳过——见下方 F6：任何 user 消息都是醒着的证据）
+    dirty = user_msgs(range(9, 23)) + [
+        {"role": "user", "content": "没时间戳"},
+        {"role": "user", "content": "字符串 ts", "ts": "123"},
+        {"role": "user", "content": "负数", "ts": -99},
+        {"role": "user", "content": "远古", "ts": int(now - 40 * 86400)},
+        {"role": "assistant", "content": "回复", "ts": int(now - 10)},
+        "不是对象", 42, None]
+    root2 = os.path.join(CTX["tmpdir"], "sw_dirty")
+    write_sessions(root2, {"sessions": [{"id": "s", "messages": dirty}]})
+    win2 = SW.get_user_sleep_window(root2)
+    assert (win2.start_hour, win2.end_hour, win2.learned) == (23, 9, True), win2
+
+    # F6: 纯图消息（content 空/占位）也是醒着的证据，不能因 content 空丢掉 ts。
+    # 全程只用空 content 的 user 消息在 10-22 点发 → 这些小时都算活跃，学到 23-10；
+    # 若误把空 content 当无活动过滤掉，则无数据 → 回默认窗（本条即为判别力）
+    def img_msgs(hours, days=30):
+        out = []
+        for back in range(days):
+            lt = _t.localtime(now - back * 86400)
+            for hour in hours:
+                out.append({"role": "user", "content": "",
+                            "ts": int(_t.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                                 hour, 5, 0, 0, 0, -1)))})
+        return out
+    root_img = os.path.join(CTX["tmpdir"], "sw_imgonly")
+    write_sessions(root_img, {"sessions": [
+        {"id": "s", "messages": img_msgs(range(10, 23))}]})
+    win_img = SW.get_user_sleep_window(root_img)
+    assert (win_img.start_hour, win_img.end_hour, win_img.learned) == (23, 10, True), win_img
+
+    # 坏 JSON / 空目录 / 结构异常 → 默认窗且不抛
+    root3 = os.path.join(CTX["tmpdir"], "sw_broken")
+    os.makedirs(root3, exist_ok=True)
+    with open(os.path.join(root3, sname), "w", encoding="utf-8") as f:
+        f.write("{不是 JSON")
+    assert SW.get_user_sleep_window(root3) == SW.DEFAULT_SLEEP_WINDOW
+    root4 = os.path.join(CTX["tmpdir"], "sw_empty")
+    os.makedirs(root4, exist_ok=True)
+    assert SW.get_user_sleep_window(root4) == SW.DEFAULT_SLEEP_WINDOW
+    root5 = os.path.join(CTX["tmpdir"], "sw_shape")
+    write_sessions(root5, {"sessions": "不是列表"})
+    assert SW.get_user_sleep_window(root5) == SW.DEFAULT_SLEEP_WINDOW
+    # root=None：走 P.session（沙箱里指向临时目录），永不抛
+    assert isinstance(SW.get_user_sleep_window(None), SW.SleepWindow)
+
+    # 缓存：成功与失败都只读一次盘；不同 root 不共享
+    SW.reset_cache()
+    calls = []
+    real_read = SW._read_user_timestamps
+
+    def counting_read(path, now_):
+        calls.append(path)
+        return real_read(path, now_)
+
+    SW._read_user_timestamps = counting_read
+    try:
+        assert SW.get_user_sleep_window(root) == SW.get_user_sleep_window(root)
+        assert len(calls) == 1, calls
+        assert SW.get_user_sleep_window(root3) == SW.DEFAULT_SLEEP_WINDOW
+        assert SW.get_user_sleep_window(root3) == SW.DEFAULT_SLEEP_WINDOW
+        assert len(calls) == 2, calls          # 失败也缓存，不重复扫盘
+        SW.get_user_sleep_window(root5)        # 另一个 root：结构异常，要读
+        assert len(calls) == 3, calls
+        SW.get_user_sleep_window(root4)        # 空目录：文件不存在，根本不读
+        assert len(calls) == 3, calls
+    finally:
+        SW._read_user_timestamps = real_read
+        SW.reset_cache()
+
+    # F4: 大小护栏——超大 sessions 文件不进 compute（_read_user_timestamps 不被调用），
+    # 直接回默认窗（GUI 线程不全量解析大文件）
+    SW.reset_cache()
+    big_calls = []
+    real_read2 = SW._read_user_timestamps
+
+    def no_read(path, now_):
+        big_calls.append(path)
+        return real_read2(path, now_)
+
+    SW._read_user_timestamps = no_read
+    old_max = SW.MAX_SESSIONS_BYTES
+    SW.MAX_SESSIONS_BYTES = 1024          # 调小阈值便于测试
+    try:
+        root_big = os.path.join(CTX["tmpdir"], "sw_big")
+        write_sessions(root_big, {"sessions": [
+            {"id": "s", "messages": user_msgs(range(9, 23))}]})
+        assert os.path.getsize(os.path.join(root_big, sname)) > 1024
+        win_big = SW.get_user_sleep_window(root_big)
+        assert win_big == SW.DEFAULT_SLEEP_WINDOW, win_big   # 过大 → 不进 compute
+        assert big_calls == [], big_calls                    # 根本没读盘
+    finally:
+        SW._read_user_timestamps = real_read2
+        SW.MAX_SESSIONS_BYTES = old_max
+        SW.reset_cache()
+
+
+@check("sleep_window: G7 auto 集成与显式 [a,b] 覆盖")
+def _():
+    import json as _json
+    import os
+    import time as _t
+    from pet import drives as D
+    from pet import heartbeat as HB
+    from pet import sleep_window as SW
+
+    SW.reset_cache()
+    now = _t.time()
+    lt = _t.localtime(now)
+    d = os.path.join(CTX["tmpdir"], "sw_g7")
+    os.makedirs(d, exist_ok=True)
+    # 30 天消息集中在 9-22 点 → 学习窗 23-09
+    msgs = []
+    for back in range(30):
+        day = _t.localtime(now - back * 86400)
+        for hour in range(9, 23):
+            msgs.append({"role": "user", "content": "在吗",
+                         "ts": int(_t.mktime((day.tm_year, day.tm_mon, day.tm_mday,
+                                              hour, 5, 0, 0, 0, -1)))})
+    with open(os.path.join(d, os.path.basename(SW.P.session)), "w",
+              encoding="utf-8") as f:
+        _json.dump({"sessions": [{"id": "s", "messages": msgs}]}, f,
+                   ensure_ascii=False)
+
+    empty_hb = {"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                "timestamps_24h": [], "consecutive_speaks": 0, "attempts_24h": []}
+    st = D.DrivesState(energy=100.0, affinity=0.0,
+                       last_user_message_time=now - 4000)
+    bonus = {h: 0.8 for h in range(24)}
+
+    def at(hour):
+        return _t.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, 30, 0, 0, 0, -1))
+
+    # auto：学习窗 23-09 覆盖 2 点 → skip/quiet_window（「现在」由注入的 now 决定，
+    # 不依赖真实时钟）；12 点不在窗内 → 该闸门放行
+    eng = HB.HeartbeatEngine(object(), D.DrivesEngine(d, {"quiet_window": "auto"}),
+                             {"quiet_window": "auto", "time_bonus": bonus})
+    assert eng.cfg["quiet_window"] == "auto"
+    dec = eng.decide(st, empty_hb, at(2))
+    assert dec.action == "skip" and dec.reason == "quiet_window", dec
+    assert dec.gates["quiet_window"] is False
+    assert eng.decide(st, empty_hb, at(12)).gates["quiet_window"] is True
+    # F3: 判别力——hour 2 默认窗（23-06）也挡，learner 恒返默认也能过；补探 hour 7：
+    # 学习窗 23-09 挡（7∈[23,9)）而默认窗 23-06 放行（7∉[23,6)）。若 learner 退化
+    # 成恒返默认，这条会从 False 变 True 而 FAIL
+    assert eng.decide(st, empty_hb, at(7)).gates["quiet_window"] is False
+    # 显式 [1,2]：同样的学习数据在场也走 pair（1 点拦、2 点放）
+    eng2 = HB.HeartbeatEngine(object(), D.DrivesEngine(d, {"quiet_window": [1, 2]}),
+                              {"quiet_window": [1, 2], "time_bonus": bonus})
+    dec2 = eng2.decide(st, empty_hb, at(1))
+    assert dec2.action == "skip" and dec2.reason == "quiet_window", dec2
+    assert eng2.decide(st, empty_hb, at(2)).gates["quiet_window"] is True
+    # 数据不足时 auto 回退默认 23-06（空目录：3 点仍在默认窗内）
+    d2 = os.path.join(CTX["tmpdir"], "sw_g7_empty")
+    os.makedirs(d2, exist_ok=True)
+    eng3 = HB.HeartbeatEngine(object(), D.DrivesEngine(d2, {"quiet_window": "auto"}),
+                              {"quiet_window": "auto", "time_bonus": bonus})
+    dec3 = eng3.decide(st, empty_hb, at(3))
+    assert dec3.action == "skip" and dec3.reason == "quiet_window", dec3
+    SW.reset_cache()
+
+
 @check("config: heartbeat 段默认值与 validate 兜底")
 def _():
     from pet import config as C
@@ -6149,7 +6437,7 @@ def _():
     assert hb["enabled"] is True and hb["min_silent"] == 600
     assert hb["min_interval"] == 1800 and hb["urgency_threshold"] == 0.35
     assert hb["max_per_24h"] == 15 and hb["max_consecutive"] == 2
-    assert hb["quiet_window"] == [23, 6] and hb["msg_energy_cost"] == 2
+    assert hb["quiet_window"] == "auto" and hb["msg_energy_cost"] == 2
     assert hb["mood_keywords"]["累"] == "tired" and hb["time_bonus"][7] == 0.8
     # validate：非对象整段回落默认
     cfg = dict(C.DEFAULT_CFG)
@@ -6164,6 +6452,28 @@ def _():
     norm = D.normalize_heartbeat_cfg(merged["heartbeat"])
     assert norm["enabled"] is False and norm["min_silent"] == 600
     assert D.normalize_heartbeat_cfg(None)["max_per_24h"] == 15
+    # 安静窗：auto 与二元整数列表都收；畸形值告警后归一为 auto（fail-closed）
+    assert C.quiet_window_ok("auto") and C.quiet_window_ok([23, 6])
+    assert C.quiet_window_ok([0, 23])
+    for bad_val in ([23, 23], [24, 6], [-1, 6], [23, 6, 9], ["23", 6],
+                    [23.0, 6], "23-6", 5, None, [True, 6]):
+        assert not C.quiet_window_ok(bad_val), bad_val
+    for bad_val, want in (([23, 23], "auto"), ([24, 6], "auto"),
+                          ("23-6", "auto"), (None, "auto")):
+        seg = dict(hb)
+        seg["quiet_window"] = bad_val
+        cfg = dict(C.DEFAULT_CFG)
+        cfg["heartbeat"] = seg
+        warns = C.validate(cfg)
+        assert cfg["heartbeat"]["quiet_window"] == want, (bad_val, cfg["heartbeat"])
+        assert any("quiet_window" in x for x in warns), warns
+    # 合法值原样保留（不被归一）
+    seg = dict(hb)
+    seg["quiet_window"] = [1, 2]
+    cfg = dict(C.DEFAULT_CFG)
+    cfg["heartbeat"] = seg
+    C.validate(cfg)
+    assert cfg["heartbeat"]["quiet_window"] == [1, 2]
 
 
 # ---------------------------------------------------------------- 运行器

@@ -70,7 +70,9 @@ DEFAULT_HEARTBEAT = {
     "urgency_threshold": 0.35,
     "max_per_24h": 15,
     "max_consecutive": 2,
-    "quiet_window": [23, 6],
+    # 学习模式：由心跳引擎按真实作息读 sleep_window；数据不足时回退 23-06，
+    # 行为连续。默认值就定在这里（单一事实来源），config 侧不再 import 时改写
+    "quiet_window": "auto",
     "msg_energy_cost": 2,
     "energy_recovery_per_300s": 2.0,
     "energy_full_secs": 14400,
@@ -136,7 +138,12 @@ def state_file_name(base, pet_id):
 
 
 def normalize_heartbeat_cfg(cfg):
-    """用户段与内置默认逐键合并：缺键回落，旧 config 不带 heartbeat 也能跑。"""
+    """用户段与内置默认逐键合并：缺键回落，旧 config 不带 heartbeat 也能跑。
+
+    安静窗口径："auto" 原样透传（学习模式，引擎侧读作息）；合法二元整数
+    列表原样保留，但 [23,6] 是 TASK-010 时期的硬编码默认、与用户主动选择
+    不可区分，按「未个性化」归一为 "auto"；其余值维持既有归一（[23,6]）。
+    """
     out = dict(DEFAULT_HEARTBEAT)
     if isinstance(cfg, dict):
         for key, val in cfg.items():
@@ -169,13 +176,26 @@ def normalize_heartbeat_cfg(cfg):
     out["mood_keywords"] = dict(kw) if isinstance(kw, dict) and kw \
         else dict(DEFAULT_MOOD_KEYWORDS)
     window = out.get("quiet_window")
-    if not (isinstance(window, (list, tuple)) and len(window) == 2):
+    if window == "auto":
+        out["quiet_window"] = "auto"
+    elif isinstance(window, list) and window == [23, 6]:
+        # [23,6] 与用户主动选择不可区分（TASK-010 硬编码默认）：按「未个性化」
+        # 归一为 auto，学习窗数据不足时仍回退 23-06，行为连续，有数据后学真实作息
+        out["quiet_window"] = "auto"
+    elif not (isinstance(window, (list, tuple)) and len(window) == 2):
         out["quiet_window"] = [23, 6]
     else:
         try:
-            out["quiet_window"] = [int(window[0]), int(window[1])]
+            pair = [int(window[0]), int(window[1])]
         except (TypeError, ValueError):
+            pair = None
+        # start==end = 空窗：decide 的 pair 分支 start<=hour<end 永假，安静窗
+        # 永久敞开（G7 fail-open）。与 config.validate 拒绝 start==end 对齐，
+        # 按畸形值归一到 [23,6]（非 auto：用户显式写了这对相同小时）
+        if not pair or pair[0] == pair[1]:
             out["quiet_window"] = [23, 6]
+        else:
+            out["quiet_window"] = pair
     return out
 
 

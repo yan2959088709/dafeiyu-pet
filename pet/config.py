@@ -307,6 +307,23 @@ def validate_pet_id(pid):
     return pid
 
 
+def quiet_window_ok(window):
+    """安静窗合法形态："auto"（从作息学习）或 [起始小时, 结束小时]。
+
+    二元整数、0-23、start != end（相等 = 空窗，等于关掉这门禁）。
+    """
+    if window == "auto":
+        return True
+    if not isinstance(window, list) or len(window) != 2:
+        return False
+    for hour in window:
+        if isinstance(hour, bool) or not isinstance(hour, int):
+            return False
+        if not (0 <= hour <= 23):
+            return False
+    return window[0] != window[1]
+
+
 def validate(cfg):
     """逐项校验并就地纠正可回落的字段；返回告警列表。"""
     warns = []
@@ -342,6 +359,12 @@ def validate(cfg):
         if enabled is not None and not isinstance(enabled, bool):
             warn_once("heartbeat", "enabled 必须是布尔值，已按关闭处理")
             cfg["heartbeat"]["enabled"] = False
+        # 安静窗：非法值归一为 "auto"（学习模式数据不足时回退 23-06，
+        # fail-closed 方向——不会把门禁整个关掉）
+        if not quiet_window_ok(cfg["heartbeat"].get("quiet_window")):
+            bad("heartbeat.quiet_window",
+                "安静窗必须是 auto 或 [起始小时, 结束小时]（0-23 且不相等），已改为 auto")
+            cfg["heartbeat"]["quiet_window"] = "auto"
 
     limit = cfg.get("chatImageLimit")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:

@@ -2,7 +2,7 @@
 
 > 审查报告（2026-11-06，4 代理并行 + 主会话复核）即本轨道契约源。
 > P0 轮范围 = 8 项 P0 + 2 项一行级 P1，已全部交付并提交（commit 76e928c）。
-> 测试入口：`tools/smoke_check.py`（104 → 111（P0 轮）→ 119（Harness 轮，含 8 条 harness 用例）→ 153（心跳轮 TASK-010，含 1 项已知偶发 flaky 见教训 L8）全绿）。
+> 测试入口：`tools/smoke_check.py`（104 → 111（P0 轮）→ 119（Harness 轮，含 8 条 harness 用例）→ 153（心跳轮 TASK-010，含 1 项已知偶发 flaky 见教训 L8）→ 157（睡眠窗轮 TASK-011）全绿）。
 
 ### TASK-001: P0 一键修复组（退出崩溃/切皮肤冻死/首启漂移/置顶抹穿透/APPDATA）
 - **Executor**: claude
@@ -170,7 +170,7 @@
 
 ### TASK-011: M4 学习式睡眠窗口 + 时段权重
 - **Executor**: claude
-- **Status**: [ ]
+- **Status**: [x]
 - **Dependencies**: TASK-010
 - **Contract**: TASK-010 蓝图 sleep_window 算法（30 天回溯/安静小时统计/含 0-6 点约束/4-14h/默认 23-06 回退）
 - **Acceptance**:
@@ -179,6 +179,21 @@
 - **Handoff log**:
   > claude [ ] 2026-11-09: 自 TASK-010 蓝图拆出。TASK-010 期间 G7 用 config 硬编码 quiet_window=(23,6)。
   > claude [Notify] 2026-11-09: 依赖 TASK-010 已 [x]（commit 5e6031b）。可开工：30 天回溯学习式睡眠窗口接入 G7 + time_context 抑制；注意沿用 TASK-010 的 pet_id 分文件命名（sha1 摘要）。
+  >
+  > claude [~] 2026-11-09: claimed via /full-auto（用户「逐步完成剩下的后续」）。依赖已验证 [x]。
+  > claude [Blueprint] 2026-11-09:
+  > DATA FLOW: 输入=pet_sessions.json 近 30 天 user 角色消息 ts；变换=compute_sleep_window 纯函数（按小时统计「有消息的天数」→安静小时=天数≤观测天数×10% →取跨越午夜的、含 0-6 点至少一小时的最长连续安静段，长度 4-14h）；输出=SleepWindow(start_hour, end_hour, learned)；状态变化=无新落盘文件（进程内缓存 TTL 1h）。接入：heartbeat decide 的 G7 在 quiet_window=="auto" 时用学习窗（数据不足/失败回退默认 23-06），quiet_window 为显式 [start,end] 时尊重用户配置覆盖 auto；time_context 若存在「回复慢/节奏」类提示则在学习窗内抑制（不存在则不造，记录即可）。
+  > MODULE: pet/sleep_window.py（新 ~110 行）: `@dataclass SleepWindow(start_hour:int, end_hour:int, learned:bool)` + contains(hour)/label()；`compute_sleep_window(timestamps: Iterable[float]) -> SleepWindow`（纯函数，可单测）；`get_user_sleep_window(root: str|None = None) -> SleepWindow`（读 sessions 提取 ts、模块级 dict 缓存 TTL 3600s、任何异常返回默认窗，永不抛）。常量 LOOKBACK_DAYS=30 / MIN_OBSERVED_DAYS=7 / QUIET_DAY_FRACTION=0.10 / MIN_WINDOW_HOURS=4 / MAX_WINDOW_HOURS=14 / NIGHT_HOURS=range(0,6) / DEFAULT=(23,6)。
+  > INTEGRATION: ①pet/heartbeat.py decide G7：cfg.quiet_window=="auto" → get_user_sleep_window(引擎 storage_dir) 的 contains(hour)；为 [a,b] → 原 pair 逻辑；②pet/config.py：DEFAULT_CFG heartbeat.quiet_window 默认由 [23,6] 改 "auto"；validate 接受 "auto" 或二元整数列表（越界/畸形→告警回退 "auto"）；normalize 侧 quiet_window 原样透传（"auto" 或 list）；③pet/time_context.py：仅当存在节奏/慢回复提示时加抑制，否则不改。
+  > TEST: ①观测<7 天→默认(23,6,learned=False) ②纯白天安静段不选（早晚有消息、办公时段安静→仍回退默认）③跨午夜窗（23-02→start=23,end=2）④30 天真实形态（消息集中 9-23 点）→学到 23-09 且 learned=True ⑤G7 集成：学习窗覆盖当前小时→decide skip("quiet_window")；cfg 显式 [a,b] 覆盖 auto ⑥缺 ts/坏消息/非 user 角色跳过 ⑦get_user_sleep_window 对坏文件/空目录/None 永不抛
+  > ELEGANCE: 算法重写自 Shikigami-Protocol sleep_window（AGPL-3.0，只搬算法不拷码；参考实现已由主会话读过，实现方不得读取 temp 下参考文件，注意行级表述差异）；无新依赖；缓存模块级 dict。
+  > RISK: sessions 大时全量扫描→1h 缓存+只取 ts；多宠共享 sessions 文件→池化全部 user 消息（与 pet_memory.json 全局语义一致）。
+  > claude [Blueprint-Approved] 2026-11-09: 用户「逐步完成剩下的后续」批准，进入实现。
+  >
+  > claude [~] 2026-11-09: 实现完成（157/157）。实现方自查自修段首判定 bug；偏差记录 5 条（__init__ auto 补丁/localtime 小时/用例②与规则 5 冲突/失败 TTL 600s/reset_cache seam）。
+  > claude [Gate-1] 2026-11-09: 质量门 PASS 无必修；4 should-fix：normalize 放行空窗 [3,3] 与 validate 分歧致 G7 fail-open / 学习窗可大半在白天（15:00 起始 12h 静默覆盖用户活跃傍晚，违反模块自述意图）/ G7 集成用例只探 hour 2 无判别力 / GUI 线程全量 parse 无大小护栏。3 廉价 nit（单一事实来源分裂/纯图消息被排除/蓝图②表述）。
+  > claude [~] 2026-11-09: 门禁修正轮 F1-F6 全部落地（空窗归一/起始小时约束 start∈{18-23,0-5}/hour7 判别力断言/8MB 护栏/单一事实源/纯图消息计活跃），157/157，逐项回退验伪。
+  > claude [x] 2026-11-09: 完成。验收 2 项全达：①pet/sleep_window.py 学习窗接入 G7（auto 模式从近 30 天 user 消息作息学习；<7 天/坏文件/超大文件回退 23-06；显式 [a,b] 覆盖；旧配置 [23,6] 自动迁 auto）②判别力用例全覆盖（数据不足/白天段不选/跨午夜/起始小时约束/集成 discriminates/脏数据/缓存）。裁决记录：a) 蓝图用例②「仍 DEFAULT」系蓝图笔误——按规则 5 该数据应学到 23-07（与参考实现语义一致），测试改验白天段不入选；b) 03:00/14:00 场景学到 04-14 为正确夜猫子作息，非缺陷；c) heartbeat_prompt「2 小时关心」提示不做学习窗抑制——G7 门禁在安静窗内不放行到 LLM，门禁级抑制已覆盖提示词级；d) time_context.py grep 无节奏/慢回复类提示文本，无可抑制项，一行未改（「+时段权重」实指 TASK-010 已交付的 urgency time_bonus 表）；e) 已知限制：迁移后无法把 quiet_window 钉回恰好 [23,6]（旧默认与主动选择不可区分），需要固定值者可设其他 pair——影响面极小，不单开任务。
 
 ### TASK-012: TASK-010 延期项 backlog（成本可见性/多宠精化/重构）
 - **Executor**: claude

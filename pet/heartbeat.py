@@ -30,6 +30,7 @@ from pet import persona as pet_persona
 from pet import stickers
 from pet import time_context as pet_time
 from pet.drives import cfg_num
+from pet.sleep_window import get_user_sleep_window
 from pet.storage import load_json
 
 HB_FILE = "heartbeat_state.json"
@@ -156,10 +157,16 @@ class HeartbeatEngine:
         """
         now = float(now)
         gates = {}
-        window = self.cfg.get("quiet_window") or [23, 6]
-        start, end = int(window[0]), int(window[1])
         hour = time.localtime(now).tm_hour
-        in_quiet = (start <= hour < end) if start <= end else (hour >= start or hour < end)
+        qw = self.cfg.get("quiet_window", "auto")
+        if qw == "auto":
+            # 学习窗：从近 30 天 user 消息作息推出；读盘失败/数据不足时
+            # sleep_window 内部回退默认 23-06，这里不关心细节
+            in_quiet = get_user_sleep_window(self.drives.storage_dir).contains(hour)
+        else:
+            window = qw or [23, 6]
+            start, end = int(window[0]), int(window[1])
+            in_quiet = (start <= hour < end) if start <= end else (hour >= start or hour < end)
         gates["quiet_window"] = not in_quiet
 
         urgency = self.drives.urgency(drives_st, now)
