@@ -8704,6 +8704,56 @@ def _():
         w._watch_events = old_events
 
 
+@check("harness: manage_window 窗口管理（假 Win32：匹配/未匹配/各动作/抢焦点失败）")
+def _():
+    from pet import harness as H
+    from pet import sysmon as S
+    w = CTX["win"]
+    names = {t["function"]["name"] for t in H.TOOLS}
+    assert "manage_window" in names, names
+    # 未知动作在触 ctypes 之前就被拒（纯校验路径）
+    bad = S.window_op(0, "close")
+    assert bad[0] is False and "未知动作" in bad[1], bad
+    old_enum, old_find = S.enum_windows, S.find_window
+    old_fg, old_op = S.foreground_window, S.window_op
+    ops = []
+    S.enum_windows = lambda: [{"hwnd": 1, "title": "Chrome"},
+                              {"hwnd": 2, "title": "VSCode"}]
+    S.find_window = lambda sub: next(
+        (x for x in S.enum_windows()
+         if str(sub).lower() in x["title"].lower()), None)
+    S.foreground_window = lambda: {"hwnd": 9, "title": "桌宠", "process": ""}
+    S.window_op = lambda hwnd, action: (ops.append((hwnd, action))
+                                        or (True, ""))
+    try:
+        out = H.execute_tool(w, "manage_window",
+                             json.dumps({"action": "minimize"}), {})
+        assert "已最小化" in out and ops == [(9, "minimize")], (out, ops)
+        ops.clear()
+        out = H.execute_tool(w, "manage_window",
+                             json.dumps({"action": "activate",
+                                         "title": "code"}), {})
+        assert "已切换到" in out and "VSCode" in out, out
+        assert ops == [(2, "activate")], ops
+        out = H.execute_tool(w, "manage_window",
+                             json.dumps({"action": "maximize",
+                                         "title": "不存在"}), {})
+        assert "没有找到" in out and "Chrome" in out, out
+        out = H.execute_tool(w, "manage_window",
+                             json.dumps({"action": "close"}), {})
+        assert "未知 action" in out, out
+        S.window_op = lambda hwnd, action: (False, "系统不允许直接抢焦点")
+        out = H.execute_tool(w, "manage_window",
+                             json.dumps({"action": "activate",
+                                         "title": "chrome"}), {})
+        assert "失败" in out and "抢焦点" in out, out
+        caps = H._tool_capabilities(w)
+        assert "manage_window" in caps, caps
+    finally:
+        S.enum_windows, S.find_window = old_enum, old_find
+        S.foreground_window, S.window_op = old_fg, old_op
+
+
 @check("memory_recall: 相关度/衰减/legacy/空context/K截断")
 def _():
     import time as _t

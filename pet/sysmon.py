@@ -155,9 +155,86 @@ def foreground_window():
                 proc = psutil.Process(int(pid.value)).name()
             except Exception:
                 proc = ""
-        return {"title": (buf.value or "")[:120], "process": proc[:60]}
+        return {"hwnd": int(hwnd), "title": (buf.value or "")[:120],
+                "process": proc[:60]}
     except Exception:
         return None
+
+
+# 窗口管理动作 → Win32 ShowWindow 命令码（activate 走 SetForegroundWindow，
+# 不在这张表里）
+SW_MINIMIZE, SW_MAXIMIZE, SW_RESTORE = 6, 3, 9
+_WINDOW_ACTS = {"minimize": SW_MINIMIZE, "maximize": SW_MAXIMIZE,
+                "restore": SW_RESTORE}
+
+
+def enum_windows():
+    """可见窗口列表 [{hwnd, title}]（EnumWindows + 标题非空）；非 nt 返回 []。"""
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        out = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = int(user32.GetWindowTextLengthW(hwnd))
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = (buf.value or "").strip()
+            if title:
+                out.append({"hwnd": int(hwnd), "title": title[:120]})
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        return out
+    except Exception:
+        return []
+
+
+def find_window(substr):
+    """按标题子串（不区分大小写）找窗口；多个命中取枚举顺序第一个。"""
+    key = str(substr or "").strip().lower()
+    if not key:
+        return None
+    for item in enum_windows():
+        if key in str(item.get("title") or "").lower():
+            return item
+    return None
+
+
+def window_op(hwnd, action):
+    """minimize/maximize/restore/activate 一个窗口。返回 (ok, err)。
+
+    activate 用 SetForegroundWindow：Windows 只允许前台进程抢焦点，
+    被拒时如实报告（不重试不糊弄）。
+    """
+    act = str(action or "").strip().lower()
+    if act not in _WINDOW_ACTS and act != "activate":
+        return False, ("未知动作：%s（minimize/maximize/restore/activate）"
+                       % act)
+    if os.name != "nt":
+        return False, "仅支持 Windows"
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = int(hwnd)
+        if act == "activate":
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+            if not user32.SetForegroundWindow(hwnd):
+                return False, "系统不允许直接抢焦点（她不是前台进程）"
+            return True, ""
+        user32.ShowWindow(hwnd, _WINDOW_ACTS[act])
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def idle_seconds():

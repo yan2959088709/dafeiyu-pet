@@ -38,6 +38,7 @@ from . import persona as pet_persona
 from . import runtime_manager
 from . import self_prompt as pet_self_prompt
 from . import stickers
+from . import sysmon as pet_sysmon
 from .pricing import DS_BASE_URL, DS_MODEL
 from .storage import P
 
@@ -206,6 +207,16 @@ TOOLS = [
             "action": {"type": "string", "description": "read | write | undo"},
             "note": {"type": "string", "description": "write 时的新提示词，最多 1500 字"},
             "version": {"type": "integer", "description": "undo 时可指定版本号，省略=上一版"}},
+            "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "manage_window",
+        "description": ("管理窗口：最小化/最大化/还原/切换到某个窗口。"
+                        "title 留空=当前前台窗口；给标题子串则找匹配窗口"
+                        "（不区分大小写）。不提供关窗——怕丢你没保存的文件。"),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string",
+                       "description": "minimize | maximize | restore | activate"},
+            "title": {"type": "string", "description": "窗口标题子串，可留空（前台窗口）"}},
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "manage_watch",
@@ -1366,6 +1377,38 @@ def delegate_enabled(win):
     return bool((getattr(win, "cfg", {}) or {}).get("aiDshEnabled", False))
 
 
+_WINDOW_CN = {"minimize": "最小化", "maximize": "最大化",
+              "restore": "还原", "activate": "切换到"}
+
+
+def _tool_window(win, args):
+    """窗口管理：最小化/最大化/还原/切换（按标题子串或前台窗）。"""
+    action = str(args.get("action") or "").strip().lower()
+    if action not in _WINDOW_CN:
+        return ("未知 action：%s（minimize/maximize/restore/activate）"
+                % action)
+    title = str(args.get("title") or "").strip()
+    if title:
+        hit = pet_sysmon.find_window(title)
+        if not hit:
+            sample = "；".join(
+                str(w.get("title") or "")[:20]
+                for w in pet_sysmon.enum_windows()[:8]) or "（没有可见窗口）"
+            return ("没有找到标题含「%s」的窗口。当前可见窗口：%s"
+                    % (_clip(title, 40), sample))
+        hwnd, name = int(hit["hwnd"]), str(hit.get("title") or "")
+    else:
+        fg = pet_sysmon.foreground_window()
+        if not fg or not fg.get("hwnd"):
+            return "拿不到前台窗口（可能焦点在桌面或全屏应用上）"
+        hwnd, name = int(fg["hwnd"]), str(fg.get("title") or "前台窗口")
+    ok, err = pet_sysmon.window_op(hwnd, action)
+    if not ok:
+        return "对「%s」执行%s失败：%s" % (_clip(name, 40), _WINDOW_CN[action],
+                                        err)
+    return "已%s：%s" % (_WINDOW_CN[action], _clip(name, 60))
+
+
 def _save_watch_cfg(win, dirs):
     cfg = getattr(win, "cfg", None)
     if cfg is None:
@@ -1459,7 +1502,6 @@ def _tool_delegate(win, args):
 
 # ------------------------------------------------------------ 系统感知工具
 def _tool_system_status(win, args):
-    from . import sysmon as pet_sysmon
     snap = pet_sysmon.snapshot()
     if not snap:
         return "读不到系统状态（psutil 不可用）"
@@ -1612,7 +1654,8 @@ def _tool_capabilities(win):
         "11. 感知：system_status（电脑的CPU/内存/电量/网络状态），"
         "active_window（主人在用什么程序、多久没动电脑），"
         "manage_watch（监看目录里的文件变化，醒来时呈报给你）",
-        "12. 行动：clipboard（读写剪贴板），open_target（打开白名单内文件/目录或网址）",
+        "12. 行动：clipboard（读写剪贴板），open_target（打开白名单内文件/目录或网址），"
+        "manage_window（最小化/最大化/还原/切换窗口，按标题找）",
         "13. 命令：run_shell —— 本机执行白名单命令（默认开；白名单外可申请主人审批）"
         if shell_enabled(win) else "13. 命令：已关闭（config.aiShellEnabled = false）",
         "14. 截图：screenshot —— 主动截取屏幕画面并直接看到它（每轮限一次）"
@@ -1698,6 +1741,8 @@ def execute_tool(win, name, raw_args, state):
             return _tool_delegate(win, args)
         if name == "manage_watch":
             return _tool_watch(win, args)
+        if name == "manage_window":
+            return _tool_window(win, args)
         if name == "check_time":
             return _tool_time(win, args)
         if name == "active_window":
