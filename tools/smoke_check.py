@@ -7063,6 +7063,105 @@ def _():
     assert cfg["heartbeat"]["quiet_window"] == [1, 2]
 
 
+@check("runtime: NDJSON 聚合（usage 累加/工具/最终/错误/脱敏）")
+def _():
+    from pet import agent_runtime as R
+    events = [
+        {"type": "session", "sessionId": "s1", "cwd": "C:/tmp"},
+        {"type": "status", "phase": "turn_start", "turn": 1},
+        {"type": "status", "phase": "step_end",
+         "usage": {"inputTokens": 100, "outputTokens": 2,
+                   "cacheReadTokens": 5, "totalTokens": 107}},
+        {"type": "tool_call", "callId": "c1", "tool": "pwsh"},
+        {"type": "tool_result", "callId": "c1", "status": "completed"},
+        {"type": "status", "phase": "step_end",
+         "usage": {"inputTokens": 10, "outputTokens": 3, "totalTokens": 13}},
+        {"type": "text", "text": "中间"},
+        {"type": "final", "text": "OK", "reason": {"kind": "completed"}},
+    ]
+    res = R.aggregate_dsh_events(events)
+    assert res.text == "OK", res.text
+    assert res.usage["inputTokens"] == 110 and res.usage["outputTokens"] == 5
+    assert res.usage["cacheReadTokens"] == 5 and res.usage["totalTokens"] == 120
+    assert res.meta["tool_calls"] == 1 and res.meta["session_id"] == "s1"
+    assert not res.error, res.error
+    bad = R.aggregate_dsh_events(
+        [{"type": "final", "text": "",
+          "reason": {"kind": "error", "error": {"message": "boom"}}}],
+        exit_code=1)
+    assert bad.error == "boom", bad.error
+    assert R.parse_ndjson('not json\n{"type":"text","text":"x"}\n[]\n') == \
+        [{"type": "text", "text": "x"}]
+    leak = R.aggregate_dsh_events([], exit_code=1,
+                                  stderr="key sk-abc failed", secrets=("sk-abc",))
+    assert "sk-abc" not in leak.error and "<redacted>" in leak.error, leak.error
+
+
+@check("runtime: DSH sidecar 适配器（成功/超时/异常脱敏）")
+def _():
+    import subprocess
+    from pet import agent_runtime as R
+
+    class Proc:
+        returncode = 0
+        stdout = ('{"type":"session","sessionId":"s"}\n'
+                  '{"type":"final","text":"OK","reason":{"kind":"completed"}}\n')
+        stderr = ""
+
+    seen = {}
+
+    def runner(argv, **kw):
+        seen["argv"] = argv
+        seen["env"] = kw["env"]
+        return Proc()
+
+    rt = R.DshHeadlessRuntime(node_path="node", dsh_bin="dsh.js", home="H",
+                              cwd="C", permission_mode="workspace-write",
+                              runner=runner, env={"X": "1"}, secrets=("sk",))
+    res = rt.run("hi")
+    assert res.text == "OK" and res.exit_code == 0 and not res.error
+    assert seen["argv"][:4] == ["node", "dsh.js", "headless", "--json"]
+    assert "workspace-write" in seen["argv"] and seen["argv"][-1] == "hi"
+    assert seen["env"]["DSH_HOME"] == "H" and seen["env"]["X"] == "1"
+
+    def timeout(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 1)
+
+    rt2 = R.DshHeadlessRuntime(node_path="n", dsh_bin="d", runner=timeout)
+    assert rt2.run("x").exit_code == 124
+
+    def leak(argv, **kw):
+        raise RuntimeError("sk-secret")
+
+    rt3 = R.DshHeadlessRuntime(node_path="n", dsh_bin="d", runner=leak,
+                               secrets=("sk-secret",))
+    bad = rt3.run("x")
+    assert bad.exit_code == 1
+    assert "sk-secret" not in bad.error and "<redacted>" in bad.error, bad.error
+
+
+@check("runtime: 原生适配器（假 runner，不触网）")
+def _():
+    from types import SimpleNamespace
+    from pet import agent_runtime as R
+    win = SimpleNamespace(cfg={"ds_api_key": "k"})
+
+    def runner(w, messages, key, state=None):
+        assert messages[-1]["content"] == "你好"
+        assert key == "k"
+        return "在呢", {"prompt_tokens": 1, "completion_tokens": 2}, {"meme": None}
+
+    res = R.NativeHarnessRuntime(win, runner=runner).run("你好")
+    assert res.text == "在呢" and res.usage["completion_tokens"] == 2
+    assert res.exit_code == 0 and not res.error
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("x")
+
+    bad = R.NativeHarnessRuntime(win, runner=boom).run("你好")
+    assert bad.exit_code == 1 and "RuntimeError" in bad.error, bad.error
+
+
 # ---------------------------------------------------------------- 运行器
 def main():
     ap = argparse.ArgumentParser()

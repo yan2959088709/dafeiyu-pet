@@ -239,6 +239,34 @@
 - **Handoff log**:
   > claude [ ] 2026-11-09: 登记自 TASK-012 移交：①`_persist` 内联副本（heartbeat.py）提取为 chat mixin 共享方法（守住 TASK-008 身份不变式，被动路行为零变化）②sticker 解析块（heartbeat.py 与 chat.py 重复 6 行）下沉共享 ③smoke hb_fixture() 上下文管理器抽取（约 100 行重复夹具）④门禁改名（gates["quiet_window"]→outside_quiet_window 等，纯可读性）⑤TASK-012 入账接线镜像：出现第三个调用方时提取 `ChatMixin._record_turn_usage(usage)`。
 
+### TASK-015: AgentRuntime 内化探针（DSH/OpenClaw 可替换执行内核）
+- **Executor**: claude
+- **Status**: [x]
+- **Dependencies**: TASK-009, TASK-010, TASK-012（均已 [x]）
+- **Contract**: 2026-11-10 用户批准的设计对话（「git 备份后，批准并执行，理论不如实践」）+ 本文件 TASK-009 Phase 3 自主路线；无 PRD，沿用 TASK-010 的先例（ONEs + 用户逐节确认的设计对话为合同源）
+- **Acceptance**:
+  1. `pet/agent_runtime.py`：AgentRuntime 协议 + RuntimeResult + NativeHarnessRuntime + DshHeadlessRuntime；NDJSON 事件聚合、用量求和、错误与超时处理；不改变既有 chat/heartbeat 行为
+  2. `tools/runtime_probe.py`：同一 goal 可跑 native/dsh/openclaw/command，输出 JSONL 事件与 JSON 汇总；密钥只从环境读取且全程脱敏
+  3. 实测记录：DSH 0.2.2-rc.1 headless 真实任务（含 tool_call/tool_result）事件、token、延迟；OpenClaw 安装/入口探测
+  4. smoke 新增 runtime 用例，既有 168 项不回归
+- **Handoff log**:
+  > claude [~] 2026-11-10: claimed. git backup tag `backup/pre-runtime-spike-20261110` @ dd202fa。用户批准「理论不如实践」。前置实测：DSH headless 成功（Node 24.22.2；NDJSON 事件 session/status/text/thinking/tool_call/tool_result/final；trivial 单轮 14,179 input tokens；tool 任务两步共 28,624 tokens；完整安装 9.0 GB）；OpenClaw 2026.11.2 MIT，Node>=24.16，npm 包 274.8MB unpacked（安装中）。
+  > claude [Blueprint] 2026-11-10: 用户已预批准（「批准并执行」）。DATA FLOW: goal+context → AgentRuntime.run → RuntimeResult(text/usage/events/error/latency) → probe JSON。MODULE: ①pet/agent_runtime.py 新模块（协议+原生适配器+DSH sidecar 适配器）②tools/runtime_probe.py 新探针 ③tools/smoke_check.py 新增用例。INTEGRATION: 零改动 chat/heartbeat；黑盒隔离。TEST: 假 transport/假 runner 单测 + DSH 真实探针 + 全量 smoke。RISK: 外部进程/密钥脱敏/超时；DSH 成本高，仅作重任务 runtime。
+  > claude [x] 2026-11-10: 交付。新增 `pet/agent_runtime.py`（AgentRuntime 协议 / RuntimeResult / NativeHarnessRuntime / DshHeadlessRuntime / CommandRuntime / NDJSON 聚合 / 脱敏）与 `tools/runtime_probe.py`（native/dsh/command 三态探针，Key 只从环境读取）。冒烟 168 → 171，171/171 全绿。实测：DSH 0.2.2-rc.1 headless 真任务成功，事件 session/status/text/thinking/tool_call/tool_result/final 完整；trivial 任务 14,175 tokens / 52.9s；工具任务约 28,624 tokens；DSH 完整安装 9.0GB；OpenClaw 2026.11.2 MIT、npm unpacked 274.8MB，本机 Node 22.20 导致 lifecycle 中止、Node 24 PATH 重试未生效，端到端未验证。ADR: docs/decisions/2026-11-10-agent-runtime-seam.md；报告: docs/spikes/2026-11-10-agent-runtime-probe.md。结论：DSH 可作重任务 sidecar，不可作生命核心；生产接线需预算门禁 + profile 裁剪 + 事件总线映射，登记 TASK-016。
+
+### TASK-016: DSH runtime 生产接线（预算门禁/事件总线/profile 裁剪/OpenClaw 适配）
+- **Executor**: claude
+- **Status**: [ ]
+- **Dependencies**: TASK-015
+- **Contract**: ADR-2026-11-10-01 + docs/spikes/2026-11-10-agent-runtime-probe.md
+- **Acceptance**:
+  1. DSH runtime 默认关闭，设置页可启用并配置日预算；超预算/超时/无 Key 时 fail-closed
+  2. `tool_call/tool_result/usage` 映射到 workstatus/tooldetail/notify，生活日志可见
+  3. DSH profile patch 替换 coding persona（宠物人格）并裁剪工具集；最小安装/按需安装方案成文
+  4. OpenClaw CLI/headless 适配（或明确不接的裁决）；既有 smoke 不回归
+- **Handoff log**:
+  > claude [ ] 2026-11-10: 自 TASK-015 deferred 登记。注意：DSH 单次基线 ~14k tokens/53s，只能重任务；默认关闭，预算门禁先于一切接线。
+
 ---
 
 ## Messages
