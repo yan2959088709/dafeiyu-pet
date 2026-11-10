@@ -484,6 +484,14 @@ class PetService:
         return any(hooks.get("quit") for hooks in self._pets.values())
 
     def quit_app(self):
+        # 主动退出先留标记：看门狗（pet-watchdog.bat）看到 quit.flag 就
+        # 不重拉；崩溃路径没有这个旗标，看门狗才会把它拉起来
+        try:
+            from pet import autostart
+            from pet.storage import P
+            autostart.write_quit_flag(P.app_dir)
+        except Exception:
+            pass
         delivered = 0
         for _pid, hooks in self._pets.items():
             fn = hooks.get("quit")

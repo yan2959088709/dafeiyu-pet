@@ -166,6 +166,22 @@ class SettingsDialog(QDialog):
             "没有其它发言门禁。300 秒约等于每天 288 次评估。保存后立即生效。"))
         root.addWidget(hb)
 
+        boot = QGroupBox("开机与自恢复")
+        boot_form = QFormLayout(boot)
+        from pet import autostart as _autostart
+        self.cb_autostart = _check("开机自动启动（登录后它自己活过来）",
+                                   _autostart.enabled())
+        self.cb_recover = _check(
+            "崩溃自恢复（异常退出后自动重拉；你主动退出不会）",
+            self.cfg.get("autoRecoverEnabled", True))
+        boot_form.addRow(self.cb_autostart)
+        boot_form.addRow(self.cb_recover)
+        boot_form.addRow(QLabel(
+            "开机自启在系统「启动」目录放一个快捷方式（不需要管理员权限）；"
+            "崩溃自恢复用一个看门狗脚本守着它，进程消失就重拉，"
+            "你经菜单/接口主动退出时不会。保存后立即生效。"))
+        root.addWidget(boot)
+
         tools = QGroupBox("AI 工具开关")
         tool_form = QFormLayout(tools)
         self.cb_ai_file = _check("文件工具（读写白名单目录）",
@@ -531,6 +547,11 @@ class SettingsDialog(QDialog):
         seg["enabled"] = self.cb_hb.isChecked()
         seg["interval_secs"] = int(self.spin_hb_interval.value())
         cfg["heartbeat"] = seg
+        # 保存前的旧值：_apply_live 靠它判断自启/恢复开关是否需要真去动启动目录
+        self._old_boot = (bool(cfg.get("autostart", False)),
+                          bool(cfg.get("autoRecoverEnabled", True)))
+        cfg["autostart"] = self.cb_autostart.isChecked()
+        cfg["autoRecoverEnabled"] = self.cb_recover.isChecked()
         cfg["aiFileEnabled"] = self.cb_ai_file.isChecked()
         cfg["aiWebEnabled"] = self.cb_ai_web.isChecked()
         cfg["aiScreenEnabled"] = self.cb_ai_screen.isChecked()
@@ -643,6 +664,19 @@ class SettingsDialog(QDialog):
                     apply_hb(self.cfg.get("heartbeat") or {})
                 except Exception:
                     pass
+        # 开机自启热生效：开关或恢复模式变了、或 .lnk 与配置脱节时才真去动
+        # 启动目录（幂等，避免每次保存都跑一趟 PowerShell）
+        try:
+            from pet import autostart
+            want = bool(self.cfg.get("autostart", False))
+            recover = bool(self.cfg.get("autoRecoverEnabled", True))
+            old = getattr(self, "_old_boot", None) or (False, True)
+            if (want, recover) != old or want != autostart.enabled():
+                ok, err = autostart.set_enabled(want, recover=recover)
+                if not ok:
+                    QMessageBox.warning(self, "开机自启", f"设置失败：{err}")
+        except Exception:
+            pass
         self._sync_api()
         if hasattr(self.owner, "say"):
             self.owner.say("设置已保存")

@@ -1460,6 +1460,138 @@ def _():
         dlg.deleteLater()
 
 
+@check("autostart: 自启/看门狗/quit.flag（patch subprocess，不碰真启动目录）")
+def _():
+    import subprocess as _sp
+    from pet import autostart as A
+    app_dir = os.path.join(CTX["tmpdir"], "appdir")
+    os.makedirs(app_dir, exist_ok=True)
+    fake_startup = os.path.join(CTX["tmpdir"], "startup")
+    os.makedirs(os.path.join(fake_startup, "Microsoft", "Windows",
+                             "Start Menu", "Programs", "Startup"),
+                exist_ok=True)
+    calls = []
+    old_run, old_appdata = _sp.run, os.environ.get("APPDATA")
+    os.environ["APPDATA"] = fake_startup
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        with open(A.lnk_path(), "w", encoding="utf-8") as fh:
+            fh.write("fake lnk")
+        return None
+
+    _sp.run = fake_run
+    try:
+        assert A.enabled() is False
+        ok, err = A.set_enabled(True, recover=True, app_dir=app_dir)
+        assert ok, err
+        assert len(calls) == 1 and "powershell" in calls[0][0], calls
+        assert "pet-watchdog.bat" in calls[0][-1], calls[0][-1]
+        assert A.enabled() is True
+        assert os.path.exists(A.watchdog_path(app_dir))
+        script = A.watchdog_script(app_dir)
+        assert "quit.flag" in script and 'start "" /wait' in script, script
+        assert "GEQ %d" % A.MAX_RELAUNCH in script, script
+        # 关：删 .lnk
+        ok, err = A.set_enabled(False, app_dir=app_dir)
+        assert ok and A.enabled() is False, (ok, err)
+        # recover=False：.lnk 直接指向 pythonw 桌宠.py，不建看门狗
+        ok, err = A.set_enabled(True, recover=False, app_dir=app_dir)
+        assert ok, err
+        assert "桌宠.py" in calls[-1][-1] and "pet-watchdog" not in calls[-1][-1], \
+            calls[-1][-1]
+        # quit.flag：主动退出标记
+        flag = A.quit_flag_path(app_dir)
+        assert A.write_quit_flag(app_dir) and os.path.exists(flag)
+        assert open(flag, encoding="utf-8").read().strip() == "quit"
+        # 看门狗写失败 → set_enabled 整体失败（不留断 .lnk）
+        old_open = open
+
+        def boom_open(path, *a, **kw):
+            if str(path).endswith(A.WATCHDOG_NAME):
+                raise OSError("disk full")
+            return old_open(path, *a, **kw)
+
+        import builtins
+        builtins.open = boom_open
+        try:
+            ok, err = A.set_enabled(True, recover=True, app_dir=app_dir)
+            assert ok is False and "看门狗" in err, (ok, err)
+        finally:
+            builtins.open = old_open
+    finally:
+        _sp.run = old_run
+        if old_appdata is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = old_appdata
+
+
+@check("petservice: quit_app 主动退出写 quit.flag（看门狗不重拉）")
+def _():
+    from pet import autostart as A
+    from pet import petservice as PS
+    svc = PS.PetService.__new__(PS.PetService)
+    svc._pets = {"1": {"quit": lambda: None}}
+    flag = os.path.join(CTX["tmpdir"], "quit.flag")
+    old_flag_path = A.quit_flag_path
+    A.quit_flag_path = lambda app_dir: flag
+    try:
+        svc.quit_app()
+        assert os.path.exists(flag), flag
+        assert open(flag, encoding="utf-8").read().strip() == "quit"
+    finally:
+        A.quit_flag_path = old_flag_path
+        if os.path.exists(flag):
+            os.remove(flag)
+
+
+@check("settings: 开机自启/崩溃自恢复开关（落键 + 热生效幂等 + 翻模式重建）")
+def _():
+    import copy
+    from pet import autostart as A
+    from pet.settings_ui import SettingsDialog
+    w = CTX["win"]
+    old_cfg = copy.deepcopy(w.cfg)
+    dlg = SettingsDialog(w)
+    calls = []
+    state = {"on": False}
+    old_set, old_enabled = A.set_enabled, A.enabled
+    A.enabled = lambda: state["on"]
+
+    def fake_set(on, **kw):
+        calls.append((on, kw))
+        state["on"] = bool(on)
+        return (True, "")
+
+    A.set_enabled = fake_set
+    try:
+        assert hasattr(dlg, "cb_autostart") and hasattr(dlg, "cb_recover")
+        dlg.cb_autostart.setChecked(True)
+        dlg.cb_recover.setChecked(False)
+        dlg._on_save()
+        assert w.cfg["autostart"] is True, w.cfg.get("autostart")
+        assert w.cfg["autoRecoverEnabled"] is False
+        assert calls == [(True, {"recover": False})], calls
+        # 值没变再存：不重复动启动目录（幂等）
+        calls.clear()
+        dlg._on_save()
+        assert calls == [], calls
+        # 自启开着时翻恢复模式：重建 .lnk 指向
+        dlg.cb_recover.setChecked(True)
+        dlg._on_save()
+        assert calls == [(True, {"recover": True})], calls
+    finally:
+        A.set_enabled, A.enabled = old_set, old_enabled
+        w.cfg.clear()
+        w.cfg.update(old_cfg)
+        try:
+            w._save_cfg()
+        except Exception:
+            pass
+        dlg.deleteLater()
+
+
 @check("harness: manage_heartbeat AI 自控心跳（status/on/off/间隔+clamp+热更新）")
 def _():
     import copy
@@ -3870,6 +4002,14 @@ def _():
     assert sorted(C.DEFAULT_CFG["aiShellAllow"]) == \
         sorted(H.DEFAULT_SHELL_ALLOW), C.DEFAULT_CFG["aiShellAllow"]
     assert "python" not in C.DEFAULT_CFG["aiShellAllow"]
+    # 开机自启/崩溃自恢复：同样必须登记（batch5 MANAGED_KEYS 教训）
+    assert C.DEFAULT_CFG["autoRecoverEnabled"] is True
+    assert "autostart" in C.MANAGED_KEYS
+    assert "autoRecoverEnabled" in C.MANAGED_KEYS
+    # 非法值按开启回落（validate 原地纠正，返回错误列表）
+    probe = {"autoRecoverEnabled": "yes"}
+    C.validate(probe)
+    assert probe["autoRecoverEnabled"] is True, probe.get("autoRecoverEnabled")
     cfg = dict(C.DEFAULT_CFG)
     cfg["sandbox_dirs"] = "  单个字符串  "
     C.validate(cfg)

@@ -117,6 +117,7 @@ DEFAULT_CFG = {
     "topmost": True,
     "passthrough": False,
     "autostart": False,
+    "autoRecoverEnabled": True,
     "x": None,
     "y": None,
     "ds_api_key": "",
@@ -417,6 +418,10 @@ def validate(cfg):
     local_fetch = cfg.get("aiLocalFetch")
     if local_fetch is not None and not isinstance(local_fetch, bool):
         bad("aiLocalFetch", "本机抓取开关必须是布尔值，已按开启处理", True)
+    # 崩溃自恢复：非法值按开启回落（autostart 键是既有本地键，无校验块）
+    recover = cfg.get("autoRecoverEnabled")
+    if recover is not None and not isinstance(recover, bool):
+        bad("autoRecoverEnabled", "崩溃自恢复开关必须是布尔值，已按开启处理", True)
     if cfg.get("aiFileRoot") is not None and not isinstance(cfg.get("aiFileRoot"), str):
         bad("aiFileRoot", "文件工具根目录必须是字符串，已按项目目录处理", "")
 

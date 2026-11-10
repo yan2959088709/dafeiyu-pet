@@ -6,13 +6,10 @@
 _update_tray_tooltip、_on_tray_activated）属于表现层，仍留在主窗；音效播放
 （_play_boing）在 pet/sound.py，经 MRO 调用。
 
-边界：自定义输入弹窗在 pet/inputs.py；SIZE_LEVELS 与开机自启用的 APP_DIR/PYTHONW
-定义在这里，主程序按需引回——子模块禁止反向依赖主程序。
+边界：自定义输入弹窗在 pet/inputs.py；SIZE_LEVELS 定义在这里，主程序按需引回
+——子模块禁止反向依赖主程序。开机自启的 .lnk/看门狗构建在 pet/autostart.py。
 """
 import ctypes
-import os
-import subprocess
-import sys
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QApplication, QLineEdit, QMenu, QMessageBox,
@@ -20,11 +17,7 @@ from PySide6.QtWidgets import (QApplication, QLineEdit, QMenu, QMessageBox,
 
 from pet import config as pet_config
 from pet.inputs import prompt_double, prompt_text
-from pet.storage import P
 from skins import SKIN_ORDER, SKIN_DISPLAY
-
-APP_DIR = P.app_dir
-PYTHONW = P.pythonw
 
 SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
 
@@ -539,26 +532,11 @@ class MenuMixin:
 
     def set_autostart(self, on):
         # 先做再落盘：失败时配置不写，菜单勾选才不会和事实脱节
-        appdata = os.environ.get("APPDATA", "")
-        if not appdata:
-            QMessageBox.warning(self, "开机自启", "设置失败：找不到 APPDATA 环境变量")
-            return
-        lnk = os.path.join(appdata, "Microsoft", "Windows",
-                           "Start Menu", "Programs", "Startup", "大肥鱼桌宠.lnk")
-        try:
-            if on:
-                ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}');"
-                      "$s.TargetPath='{}';$s.Arguments='\"{}\"';$s.WorkingDirectory='{}';$s.Save()"
-                      .format(lnk, PYTHONW,
-                              "" if getattr(sys, "frozen", False) else os.path.join(APP_DIR, "桌宠.py"),
-                              APP_DIR))
-                subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=True)
-            else:
-                if os.path.exists(lnk):
-                    os.remove(lnk)
-        except Exception as ex:
-            QMessageBox.warning(self, "开机自启", f"设置失败：{ex}")
+        from pet import autostart
+        ok, err = autostart.set_enabled(
+            on, recover=bool(self.cfg.get("autoRecoverEnabled", True)))
+        if not ok:
+            QMessageBox.warning(self, "开机自启", f"设置失败：{err}")
             return
         self.cfg["autostart"] = bool(on)
         self._save_cfg()
