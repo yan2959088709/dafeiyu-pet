@@ -377,6 +377,15 @@ def validate(cfg):
             or not (128 <= tokens <= 4096):
         bad("aiMaxTokens", "单次输出上限必须是 128-4096 的整数", 1024)
 
+    # AI 工具开关（文件/联网）：缺失=默认开启（不写盘不告警），写了非布尔才纠正。
+    # 写权限由 harness 的路径沙箱兜底（根目录/运行期数据文件），这里只校验类型。
+    for key, label in (("aiFileEnabled", "文件工具"), ("aiWebEnabled", "联网工具")):
+        val = cfg.get(key)
+        if val is not None and not isinstance(val, bool):
+            bad(key, "%s开关必须是布尔值，已按开启处理" % label, True)
+    if cfg.get("aiFileRoot") is not None and not isinstance(cfg.get("aiFileRoot"), str):
+        bad("aiFileRoot", "文件工具根目录必须是字符串，已按项目目录处理", "")
+
     pets = cfg.get("pets")
     if not isinstance(pets, list) or not pets:
         bad("pets", "宠物列表必须是非空数组", copy.deepcopy(DEFAULT_PETS))

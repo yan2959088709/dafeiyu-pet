@@ -12,9 +12,15 @@ _chat_out 统一渲染。tool 消息是瞬态的：只进 messages，不落 chat
 tools 走 OpenAI 兼容格式；DeepSeek 实测 thinking=enabled 与 tool_calls 可共存
 （reasoning_content 与 tool_calls 同返回，finish_reason=tool_calls）。
 """
+import contextlib
+import html as html_lib
+import ipaddress
 import json
+import os
 import re
+import socket
 import time
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -22,13 +28,34 @@ from . import log as pet_log
 from . import memes as pet_memes
 from . import stickers
 from .pricing import DS_BASE_URL, DS_MODEL
+from .storage import P
 
-MAX_HOPS = 3                 # 工具跳数上限；用尽后不带工具逼一句正文
+MAX_HOPS = 4                 # 工具跳数上限；用尽后不带工具逼一句正文
 SEARCH_TOP_K = 5             # 检索返回条数上限
 DEFAULT_MAX_TOKENS = 1024
 TIMEOUT_SEC = 30             # 单次请求超时（不是整轮预算，整轮见 deadline）
 ARG_MAX_CHARS = 64           # 工具参数字符串截断（防回灌放大）
 DESC_MAX_CHARS = 80          # 本地素材描述截断（进上下文前清洗）
+FACT_MAX_CHARS = 60          # 记忆条目长度上限
+FILE_READ_MAX_CHARS = 8000   # 单次读文件返回上限
+FILE_WRITE_MAX_CHARS = 64 * 1024
+FILE_LIST_MAX = 200
+WEB_MAX_BYTES = 200 * 1024
+WEB_MAX_CHARS = 4000
+WEB_TIMEOUT = 10
+WEB_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+
+# 运行期数据文件禁止 AI 写入：写坏它们会丢配置/会话/记忆，或打断正在跑的实例
+PROTECTED_WRITE_NAMES = {
+    "config.json", "config.jsonc", "pet_sessions.json", "pet_sessions.json.bak",
+    "pet_memory.json", "usage_ledger.json", "logs.txt", "api-runtime.json",
+}
+PROTECTED_WRITE_DIRS = (".venv",)
+
+# 无动作库皮肤（whale-girl）可播放的情绪动作
+ANIM_FALLBACK = ("think", "joy", "celebrate", "disappointed", "error",
+                 "working", "play", "eat", "welcome", "sleep", "wake", "wait")
 
 # 本地素材检索结果以「工具返回值」形态进 messages，提示词层级上比 system 更接近
 # 用户侧、可信度更低；包一层显式分隔，声明其数据属性（本地文件可写，不可远程利用，
@@ -60,13 +87,77 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "tag": {"type": "string", "description": "小表情标签"}},
             "required": ["tag"]}}},
+    {"type": "function", "function": {
+        "name": "remember_fact",
+        "description": "长期记住一件关于主人的事（称呼/喜好/习惯/身份/计划等）。会自动去重并消解矛盾；最多 20 条。",
+        "parameters": {"type": "object", "properties": {
+            "fact": {"type": "string", "description": "事实本身，20 字以内，如：主人喜欢喝美式咖啡"}},
+            "required": ["fact"]}}},
+    {"type": "function", "function": {
+        "name": "forget_fact",
+        "description": "忘记与关键词匹配的记忆条目（合并/纠正旧记忆时用）。",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string", "description": "要忘记的内容关键词"}},
+            "required": ["keyword"]}}},
+    {"type": "function", "function": {
+        "name": "search_memories",
+        "description": "检索你记住的关于主人的长期事实。keyword 留空返回全部。",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string", "description": "检索关键词，可留空"}}}}},
+    {"type": "function", "function": {
+        "name": "list_dir",
+        "description": "列出工作目录下的文件与子目录。path 为相对路径，留空为根目录。",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "相对路径，如 sprites 或空"}}}}},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "读取工作目录内的文本文件内容。二进制与超大文件会被拒绝。",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "相对路径"},
+            "max_chars": {"type": "integer", "description": "最多返回多少字符，默认 8000"}},
+            "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "在工作目录内新建或覆盖文本文件；append=true 时追加。禁止写入 config/会话/记忆等运行期数据文件。",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "相对路径"},
+            "content": {"type": "string", "description": "文件内容"},
+            "append": {"type": "boolean", "description": "true=追加，省略=覆盖"}},
+            "required": ["path", "content"]}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "联网搜索网页（Bing）。需要最新信息、新闻、查资料时使用。",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "搜索关键词"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "web_fetch",
+        "description": "抓取一个网页并返回纯文本内容（仅 http/https 公网地址，内网地址会被拒绝）。",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "完整网址"}},
+            "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "list_actions",
+        "description": "列出当前形象可播放的动作名。想用身体动作表达情绪时先看有哪些。",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string", "description": "可选过滤关键词"}}}}},
+    {"type": "function", "function": {
+        "name": "play_animation",
+        "description": "播放一个桌宠动作（开心时转圈、累了趴下等）。name 必须是 list_actions 返回的动作名；每轮最多一个。",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "动作名"}},
+            "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "list_capabilities",
+        "description": "查看你当前具备的全部能力（工具、本地技能、开关状态）。不确定自己能做什么时调用。",
+        "parameters": {"type": "object", "properties": {}}}},
 ]
 
 
 # ------------------------------------------------------------ 本地检索
-def _clip(text):
-    """进上下文前的清洗：去控制字符 + 截断（本地素材文件可写，不信任其长度）。"""
-    return "".join(ch for ch in str(text or "") if ch >= " " or ch in "\n\t")[:DESC_MAX_CHARS]
+def _clip(text, max_chars=DESC_MAX_CHARS):
+    """进上下文前的清洗：去控制字符 + 截断（本地素材/文件内容都不可信任）。"""
+    return "".join(ch for ch in str(text or "") if ch >= " " or ch in "\n\t")[:max_chars]
 
 
 def _score(items, keyword, k=SEARCH_TOP_K):
@@ -139,6 +230,395 @@ def _send_sticker(args, state):
     return "已准备小表情：%s，会贴在你的回复气泡下方" % _clip(tag)
 
 
+# ------------------------------------------------------------ 记忆工具
+def _mem_lock_ctx(win):
+    lock = getattr(win, "_mem_lock", None)
+    return lock if lock is not None else contextlib.nullcontext()
+
+
+def _tool_remember(win, args):
+    fact = _clip(args.get("fact") or "", FACT_MAX_CHARS).strip(" ，。,.；;")
+    if len(fact) < 2:
+        return "事实太短，没记住"
+    win._add_fact(fact)
+    return "记住了：%s" % fact
+
+
+def _tool_forget(win, args):
+    kw = _clip(args.get("keyword") or "", 40).strip()
+    if not kw:
+        return "请给出要忘记的关键词"
+    with _mem_lock_ctx(win):
+        facts = list(getattr(win, "facts", []) or [])
+        hits = [f for f in facts if kw in f or f in kw]
+        if not hits:
+            return "没有找到含「%s」的记忆（共记住 %d 条）" % (kw, len(facts))
+        win.facts[:] = [f for f in facts if f not in hits]
+        win._save_mem()
+    return "忘掉了：%s" % "；".join(_clip(h, 30) for h in hits[:5])
+
+
+def _tool_search_mem(win, args):
+    kw = _clip(args.get("keyword") or "", 40).strip()
+    with _mem_lock_ctx(win):
+        facts = list(getattr(win, "facts", []) or [])
+    if not facts:
+        return "还没有记住任何事"
+    hits = [f for f in facts if kw in f] if kw else facts
+    if not hits:
+        return "没有找到含「%s」的记忆（共记住 %d 条）" % (kw, len(facts))
+    return (DATA_HEADER + "\n我记得：\n"
+            + "\n".join("- %s" % _clip(f, FACT_MAX_CHARS) for f in hits[:20]))
+
+
+# ------------------------------------------------------------ 文件工具（限定项目目录）
+def file_enabled(win):
+    return bool((getattr(win, "cfg", {}) or {}).get("aiFileEnabled", True))
+
+
+def web_enabled(win):
+    return bool((getattr(win, "cfg", {}) or {}).get("aiWebEnabled", True))
+
+
+def file_root(win):
+    """文件工具的根目录：默认项目目录，config.aiFileRoot 可覆盖。"""
+    root = str((getattr(win, "cfg", {}) or {}).get("aiFileRoot") or "").strip()
+    if root:
+        root = os.path.expandvars(os.path.expanduser(root))
+    try:
+        return os.path.realpath(root or P.app_dir)
+    except OSError:
+        return P.app_dir
+
+
+def _safe_path(win, rel, for_write=False):
+    """把相对路径解析到根目录内；越界/绝对路径/受保护文件一律拒绝。"""
+    root = file_root(win)
+    rel = str(rel or "").strip().replace("\\", "/").lstrip("/")
+    if rel.startswith("./"):
+        rel = rel[2:]
+    if not rel:
+        return root, ""
+    if re.match(r"^[A-Za-z]:", rel) or os.path.isabs(rel):
+        raise ValueError("只接受相对路径")
+    target = os.path.realpath(os.path.join(root, rel))
+    try:
+        inside = (os.path.commonpath([os.path.normcase(root), os.path.normcase(target)])
+                  == os.path.normcase(root))
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ValueError("路径越界，只能访问工作目录内")
+    if for_write:
+        parts = [p for p in rel.split("/") if p]
+        protected_dirs = {os.path.normcase(d) for d in PROTECTED_WRITE_DIRS}
+        if parts and os.path.normcase(parts[0]) in protected_dirs:
+            raise ValueError("拒绝写入：%s 是运行环境目录" % parts[0])
+        base = os.path.basename(rel).lower()
+        if base in PROTECTED_WRITE_NAMES:
+            raise ValueError("拒绝写入：%s 是运行期数据文件" % base)
+    return target, rel
+
+
+def _safe_path_msg(win, rel, for_write=False):
+    """路径解析的拒绝原因要回喂给模型（不能被 execute_tool 的兜底吞成通用文案）。"""
+    try:
+        return _safe_path(win, rel, for_write), None
+    except ValueError as e:
+        return None, str(e)
+
+
+def _tool_list_dir(win, args):
+    if not file_enabled(win):
+        return "文件功能已关闭"
+    resolved, err = _safe_path_msg(win, args.get("path"))
+    if err:
+        return err
+    target, rel = resolved
+    if not os.path.isdir(target):
+        return "目录不存在：%s" % (rel or ".")
+    try:
+        names = sorted(os.listdir(target))
+    except OSError as e:
+        return "列目录失败：%s" % e
+    lines = []
+    for name in names[:FILE_LIST_MAX]:
+        full = os.path.join(target, name)
+        try:
+            if os.path.isdir(full):
+                lines.append("[目录] %s/" % name)
+            else:
+                lines.append("%s（%d 字节）" % (name, os.path.getsize(full)))
+        except OSError:
+            continue
+    more = ""
+    if len(names) > FILE_LIST_MAX:
+        more = "\n（另有 %d 项未列出）" % (len(names) - FILE_LIST_MAX)
+    return ((DATA_HEADER + "\n当前目录：%s\n" % (rel or "（根目录）"))
+            + ("\n".join(lines) if lines else "（空目录）") + more)
+
+
+def _tool_read_file(win, args):
+    if not file_enabled(win):
+        return "文件功能已关闭"
+    resolved, err = _safe_path_msg(win, args.get("path"))
+    if err:
+        return err
+    target, rel = resolved
+    if not os.path.isfile(target):
+        return "文件不存在：%s" % rel
+    try:
+        size = os.path.getsize(target)
+        with open(target, "rb") as f:
+            raw = f.read(FILE_READ_MAX_CHARS * 4)
+    except OSError as e:
+        return "读取失败：%s" % e
+    if b"\x00" in raw[:4096]:
+        return "这是二进制文件，读不了文本内容"
+    text = raw.decode("utf-8", "replace")
+    try:
+        limit = int(args.get("max_chars") or FILE_READ_MAX_CHARS)
+    except (TypeError, ValueError):
+        limit = FILE_READ_MAX_CHARS
+    limit = max(200, min(limit, FILE_READ_MAX_CHARS))
+    clipped = text[:limit]
+    truncated = size > len(raw) or len(text) > limit
+    tail = "\n（已截断，文件共 %d 字节）" % size if truncated else ""
+    return DATA_HEADER + "\n文件：%s\n" % rel + clipped + tail
+
+
+def _tool_write_file(win, args):
+    if not file_enabled(win):
+        return "文件功能已关闭"
+    rel = str(args.get("path") or "").strip()
+    if not rel:
+        return "需要给出文件路径"
+    content = str(args.get("content") or "")
+    if len(content) > FILE_WRITE_MAX_CHARS:
+        return "内容过长（上限 %d 字符）" % FILE_WRITE_MAX_CHARS
+    resolved, err = _safe_path_msg(win, rel, for_write=True)
+    if err:
+        return err
+    target, rel = resolved
+    if os.path.isdir(target):
+        return "目标是一个目录，不能写入"
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    append = bool(args.get("append"))
+    with open(target, "a" if append else "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    return "已写入 %s（%d 字符%s）" % (rel, len(content), "，追加" if append else "")
+
+
+# ------------------------------------------------------------ 联网工具
+def _host_blocked(host):
+    """解析域名并拒绝回环/内网/保留地址（SSRF 防护）。解析失败也拒绝。"""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return True
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return True
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+    return False
+
+
+def _clean_url(url):
+    parts = urlsplit(str(url or "").strip())
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("只支持 http/https 网址")
+    if _host_blocked(parts.hostname):
+        raise ValueError("该地址指向本机或内网，已拒绝")
+    return parts.geturl()
+
+
+def _html_to_text(markup):
+    """剥标签取纯文本（脚本/样式整段丢弃），供联网结果回喂模型。"""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", str(markup or ""))
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
+def _parse_bing(markup):
+    """从 Bing 结果页解析 (标题, 链接, 摘要)。"""
+    out = []
+    for block in re.findall(r'(?s)<li class="b_algo".*?</li>', markup or "")[:10]:
+        m = re.search(r'(?s)<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block)
+        if not m:
+            continue
+        title = html_lib.unescape(re.sub(r"(?s)<[^>]+>", "", m.group(2))).strip()
+        href = html_lib.unescape(m.group(1))
+        snip = re.search(r"(?s)<p[^>]*>(.*?)</p>", block)
+        snippet = html_lib.unescape(re.sub(r"(?s)<[^>]+>", " ", snip.group(1))).strip() \
+            if snip else ""
+        snippet = re.sub(r"[ \t\r\n]+", " ", snippet)[:120]
+        if title and href.startswith("http"):
+            out.append((title[:80], href, snippet))
+    return out
+
+
+def _tool_web_search(win, args):
+    if not web_enabled(win):
+        return "联网功能已关闭"
+    query = _clip(args.get("query") or "", 80).strip()
+    if not query:
+        return "需要给出搜索关键词"
+    try:
+        resp = requests.get("https://cn.bing.com/search", params={"q": query},
+                            timeout=WEB_TIMEOUT, headers=WEB_UA)
+        resp.encoding = "utf-8"
+        markup = resp.text
+    except requests.RequestException as e:
+        return "搜索失败：%s" % type(e).__name__
+    results = _parse_bing(markup)
+    if not results:
+        return "没有搜到结果（网络可能受限）。可以换个关键词，或直接给网址用 web_fetch"
+    lines = ["%d. %s\n   %s\n   %s" % (i, title, href, snippet)
+             for i, (title, href, snippet) in enumerate(results[:5], 1)]
+    return DATA_HEADER + "\n搜索「%s」结果：\n" % query + "\n".join(lines)
+
+
+def _tool_web_fetch(win, args):
+    if not web_enabled(win):
+        return "联网功能已关闭"
+    url = str(args.get("url") or "").strip()
+    if not url:
+        return "需要给出网址"
+    try:
+        safe = _clean_url(url)
+    except ValueError as e:
+        return str(e)
+    resp = None
+    try:
+        for _hop in range(4):
+            resp = requests.get(safe, timeout=WEB_TIMEOUT, headers=WEB_UA,
+                                stream=True, allow_redirects=False)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("Location") or ""
+                resp.close()
+                if not loc:
+                    return "服务器返回了空跳转"
+                safe = _clean_url(urljoin(safe, loc))
+                continue
+            break
+        else:
+            return "跳转次数过多"
+    except ValueError as e:
+        return str(e)
+    except requests.RequestException as e:
+        return "抓取失败：%s" % type(e).__name__
+    try:
+        if resp.status_code >= 400:
+            return "抓取失败：HTTP %d" % resp.status_code
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if ctype and not any(t in ctype for t in ("text/", "json", "xml", "html")):
+            return "不支持的内容类型：%s" % ctype
+        raw = b""
+        for chunk in resp.iter_content(8192):
+            raw += chunk
+            if len(raw) >= WEB_MAX_BYTES:
+                break
+        enc = "utf-8"
+        m = re.search(r"charset=([\w-]+)", ctype)
+        if m:
+            enc = m.group(1)
+        try:
+            text = raw.decode(enc, "replace")
+        except LookupError:
+            text = raw.decode("utf-8", "replace")
+        plain = _html_to_text(text)[:WEB_MAX_CHARS]
+        return DATA_HEADER + "\n网址：%s\n" % safe + plain
+    finally:
+        resp.close()
+
+
+# ------------------------------------------------------------ 动作工具
+def _anim_names(win):
+    skin = getattr(win, "skin", None)
+    getter = getattr(skin, "action_names", None)
+    if callable(getter):
+        try:
+            names = [str(n) for n in getter()]
+            if names:
+                return names
+        except Exception:
+            pass
+    return list(ANIM_FALLBACK)
+
+
+def anim_available(win, name):
+    name = str(name or "").strip()
+    if not name:
+        return False
+    checker = getattr(win, "_skin_has_state", None)
+    if callable(checker):
+        try:
+            return bool(checker(name))
+        except Exception:
+            pass
+    return name in ANIM_FALLBACK
+
+
+def _tool_list_actions(win, args):
+    kw = _clip(args.get("keyword") or "", 30).strip()
+    names = _anim_names(win)
+    if not names:
+        return "当前形象没有可播放的动作"
+    if kw:
+        matched = [n for n in names if kw in n]
+        if not matched:
+            # 关键词没命中不等于没有动作：回落给示例清单，模型才有得选
+            sample = "、".join(names[:20])
+            more = "…（共 %d 个）" % len(names) if len(names) > 20 else ""
+            return ("没有匹配「%s」的动作。当前形象可用动作：%s%s"
+                    % (kw, sample, more))
+        names = matched
+    return DATA_HEADER + "\n当前形象可用动作：\n" + "、".join(names[:80])
+
+
+def _tool_play_anim(win, args, state):
+    if state.get("anim"):
+        return "本轮已经安排过一个动作了（每轮限一个）"
+    name = _clip(args.get("name") or "", 40).strip()
+    if not anim_available(win, name):
+        return "动作「%s」不在当前形象的库里，先用 list_actions 查看可用动作" % name
+    state["anim"] = name
+    return "已准备动作：%s，会在你的回复发出时播放" % name
+
+
+# ------------------------------------------------------------ 自我认知
+def _tool_capabilities(win):
+    cfg = getattr(win, "cfg", {}) or {}
+    try:
+        facts = len(getattr(win, "facts", []) or [])
+    except Exception:
+        facts = 0
+    lines = [
+        "你的能力清单：",
+        "1. 表情包：search_memes / send_meme（每轮最多发一个）",
+        "2. 小表情：search_stickers / send_sticker（每轮最多发一个）",
+        "3. 记忆：remember_fact / forget_fact / search_memories —— 当前长期事实 %d 条" % facts,
+        "4. 动作：list_actions / play_animation —— 当前形象 %d 个动作" % len(_anim_names(win)),
+        ("5. 文件：list_dir / read_file / write_file —— 根目录 %s（仅项目目录；"
+         "config/会话/记忆等运行期数据文件禁写）" % file_root(win))
+        if file_enabled(win) else "5. 文件：已关闭（config.aiFileEnabled = false）",
+        "6. 联网：web_search / web_fetch —— Bing 搜索 + 公网网页抓取，内网地址会被拒绝"
+        if web_enabled(win) else "6. 联网：已关闭（config.aiWebEnabled = false）",
+        "7. 自知：list_capabilities（本清单）",
+        "另外，用户直接输入「查余额 / 查天气 / 记住… / 忘记… / 你记得什么」会由本地技能处理，不经过你。",
+    ]
+    return "\n".join(lines)
+
+
 def execute_tool(win, name, raw_args, state):
     """执行一个工具调用，返回给模型的文本结果。永不抛异常（错误也是结果）。"""
     name = str(name or "")[:ARG_MAX_CHARS]
@@ -160,6 +640,28 @@ def execute_tool(win, name, raw_args, state):
             return _send_meme(win, args, state)
         if name == "send_sticker":
             return _send_sticker(args, state)
+        if name == "remember_fact":
+            return _tool_remember(win, args)
+        if name == "forget_fact":
+            return _tool_forget(win, args)
+        if name == "search_memories":
+            return _tool_search_mem(win, args)
+        if name == "list_dir":
+            return _tool_list_dir(win, args)
+        if name == "read_file":
+            return _tool_read_file(win, args)
+        if name == "write_file":
+            return _tool_write_file(win, args)
+        if name == "web_search":
+            return _tool_web_search(win, args)
+        if name == "web_fetch":
+            return _tool_web_fetch(win, args)
+        if name == "list_actions":
+            return _tool_list_actions(win, args)
+        if name == "play_animation":
+            return _tool_play_anim(win, args, state)
+        if name == "list_capabilities":
+            return _tool_capabilities(win)
     except Exception as e:  # noqa: BLE001 - 分类文案回喂，细节只进日志
         pet_log.debug("工具 %s 执行失败: %s" % (name, e))
         return "工具执行失败，换个参数或用 search_* 重新检索再试"
@@ -266,7 +768,7 @@ def run_turn(win, messages, key, state=None, *, model=DS_MODEL, max_tokens=None,
     if deadline is None:
         deadline = time.monotonic() + TIMEOUT_SEC * (MAX_HOPS + 1)
     if state is None:
-        state = {"meme": None, "sticker": None}
+        state = {"meme": None, "sticker": None, "anim": None}
     total_usage = None
     finish = ""
     for hop in range(MAX_HOPS):

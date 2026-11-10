@@ -15,6 +15,9 @@ PROACTIVE_SCENE = ("你现在想在主人安静时主动说点什么。可以分
 HINT_SCENE = ("【主动搭话提示】沉默超过 2 小时可以关心一下主人；"
               "早晨（7-9 点）可以自然地问候；同一话题不要重复。")
 
+TOOLS_HINT = ("【工具】你有表情、长期事实、文件、联网、动作工具可自主调用"
+              "（不确定能做什么就调 list_capabilities）；正文只写字，不要带标记。")
+
 
 def build_heartbeat_system(drives_st, persona_text, time_line, facts, cfg,
                            last_speak_content=""):
@@ -47,4 +50,5 @@ def build_heartbeat_system(drives_st, persona_text, time_line, facts, cfg,
         if last:
             hint += "上次你主动说过：「%s」，这次换个话题，别重复。" % last[:50]
         lines.append(hint)
+    lines.append(TOOLS_HINT)
     return "\n".join(lines)

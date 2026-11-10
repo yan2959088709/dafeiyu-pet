@@ -34,7 +34,8 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QHBoxLayout, QPushButton, QFrame, QDialog,
                                QToolButton, QLabel, QTextBrowser,
                                QScrollArea, QStyle,
-                               QGridLayout, QStackedWidget)
+                               QGridLayout, QStackedWidget,
+                               QPlainTextEdit)
 from skins import load_skin, SKIN_ORDER, SKIN_DISPLAY   # 皮肤注册表：每套皮肤独立模块
 
 
@@ -139,6 +140,7 @@ class _EnterCatcher(QObject):
     根因：QLineEdit 在 QDialog 里按 Enter，Qt 会查找并触发对话框里第一个
     autoDefault 按钮——本面板里恰是「✕」关闭按钮，导致每次发完消息面板被关。
     这里在事件到达输入框之前把回车消费掉，由自己触发发送逻辑。
+    Shift/Ctrl+回车放行给输入框：多行输入时的换行。
     """
 
     def __init__(self, cb):
@@ -148,6 +150,9 @@ class _EnterCatcher(QObject):
     def eventFilter(self, obj, ev):
         if ev.type() == QEvent.Type.KeyPress and \
                 ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if ev.modifiers() & (Qt.KeyboardModifier.ShiftModifier
+                                 | Qt.KeyboardModifier.ControlModifier):
+                return False
             self._cb()
             return True
         return False
@@ -323,6 +328,76 @@ class TokenStatsWindow(QWidget):
         super().mouseReleaseEvent(e)
 
 
+# ===== QQ 风格聊天气泡（HTML 常量与构建器；改视觉只需动这里）=====
+# 布局：一条消息 = 时间分隔（可选）+ 表格行（头像 / 尖角 / 圆角气泡）。
+# 限宽用「气泡格 auto + 尾部 spacer 格固定」实现：短消息气泡随内容收窄，
+# 长消息在 spacer 处换行，Qt 富文本不支持 max-width，这是等效替代。
+CHAT_CSS = """
+body{background:#f5f7fc;font-family:'Microsoft YaHei';font-size:14px;}
+table{margin-bottom:2px;}
+td{vertical-align:top;}
+.av{font-size:15px;font-weight:bold;color:#ffffff;text-align:center;}
+"""
+CHAT_AVATAR_W = 40       # 头像格宽（36px 图 + 4px 间距）
+CHAT_TAIL_W = 8          # 尖角格宽
+CHAT_BUBBLE_MAX = 236    # 气泡最大宽度（344 版心 − 头像 − 尖角 − 余量）
+CHAT_DIV_GAP = 300       # 时间分隔阈值（秒）：间隔超过它才插一行
+_TAIL_DIR = os.path.join(SPRITE_DIR, "dsh-pet", "chat")
+
+
+def _file_url(path):
+    return "file:///" + str(path).replace("\\", "/")
+
+
+def chat_time_divider(ts):
+    """居中的时间分隔行（细线 + 灰字），间隔过大时由 append_msg 插入。"""
+    label = time.strftime("%H:%M", time.localtime(ts))
+    return ('<table width="100%%" cellspacing="0" cellpadding="0" '
+            'style="margin:6px 0 8px 0;"><tr>'
+            '<td><div style="border-top:1px solid #e6eaf2;"></div></td>'
+            '<td width="76" style="text-align:center;color:#98a2b8;'
+            'font-size:11px;">%s</td>'
+            '<td><div style="border-top:1px solid #e6eaf2;"></div></td>'
+            '</tr></table>' % label)
+
+
+def chat_bubble_html(text, who):
+    """一条 QQ 风格气泡：who="pet" 左侧白气泡（logo 头像），"user" 右侧蓝气泡。
+
+    text 必须是已转义、<br> 已就绪的气泡内容（表情/图片 <img> 由调用方拼入）。
+    尖角是 PNG 资源：Qt 富文本既没有尖角字形（微软雅黑无 U+25C0），
+    也不支持 CSS 边框三角技巧，两者都实测渲染不出来。
+    """
+    if who == "user":
+        return ('<table cellspacing="0" cellpadding="0" align="right"><tr>'
+                '<td width="%d"></td>'
+                '<td><div style="background:#5b8cff;'
+                'border-radius:12px;border-top-right-radius:3px;'
+                'padding:8px 11px;color:#ffffff;">%s</div></td>'
+                '<td width="%d" style="padding-top:11px;">'
+                '<img src="%s" width="8" height="11"></td>'
+                '<td width="%d" style="padding-left:8px;">'
+                '<div class="av" style="background:#8fa3c8;border-radius:8px;'
+                'height:36px;line-height:36px;">主</div></td>'
+                '</tr></table>'
+                % (344 - CHAT_AVATAR_W - CHAT_TAIL_W - CHAT_BUBBLE_MAX, text,
+                   CHAT_TAIL_W, _file_url(os.path.join(_TAIL_DIR, "tail_right.png")),
+                   CHAT_AVATAR_W))
+    return ('<table cellspacing="0" cellpadding="0"><tr>'
+            '<td width="%d" style="padding-right:8px;">'
+            '<img src="%s" width="36" height="36"></td>'
+            '<td width="%d" style="padding-top:11px;">'
+            '<img src="%s" width="8" height="11"></td>'
+            '<td><div style="background:#ffffff;border:1px solid #e6eaf2;'
+            'border-radius:12px;border-top-left-radius:3px;'
+            'padding:8px 11px;color:#2a3140;">%s</div></td>'
+            '<td width="%d"></td>'
+            '</tr></table>'
+            % (CHAT_AVATAR_W, _file_url(LOGO_PATH), CHAT_TAIL_W,
+               _file_url(os.path.join(_TAIL_DIR, "tail_left.png")), text,
+               344 - CHAT_AVATAR_W - CHAT_TAIL_W - CHAT_BUBBLE_MAX))
+
+
 class ChatPanel(QDialog):
     """聊天面板：气泡消息流 + 输入框 + 记忆管理（🧠 查看 / 🧹 清空）"""
 
@@ -362,9 +437,21 @@ class ChatPanel(QDialog):
         self.logo.setFixedSize(24, 24)
         self.logo.setStyleSheet("background:transparent;border:none;")
         hl.addWidget(self.logo)
+        # 名称 + 在线状态（QQ 式双行抬头）
+        title_box = QWidget()
+        title_box.setStyleSheet("background:transparent;")
+        tbl = QVBoxLayout(title_box)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(0)
         self.title = QLabel("🐋 鲸鱼娘")
-        self.title.setStyleSheet("color:white;font-size:15px;font-weight:bold;background:transparent;")
-        hl.addWidget(self.title)
+        self.title.setStyleSheet("color:white;font-size:15px;font-weight:bold;"
+                                 "background:transparent;")
+        tbl.addWidget(self.title)
+        self.status = QLabel("● 在线")
+        self.status.setStyleSheet("color:rgba(255,255,255,0.75);font-size:10px;"
+                                  "background:transparent;")
+        tbl.addWidget(self.status)
+        hl.addWidget(title_box)
         hl.addStretch()
         for tip, cb, pix in (("看看她记住了什么", self._on_mem, QStyle.StandardPixmap.SP_FileDialogInfoView),
                              ("清空记忆", self._on_clear, QStyle.StandardPixmap.SP_TrashIcon)):
@@ -460,61 +547,69 @@ class ChatPanel(QDialog):
         self.chip_row.hide()
         pcl.addWidget(self.chip_row)
 
-        # ---- 输入区 ----
+        # ---- 输入区（QQ 式：工具栏在上，多行输入框在下，发送在工具栏右侧）----
         bar = QFrame()
         bar.setStyleSheet("QFrame{background:#ffffff;border-top:1px solid #edf0f5;"
                           "border-bottom-left-radius:17px;"
                           "border-bottom-right-radius:17px;}")
-        bl = QHBoxLayout(bar)
-        bl.setContentsMargins(14, 10, 12, 12)
-        bl.setSpacing(8)
-        self.input = QLineEdit()
+        bl = QVBoxLayout(bar)
+        bl.setContentsMargins(12, 8, 10, 10)
+        bl.setSpacing(6)
+
+        # 工具栏行：表情 / 图片 / 截屏（左） + 发送（右）
+        tools = QHBoxLayout()
+        tools.setSpacing(4)
+        _tool_css = ("QPushButton{background:transparent;border:none;"
+                     "border-radius:8px;color:#5b6b88;font-size:12px;"
+                     "padding:4px 8px;}"
+                     "QPushButton:hover{background:#eef1f8;color:#3d5cd0;}")
+        # 表情按钮：弹出可搜索的网格选择器，点选插入 <sticker:标签> 到光标处
+        self.sticker_btn = QPushButton("表情")
+        self.sticker_btn.setToolTip("插入表情")
+        self.sticker_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sticker_btn.setStyleSheet(_tool_css)
+        self.sticker_btn.clicked.connect(self._open_sticker_panel)
+        tools.addWidget(self.sticker_btn)
+        self.image_btn = QPushButton("图片")
+        self.image_btn.setToolTip("上传图片（PNG / JPEG / WebP / GIF）")
+        self.image_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.image_btn.setStyleSheet(_tool_css)
+        self.image_btn.clicked.connect(self._pick_image)
+        tools.addWidget(self.image_btn)
+        self.shot_btn = QPushButton("截屏")
+        self.shot_btn.setToolTip("截取当前屏幕")
+        self.shot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.shot_btn.setStyleSheet(_tool_css)
+        self.shot_btn.clicked.connect(self._grab_screen)
+        tools.addWidget(self.shot_btn)
+        tools.addStretch(1)
+        self.send_btn = QPushButton("发送")
+        self.send_btn.setFixedSize(58, 28)
+        self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.send_btn.setStyleSheet(
+            "QPushButton{background:#5b8cff;border:none;border-radius:14px;"
+            "color:white;font-size:12px;font-weight:bold;}"
+            "QPushButton:hover{background:#4a7cf0;}"
+            "QPushButton:pressed{background:#3d6ce0;}")
+        self.send_btn.clicked.connect(self._on_submit)
+        tools.addWidget(self.send_btn)
+        bl.addLayout(tools)
+
+        # 多行输入框：回车发送、Shift+回车换行（见 _EnterCatcher）
+        self.input = QPlainTextEdit()
         self.input.setPlaceholderText("跟她说点什么…（试试：记住我喜欢咖啡）")
+        self.input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.input.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.input.setFixedHeight(56)
         self.input.setStyleSheet(
-            "QLineEdit{background:#f2f4f9;border:none;border-radius:16px;"
-            "padding:8px 14px;font-size:14px;color:#26303e;}"
-            "QLineEdit:focus{border:1px solid #b7c9ff;}")
-        # 回车由 eventFilter 接管：只发消息、绝不关闭面板（见 _EnterCatcher）
+            "QPlainTextEdit{background:#f2f4f9;border:none;border-radius:12px;"
+            "padding:6px 10px;font-size:14px;color:#26303e;}"
+            "QPlainTextEdit:focus{border:1px solid #b7c9ff;}")
         self._enter_catcher = _EnterCatcher(self._on_submit)
         self.input.installEventFilter(self._enter_catcher)
         self._paste_catcher = _PasteCatcher(self._attach_from_blob)
         self.input.installEventFilter(self._paste_catcher)
-        # 表情按钮：弹出可搜索的网格选择器，点选插入 <sticker:标签> 到光标处
-        self.sticker_btn = QPushButton("表情")
-        self.sticker_btn.setFixedSize(44, 36)
-        self.sticker_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.sticker_btn.setToolTip("插入表情标记")
-        self.sticker_btn.setStyleSheet(
-            "QPushButton{background:#eef1f8;border:none;border-radius:10px;"
-            "color:#5b6b88;font-size:12px;}"
-            "QPushButton:hover{background:#e0e6f3;color:#3d5cd0;}")
-        self.sticker_btn.clicked.connect(self._open_sticker_panel)
-        self.image_btn = QPushButton("图片")
-        self.image_btn.setFixedSize(44, 36)
-        self.image_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.image_btn.setToolTip("上传图片（PNG / JPEG / WebP / GIF）")
-        self.image_btn.setStyleSheet(self.sticker_btn.styleSheet())
-        self.image_btn.clicked.connect(self._pick_image)
-        bl.addWidget(self.image_btn)
-        self.shot_btn = QPushButton("截屏")
-        self.shot_btn.setFixedSize(44, 36)
-        self.shot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.shot_btn.setToolTip("截取当前屏幕")
-        self.shot_btn.setStyleSheet(self.sticker_btn.styleSheet())
-        self.shot_btn.clicked.connect(self._grab_screen)
-        bl.addWidget(self.shot_btn)
-        bl.addWidget(self.sticker_btn)
         bl.addWidget(self.input, 1)
-        self.send_btn = QPushButton("↑")
-        self.send_btn.setFixedSize(36, 36)
-        self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.send_btn.setStyleSheet(
-            "QPushButton{background:#5b8cff;border:none;border-radius:18px;"
-            "color:white;font-size:18px;font-weight:bold;}"
-            "QPushButton:hover{background:#4a7cf0;}"
-            "QPushButton:pressed{background:#3d6ce0;}")
-        self.send_btn.clicked.connect(self._on_submit)
-        bl.addWidget(self.send_btn)
         pcl.addWidget(bar)
 
         # ===== 视图二：会话列表视图（完整会话管理）=====
@@ -777,41 +872,63 @@ class ChatPanel(QDialog):
         self.title.setText(name)
 
     def _render_view(self):
-        """把全部消息块重绘到 QTextBrowser（流式增量即逐次 setHtml，实现打字机效果）"""
-        self.view.setHtml("".join(self._msg_blocks))
+        """把全部消息块重绘到 QTextBrowser（流式增量即逐次 setHtml，实现打字机效果）
+
+        滚动到底必须等布局之后：setHtml 同步返回时滚动条范围还是旧内容的，
+        紧接着 setValue(maximum()) 会停在一屏之前——紧循环灌消息（重载/沙箱驱动）
+        时整个视图都停在旧位置。所以置底挪到事件循环里跑，且只在原本就贴底时
+        才跟下去（用户上翻看历史时不被新消息拽走，与 QQ 一致）。
+        """
+        at_bottom = self._scroll_at_bottom()
+        self.view.setHtml("<html><head><style>%s</style></head><body>%s</body></html>"
+                          % (CHAT_CSS, "".join(self._msg_blocks)))
+        if at_bottom:
+            QTimer.singleShot(0, self._scroll_to_bottom)
+
+    def _scroll_at_bottom(self):
+        sb = self.view.verticalScrollBar()
+        return sb.value() >= sb.maximum() - 4
+
+    def _scroll_to_bottom(self):
         sb = self.view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _sticker_html(self, sticker, align="left"):
-        """把表情文件名转成聊天气泡下方的 <img> HTML（命中映射则显示，否则空串）。"""
-        if not sticker:
-            return ""
-        path = stickers.path_for(sticker)
-        if not os.path.exists(path):
-            return ""
-        return ('<div align="{1}"><img src="file:///{0}" width="{2}"></div><br>'
-                .format(path.replace("\\", "/"), align, stickers.THUMB_W))
+    def _bubble_content(self, text, sticker, image):
+        """气泡内容：转义文本 + 表情/图片缩略图（都嵌在气泡内部，QQ 式）。
 
-    def _image_html(self, path, align="left", width=140):
-        """把附件文件转成聊天气泡下方的 <img> HTML（文件不在则空串）。"""
-        if not path or not os.path.exists(path):
-            return ""
-        return ('<div align="{1}"><img src="file:///{0}" width="{2}"></div><br>'
-                .format(str(path).replace("\\", "/"), align, width))
+        纯占位消息（气泡里只有表情或只有图片时）不留 "[表情]"/"[图片]" 文字——
+        缩略图已经渲染出来了，占位符只是无图可显时的兜底。
+        """
+        safe = html.escape(str(text if text is not None else "").strip())
+        safe = safe.replace("\n", "<br>")
+        parts = []
+        if sticker and os.path.exists(stickers.path_for(sticker)):
+            if safe in ("", "[表情]"):
+                safe = ""
+            parts.append('<img src="%s" width="%d">'
+                         % (_file_url(stickers.path_for(sticker)), stickers.THUMB_W))
+        if image and os.path.exists(image):
+            if safe in ("", "[图片]"):
+                safe = ""
+            parts.append('<img src="%s" width="140">' % _file_url(image))
+        if not safe and not parts:
+            safe = "…"
+        body = ("<br>".join([safe] + parts)) if safe else "".join(parts)
+        return body
 
-    def append_msg(self, who, text, sticker=None, image=None):
-        safe = html.escape(str(text).strip()).replace("\n", "<br>")
-        if who == "user":
-            blk = ('<div align="right"><span style="background-color:#5b8cff;'
-                   'color:#ffffff;font-size:14px;">&nbsp;{0}&nbsp;</span></div><br>')
-        else:
-            blk = ('<div align="left"><span style="background-color:#eef1f8;'
-                   'color:#333a45;font-size:14px;">&nbsp;{0}&nbsp;</span></div><br>')
-        blk = blk.format(safe)
-        if sticker:
-            blk += self._sticker_html(sticker, align="right" if who == "user" else "left")
-        if image:
-            blk += self._image_html(image, align="right" if who == "user" else "left")
+    def append_msg(self, who, text, sticker=None, image=None, ts=None):
+        """追加一条消息（QQ 气泡：头像 + 尖角 + 圆角）。
+
+        ts=消息时间戳：与上条间隔超过 CHAT_DIV_GAP 时在其上方插入时间分隔行；
+        历史里的旧消息没有 ts，跳过分隔（不造假时间）。
+        """
+        blk = ""
+        if ts:
+            last = getattr(self, "_last_div_ts", None)
+            if last is None or ts - last > CHAT_DIV_GAP:
+                blk += chat_time_divider(ts)
+            self._last_div_ts = ts
+        blk += chat_bubble_html(self._bubble_content(text, sticker, image), who)
         self._msg_blocks.append(blk)
         self._render_view()
 
@@ -826,20 +943,15 @@ class ChatPanel(QDialog):
         if self._stream_block_idx is None or not self._msg_blocks:
             return
         safe = html.escape(str(text)).replace("\n", "<br>")
-        blk = ('<div align="left"><span style="background-color:#eef1f8;'
-               'color:#333a45;font-size:14px;">&nbsp;{0}&nbsp;</span></div><br>').format(safe)
-        self._msg_blocks[self._stream_block_idx] = blk
+        self._msg_blocks[self._stream_block_idx] = chat_bubble_html(safe, "pet")
         self._render_view()
 
     def stream_finalize(self, text, sticker=None):
         """流式回复收尾：把当前流式块重写为干净文本（去掉 <sticker:…> 标记）+ 表情图。"""
         if self._stream_block_idx is None or not self._msg_blocks:
             return
-        safe = html.escape(str(text).strip()).replace("\n", "<br>")
-        blk = ('<div align="left"><span style="background-color:#eef1f8;'
-               'color:#333a45;font-size:14px;">&nbsp;{0}&nbsp;</span></div><br>').format(safe)
-        blk += self._sticker_html(sticker)
-        self._msg_blocks[self._stream_block_idx] = blk
+        self._msg_blocks[self._stream_block_idx] = chat_bubble_html(
+            self._bubble_content(text, sticker, None), "pet")
         self._render_view()
 
     def stream_end(self):
@@ -849,6 +961,7 @@ class ChatPanel(QDialog):
     def clear_view(self):
         self._msg_blocks = []
         self._stream_block_idx = None
+        self._last_div_ts = None
         self._render_view()
 
     def set_busy(self, busy):
@@ -1016,7 +1129,7 @@ class ChatPanel(QDialog):
         self._set_sticker(tag)
 
     def _on_submit(self):
-        text = self.input.text().strip()
+        text = self.input.toPlainText().strip()
         if self._sticker_tag:
             text = (text + " <sticker:%s>" % self._sticker_tag).strip()
         att = getattr(self, "_attachment", None)
@@ -1446,7 +1559,7 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
                 from pet import chat_attach
                 img = chat_attach.path_for(P.attachments, m["attachment"])
             self.chat_panel.append_msg("user" if is_user else "pet", content,
-                                       sticker=st, image=img)
+                                       sticker=st, image=img, ts=m.get("ts"))
 
     def _load_earlier(self):
         """历史分页：每次多加载 14 条（上限仍受 max_history 约束）。"""
@@ -1549,9 +1662,10 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
                 save = item[1] if len(item) > 1 else True
                 sticker = item[2] if len(item) > 2 else None
                 meme = item[3] if len(item) > 3 else None   # Harness FC 意图（表情包）
+                anim = item[4] if len(item) > 4 else None   # Harness FC 意图（动作）
                 streamed = self._stream_accum is not None
                 self._chat_out(text, save=save, streamed=streamed,
-                               sticker=sticker, meme=meme)
+                               sticker=sticker, meme=meme, anim=anim)
                 if streamed:
                     # 流式收尾：重写为去掉标记的干净文本 + 表情缩略图
                     self.chat_panel.stream_finalize(stickers.strip_marks(self._stream_accum),

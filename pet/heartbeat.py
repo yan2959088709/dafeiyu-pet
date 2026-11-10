@@ -299,7 +299,7 @@ class HeartbeatEngine:
             last_content)
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": HB_NUDGE}]
-        state = {"meme": None, "sticker": None}
+        state = {"meme": None, "sticker": None, "anim": None}
         reply, usage, state = pet_harness.run_turn(
             chat, messages, key, state=state, transport=self.transport)
         # 真的跑了 LLM 的这一轮：占一份 24h 尝试配额（含随后判定的静默）
@@ -337,7 +337,8 @@ class HeartbeatEngine:
         # （落盘失败不该把回复吞掉）；反过来 _chat_queue 抛桩（出口不可用）
         # 时这句话没上屏，只能算一次 attempt——finally 保证它落盘，冷却生效
         try:
-            chat._chat_queue.append((reply, False, sticker, state.get("meme")))
+            chat._chat_queue.append((reply, False, sticker, state.get("meme"),
+                                     state.get("anim")))
             with chat._mem_lock:
                 cur = next((s for s in chat._sessions if s["id"] == sid), None)
                 if cur is not None and cur["messages"] is hist:

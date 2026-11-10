@@ -29,10 +29,18 @@ from . import time_context as pet_time
 from .pricing import DS_BASE_URL, DS_MODEL, calc_turn_cost
 from .storage import P
 
-# Harness 时代的表达规范：目录不再进提示词，改由 FC 工具按需检索发送
-HARNESS_HINT = ("【表达工具】想发表情包或小表情时用工具：先 search_memes / search_stickers "
-                "检索库里有什么，再 send_meme / send_sticker 发送，每轮各限一个；"
-                "正文只写字，不要把任何标记写进回复。")
+# Harness 时代的表达规范：目录不再进提示词，改由 FC 工具按需检索发送。
+# 工具清单写进提示词，模型才知道自己能做什么（list_capabilities 供运行时自查）。
+HARNESS_HINT = (
+    "【能力工具】你可以自主调用这些工具：\n"
+    "- 表情：search_memes / send_meme（表情包），search_stickers / send_sticker（小表情），每轮各限一个；\n"
+    "- 记忆：remember_fact / forget_fact / search_memories（关于主人的长期事实，最多 20 条）；\n"
+    "- 文件：list_dir / read_file / write_file（只能访问程序目录；config、会话、记忆等运行期数据文件禁止写入）；\n"
+    "- 联网：web_search / web_fetch（主动搜索和抓取公网网页，内网地址会被拒绝）；\n"
+    "- 动作：list_actions / play_animation（用身体动作表达情绪，每轮最多一个）；\n"
+    "- list_capabilities：查看自己的完整能力清单。\n"
+    "需要时自主调用；正文只写字，不要把任何标记写进回复。"
+)
 
 
 class ChatMixin:
@@ -172,12 +180,14 @@ class ChatMixin:
         return self._call_ds(ai_text, user_sticker=tag, attachment=attachment)
 
     def _chat_out(self, text, save=True, user_text=None, streamed=False, sticker=None,
-                  user_sticker=None, meme=None):
+                  user_sticker=None, meme=None, anim=None):
         """主线程：鲸鱼娘回复 → 面板 + 气泡 (+ 历史/记忆)
         streamed=True 表示回复已在面板上流式逐字显示过，此处不再重复追加。
         sticker=表情文件名：写入历史条目并在聊天气泡下方渲染缩略图。
         user_sticker=用户消息的表情标签：随 user 历史条目保存，供重渲染与 AI 上下文感知。
-        meme=FC 意图传来的表情包名：优先于正文 [图:] 标记解析（后者是 fallback）。"""
+        meme=FC 意图传来的表情包名：优先于正文 [图:] 标记解析（后者是 fallback）。
+        anim=FC 意图要播放的动作名（play_animation 工具）：手动级优先级，播放即跳过
+        关键词动作映射（模型自己选了表达方式，不再按正文猜）。"""
         if self._drives is not None:
             self._drives.apply_ai_reply(time.time())
         text, parsed_meme = pet_memes.parse_reply(text, self._meme_pool())
@@ -207,7 +217,10 @@ class ChatMixin:
             self.chat_panel.append_msg("pet", text, sticker=sticker,
                                        ts=int(time.time()))
         self.say(stickers.strip_marks(text), dur=4.2, prio=1)  # 气泡只显示文字，不显示标记
-        self._react_to_reply(text)               # 根据回复内容做出相应动作（缺陷4）
+        if anim and pet_harness.anim_available(self, anim):
+            self._start_emote(anim, dur=8.0, prio="manual")   # 模型自选动作优先
+        else:
+            self._react_to_reply(text)           # 根据回复内容做出相应动作（缺陷4）
         self._speak_reply(text)                  # 语音播报（voiceEnabled 时）
         self._notify_reply(text)                 # 窗口不在前台时弹系统通知
         if meme and self.cfg.get("chatImageEnabled", True):
@@ -470,7 +483,7 @@ class ChatMixin:
                     uitem["attachment"] = attachment["id"]
                 _persist(uitem)      # 先落 user：超时/报错路径重载也不会「没发过」
                 # Harness：带思考 + 工具自主决策（检索/发送表情），≤3 跳后给正文
-                state = {"meme": None, "sticker": None}
+                state = {"meme": None, "sticker": None, "anim": None}
                 reply, usage, state = pet_harness.run_turn(
                     self, messages, key, state=state)
                 reply = (reply or "").strip()
@@ -497,7 +510,8 @@ class ChatMixin:
                     self._stream_queue.append(reply[i:i + 2])
                     time.sleep(delay)
                 # 历史已存；主线程收尾（streamed=True 时重写为干净文本+表情）
-                self._chat_queue.append((reply, False, sticker, state.get("meme")))
+                self._chat_queue.append((reply, False, sticker, state.get("meme"),
+                                         state.get("anim")))
                 # 每轮消耗统计（Token 悬浮窗数据源；气泡提示仍受 show_turn_cost 控制）
                 if usage:
                     self._last_turn_cost = calc_turn_cost(DS_MODEL, usage) or 0.0

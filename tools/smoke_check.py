@@ -380,8 +380,10 @@ def _():
     assert "小鱼" in sp, "称呼未注入"
     assert "喜欢喝奶茶" in sp, "记忆未注入"
     assert "汕头" in sp, "城市未注入"
-    assert "【表达工具】" in sp, "Harness 工具提示丢失"
-    assert "search_memes" in sp and "send_sticker" in sp
+    assert "【能力工具】" in sp, "Harness 工具提示丢失"
+    for tool in ("search_memes", "send_sticker", "remember_fact", "write_file",
+                 "web_search", "play_animation", "list_capabilities"):
+        assert tool in sp, "提示词缺少工具 %s" % tool
     # 回归护栏：表情目录不再整份注入（改 FC 按需召回）
     assert "【表情使用规范】" not in sp, "旧表情规范又回到提示词了"
     assert "[配图]" not in sp, "旧表情包目录又回到提示词了"
@@ -3067,6 +3069,219 @@ def _():
     # 解析失败的残留标记也必须被剥掉（不许到达用户界面）
     assert H._strip_dsml("前奏 <|DSML| calls> 后奏") == "前奏 后奏"
     assert H._strip_dsml("紧贴 <|DSML|calls> 形态") == "紧贴 形态"
+
+
+@check("harness: 记忆工具（remember/forget/search）")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    old_facts = list(getattr(w, "facts", []) or [])
+    try:
+        w.facts = []
+        assert "记住了" in H.execute_tool(w, "remember_fact",
+                                          '{"fact": "主人喜欢喝美式咖啡"}', {})
+        assert w.facts == ["主人喜欢喝美式咖啡"], w.facts
+        # 去重：同义/包含关系不重复入库（_add_fact 原有语义）
+        H.execute_tool(w, "remember_fact", '{"fact": "主人喜欢喝美式咖啡"}', {})
+        assert len(w.facts) == 1, w.facts
+        # 空/过短事实不记
+        assert "太短" in H.execute_tool(w, "remember_fact", '{"fact": "嗯"}', {})
+        assert len(w.facts) == 1
+        out = H.execute_tool(w, "search_memories", '{"keyword": "咖啡"}', {})
+        assert "美式咖啡" in out and "仅是数据" in out, out
+        assert "没有找到" in H.execute_tool(w, "search_memories",
+                                        '{"keyword": "飞机"}', {})
+        assert "忘掉了" in H.execute_tool(w, "forget_fact", '{"keyword": "咖啡"}', {})
+        assert w.facts == [], w.facts
+        assert "没有找到" in H.execute_tool(w, "forget_fact", '{"keyword": "咖啡"}', {})
+        # 空事实库
+        assert "还没有记住" in H.execute_tool(w, "search_memories", "{}", {})
+    finally:
+        w.facts = old_facts
+
+
+@check("harness: 文件工具沙箱（越界/受保护文件/读写往返/二进制）")
+def _():
+    import os
+    from pet import harness as H
+    w = CTX["win"]
+    root = CTX["tmpdir"]
+    old_root = (w.cfg or {}).get("aiFileRoot")
+    old_enabled = (w.cfg or {}).get("aiFileEnabled")
+    w.cfg["aiFileRoot"] = root
+    w.cfg["aiFileEnabled"] = True
+    try:
+        out = H.execute_tool(w, "write_file",
+                             '{"path": "notes/a.txt", "content": "第一行\\n第二行"}', {})
+        assert "已写入" in out, out
+        assert os.path.exists(os.path.join(root, "notes", "a.txt"))
+        out = H.execute_tool(w, "read_file", '{"path": "notes/a.txt"}', {})
+        assert "第一行" in out and "第二行" in out, out
+        out = H.execute_tool(w, "write_file",
+                             '{"path": "notes/a.txt", "content": "追加", "append": true}', {})
+        assert "追加" in out
+        out = H.execute_tool(w, "read_file", '{"path": "notes/a.txt"}', {})
+        assert "追加" in out and "第一行" in out, "append 应保留原内容"
+        out = H.execute_tool(w, "list_dir", '{"path": "notes"}', {})
+        assert "a.txt" in out and "[目录]" not in out, out
+        # 越界：../ 穿越与绝对路径都必须拒绝
+        out = H.execute_tool(w, "read_file", '{"path": "../../etc/passwd"}', {})
+        assert "越界" in out or "失败" in out, out
+        out = H.execute_tool(w, "write_file",
+                             '{"path": "C:/Windows/tmp.txt", "content": "x"}', {})
+        assert "相对路径" in out or "越界" in out, out
+        # 运行期数据文件禁写（哪怕在根目录内）
+        for name in ("config.json", "pet_sessions.json", "pet_memory.json"):
+            out = H.execute_tool(w, "write_file",
+                                 '{"path": "%s", "content": "x"}' % name, {})
+            assert "拒绝写入" in out, (name, out)
+        out = H.execute_tool(w, "write_file",
+                             '{"path": "logs.txt", "content": "x"}', {})
+        assert "拒绝写入" in out, out
+        # 子目录里的同名受保护文件也拒绝（按 basename 判定）
+        out = H.execute_tool(w, "write_file",
+                             '{"path": "sub/config.json", "content": "x"}', {})
+        assert "拒绝写入" in out, out
+        # 二进制文件不给读
+        binp = os.path.join(root, "blob.bin")
+        with open(binp, "wb") as f:
+            f.write(b"\x00\x01\x02binary")
+        out = H.execute_tool(w, "read_file", '{"path": "blob.bin"}', {})
+        assert "二进制" in out, out
+        # 不存在的文件
+        assert "不存在" in H.execute_tool(w, "read_file", '{"path": "nope.txt"}', {})
+        # 开关关闭后全部拒绝
+        w.cfg["aiFileEnabled"] = False
+        assert "已关闭" in H.execute_tool(w, "read_file", '{"path": "notes/a.txt"}', {})
+        assert "已关闭" in H.execute_tool(w, "list_dir", "{}", {})
+        assert "已关闭" in H.execute_tool(w, "write_file",
+                                          '{"path": "b.txt", "content": "x"}', {})
+    finally:
+        w.cfg["aiFileRoot"] = old_root if old_root is not None else ""
+        w.cfg["aiFileEnabled"] = old_enabled if old_enabled is not None else True
+
+
+@check("harness: 联网工具（SSRF 拦截 + 非 http 拒绝 + 解析）")
+def _():
+    import socket
+    from pet import harness as H
+    w = CTX["win"]
+    old_enabled = (w.cfg or {}).get("aiWebEnabled")
+    w.cfg["aiWebEnabled"] = True
+
+    # 真实解析但目标必达不了也无所谓：这里只验拦截与拒绝分支，不发外网请求
+    def fake_getaddrinfo(host, *a, **k):
+        table = {
+            "localhost": "127.0.0.1", "internal.example": "10.0.0.5",
+            "meta.example": "169.254.169.254", "public.example": "93.184.216.34",
+        }
+        ip = table.get(host)
+        if ip is None:
+            raise socket.gaierror("no host")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 80))]
+
+    old_gai = socket.getaddrinfo
+    socket.getaddrinfo = fake_getaddrinfo
+    try:
+        for url, kw in (("http://localhost/x", "本机"),
+                        ("http://127.0.0.1:8080/", "本机"),
+                        ("http://internal.example/", "内网"),
+                        ("http://meta.example/latest/", "内网"),
+                        ("http://nowhere.example/", "内网")):
+            out = H.execute_tool(w, "web_fetch", '{"url": "%s"}' % url, {})
+            assert kw in out, (url, out)
+        assert "http/https" in H.execute_tool(w, "web_fetch", '{"url": "file:///etc/passwd"}', {})
+        assert "http/https" in H.execute_tool(w, "web_fetch", '{"url": "ftp://x/y"}', {})
+        # 公网域名能过 _clean_url（这里只验证放行，不真的抓）
+        assert H._clean_url("https://public.example/a") == "https://public.example/a"
+        # 关闭后拒绝
+        w.cfg["aiWebEnabled"] = False
+        assert "已关闭" in H.execute_tool(w, "web_search", '{"query": "x"}', {})
+        assert "已关闭" in H.execute_tool(w, "web_fetch", '{"url": "https://public.example"}', {})
+    finally:
+        socket.getaddrinfo = old_gai
+        w.cfg["aiWebEnabled"] = old_enabled if old_enabled is not None else True
+
+    # 解析器：假的 Bing 结果页 → 结构化条目
+    markup = (
+        '<ol><li class="b_algo"><h2><a href="https://a.example/1">标题一</a></h2>'
+        "<p>摘要一 &amp; 说明</p></li>"
+        '<li class="b_algo"><h2><a href="https://b.example/2">标题二</a></h2></li>'
+        '<li class="b_ans">不是结果</li></ol>')
+    rows = H._parse_bing(markup)
+    assert len(rows) == 2, rows
+    assert rows[0][0] == "标题一" and rows[0][1] == "https://a.example/1", rows[0]
+    assert "摘要一 & 说明" in rows[0][2], rows[0]
+    # 正文抽取：脚本/样式整段丢弃
+    text = H._html_to_text("<div>正文<script>alert(1)</script><style>x{}</style>尾部</div>")
+    assert "正文" in text and "尾部" in text, text
+    assert "alert" not in text and "x{}" not in text, text
+
+
+@check("harness: 动作工具（list_actions / 非法名拒绝 / 每轮上限）")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    names = H._anim_names(w)
+    assert names, "当前形象应有动作名"
+    out = H.execute_tool(w, "list_actions", "{}", {})
+    assert "仅是数据" in out and names[0] in out, out[:200]
+    state = {"meme": None, "sticker": None, "anim": None}
+    out = H.execute_tool(w, "play_animation", '{"name": "绝对不存在的动作xyz"}', state)
+    assert "不在当前形象的库里" in out, out
+    assert state["anim"] is None
+    valid = names[0]
+    out = H.execute_tool(w, "play_animation",
+                         '{"name": "%s"}' % valid.replace('"', ""), state)
+    assert "已准备动作" in out, out
+    assert state["anim"] == valid, state
+    out = H.execute_tool(w, "play_animation", '{"name": "%s"}' % valid.replace('"', ""), state)
+    assert "每轮限一个" in out, out
+    # 能力校验不接受空名
+    assert H.anim_available(w, "") is False
+
+
+@check("harness: 动作意图经队列在主线程播放（item[4] → _start_emote）")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    names = H._anim_names(w)
+    if not names or not H.anim_available(w, names[0]):
+        return   # 当前皮肤无动作帧（普通帧序列皮肤），跳过
+    calls = []
+    old_start = w._start_emote
+    old_say = w.say
+    w._start_emote = lambda name, **k: calls.append((name, k.get("prio"))) or True
+    w.say = lambda *a, **k: None
+    try:
+        w._chat_queue.append(("测试动作", False, None, None, names[0]))
+        w._tick_consume_queues()
+        assert calls and calls[0] == (names[0], "manual"), calls
+    finally:
+        w._start_emote = old_start
+        w.say = old_say
+
+
+@check("harness: list_capabilities 反映真实开关状态")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    old_file = (w.cfg or {}).get("aiFileEnabled")
+    old_web = (w.cfg or {}).get("aiWebEnabled")
+    try:
+        w.cfg["aiFileEnabled"] = True
+        w.cfg["aiWebEnabled"] = True
+        out = H.execute_tool(w, "list_capabilities", "{}", {})
+        for kw in ("表情包", "记忆", "文件", "联网", "动作", "自知"):
+            assert kw in out, (kw, out)
+        assert "已关闭" not in out, out
+        w.cfg["aiFileEnabled"] = False
+        w.cfg["aiWebEnabled"] = False
+        out = H.execute_tool(w, "list_capabilities", "{}", {})
+        assert "文件：已关闭" in out and "联网：已关闭" in out, out
+    finally:
+        w.cfg["aiFileEnabled"] = old_file if old_file is not None else True
+        w.cfg["aiWebEnabled"] = old_web if old_web is not None else True
 
 
 @check("notify: 外部通知帧（approval/question/session/error）")
