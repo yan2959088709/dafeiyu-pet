@@ -1457,6 +1457,9 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         self.last_system_check = 0
         self.last_battery_check = 0        # 电量关心轮询时钟
         self._battery_alerted = False      # 本轮放电已提醒过（插电后复位）
+        self.last_watch_check = 0          # 文件监看轮询时钟
+        self._watch_prev = None            # 上次快照（None=还没播种）
+        self._watch_events = None          # 待观察事件 deque（惰性建）
         self.t = 0
         self.jump_t = 0
         self.dragging = False
@@ -1902,6 +1905,15 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             self._roll_value()
             self.update()
 
+        # 文件系统事件感知：轮询快照 diff，新变化进 _watch_events 供下次
+        # 心跳观察（器灵的基本感知——下载文件夹来了新文件，她得知道）
+        if now_ms - self.last_watch_check > 10000:
+            self.last_watch_check = now_ms
+            try:
+                self._watch_poll()
+            except Exception:
+                pass
+
         # 实时令牌模式：周期刷新今日用量（platform usage 接口）
         if (self.cfg.get("usage_mode") == "token"
                 and self.cfg.get("ds_platform_token")
@@ -1911,6 +1923,34 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             threading.Thread(target=self._refresh_token_usage,
                              args=(self.cfg.get("ds_platform_token"),),
                              daemon=True).start()
+
+    def _watch_poll(self):
+        """轮询监看目录：快照 diff → _watch_events（上限 50，超出丢最旧）。
+
+        首轮只播种不产事件（否则启动即把整个目录当「新文件」刷屏）。
+        """
+        from pet import filewatch
+        dirs = [str(d) for d in (self.cfg.get("watchDirs") or [])
+                if isinstance(d, str) and d.strip()]
+        if not dirs:
+            self._watch_prev = {}
+            return
+        cur = filewatch.snapshot(dirs)
+        prev = self._watch_prev
+        if prev is None:
+            self._watch_prev = cur
+            return
+        self._watch_prev = cur
+        events = filewatch.diff(prev, cur)
+        if not events:
+            return
+        queue = self._watch_events
+        if queue is None:
+            from collections import deque
+            queue = deque(maxlen=filewatch.MAX_EVENTS)
+            self._watch_events = queue
+        for ev in events:
+            queue.append(ev)
 
     def _update_tray_tooltip(self):
         if self.pet_name:

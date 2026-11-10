@@ -24,6 +24,7 @@ from typing import Literal
 
 from pet import drives as pet_drives
 from pet import episodic as pet_episodic
+from pet import filewatch as pet_filewatch
 from pet import goals as pet_goals
 from pet import harness as pet_harness
 from pet import heartbeat_journal as pet_journal
@@ -352,6 +353,16 @@ class HeartbeatEngine:
             goals = pet_goals.active_text(5)
             if goals:
                 system += "\n【你当前的目标】\n" + goals
+            watch = getattr(chat, "_watch_events", None)
+            if watch:
+                # 观察到的变化：读了就消费（下次醒来只见新事件），她可以
+                # 自己决定管不管（ autonomy-over-gates：只呈报，不代决）
+                lines = [pet_filewatch.describe(e) for e in list(watch)[:10]]
+                system += "\n【你观察到的变化】\n" + "\n".join(lines)
+                try:
+                    watch.clear()
+                except Exception:
+                    pass
             life_state = pet_life_loop.load(P.life_state)
             last_user = float(getattr(self._drives_st, "last_user_message_time",
                                       0.0) or 0.0)

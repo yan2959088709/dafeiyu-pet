@@ -181,6 +181,7 @@ DEFAULT_CFG = {
     "aiShellTimeout": 15,
     "aiLocalFetch": True,
     "aiDshEnabled": False,
+    "watchDirs": [],
     "sandbox_dirs": [],
 }
 
@@ -440,6 +441,10 @@ def validate(cfg):
                                    if isinstance(d, str) and d.strip()]
         else:
             bad("sandbox_dirs", "沙盒目录必须是字符串或字符串数组，已按空处理", [])
+    # 文件监看目录：字符串数组；非数组按空处理（不监看任何目录）
+    watch = cfg.get("watchDirs")
+    if watch is not None and not isinstance(watch, list):
+        bad("watchDirs", "监看目录必须是字符串数组，已按空处理", [])
 
     # 命令执行（run_shell）：默认开，但白名单才是真闸门；白名单=可执行名数组；
     # 超时 5-60s。没配 aiShellAllow 时 harness 给起始白名单（系统信息类命令）

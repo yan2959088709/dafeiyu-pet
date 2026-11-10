@@ -43,7 +43,7 @@ HARNESS_HINT = (
     "- 定时：manage_schedule（到点说一句/弹窗提醒/关怀/写日记，add/list/remove/toggle）；\n"
     "- 心跳：manage_heartbeat（查看/开关/调整你自己的心跳节奏，status/on/off/set_interval）；\n"
     "- 目标：manage_goal（你自己的长期目标，心跳时自主推进）；\n"
-    "- 感知：system_status（电脑CPU/内存/电量/网络），active_window（主人在用什么程序、多久没动电脑）；\n"
+    "- 感知：system_status（电脑CPU/内存/电量/网络），active_window（主人在用什么程序、多久没动电脑），manage_watch（监看目录，文件有新变化醒来时告诉你）；\n"
     "- 行动：clipboard（读写剪贴板），open_target（打开白名单内文件/目录或网址）；\n"
     "- 截图：screenshot（主动截取屏幕画面并直接看到它，每轮限一次）；\n"
     "- 命令：run_shell（本机执行白名单内的命令，白名单外可申请主人审批）；\n"

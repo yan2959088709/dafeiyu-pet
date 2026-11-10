@@ -8549,6 +8549,161 @@ def _():
         w.cfg.update(old_cfg)
 
 
+@check("filewatch: 快照/diff/describe + 桌宠 _watch_poll 播种与事件")
+def _():
+    from pet import filewatch as FW
+    w = CTX["win"]
+    d = os.path.join(CTX["tmpdir"], "watchdir")
+    os.makedirs(os.path.join(d, "sub"), exist_ok=True)
+    a = os.path.join(d, "a.txt")
+    b = os.path.join(d, "sub", "b.txt")
+    with open(a, "w") as fh:
+        fh.write("1")
+    with open(b, "w") as fh:
+        fh.write("2")
+    os.utime(a, (1000.0, 1000.0))
+    snap1 = FW.snapshot([d])
+    assert set(snap1) == {a, b}, snap1          # 递归收子目录
+    with open(a, "w") as fh:
+        fh.write("123")
+    os.utime(a, (2000.0, 2000.0))
+    os.remove(b)
+    c = os.path.join(d, "c.txt")
+    with open(c, "w") as fh:
+        fh.write("3")
+    snap2 = FW.snapshot([d])
+    ev = FW.diff(snap1, snap2, now=100.0)
+    kinds = {os.path.basename(e["path"]): e["kind"] for e in ev}
+    assert kinds == {"a.txt": "modified", "b.txt": "deleted",
+                     "c.txt": "created"}, kinds
+    assert all(e["ts"] == 100.0 for e in ev), ev
+    assert [e["path"] for e in ev] == sorted(e["path"] for e in ev)
+    text = FW.describe({"path": a, "kind": "created", "ts": 0})
+    assert "新文件" in text and a in text, text
+    assert FW.snapshot(["不存在的目录"]) == {}
+    assert FW.diff({}, {}, now=1.0) == []
+    # 桌宠 _watch_poll：首轮播种无事件，再改动产事件；空配置清快照
+    old_cfg = dict(w.cfg)
+    old_prev = getattr(w, "_watch_prev", None)
+    old_events = getattr(w, "_watch_events", None)
+    try:
+        w.cfg["watchDirs"] = [d]
+        w._watch_prev = None
+        w._watch_events = None
+        w._watch_poll()
+        assert w._watch_prev and not w._watch_events, w._watch_events
+        with open(a, "w") as fh:
+            fh.write("1234")
+        w._watch_poll()
+        assert w._watch_events and len(w._watch_events) == 1, w._watch_events
+        assert w._watch_events[0]["kind"] == "modified", w._watch_events
+        w.cfg["watchDirs"] = []
+        w._watch_poll()
+        assert w._watch_prev == {} and len(w._watch_events) == 1, \
+            (w._watch_prev, w._watch_events)
+    finally:
+        w.cfg.clear()
+        w.cfg.update(old_cfg)
+        w._watch_prev = old_prev
+        w._watch_events = old_events
+
+
+@check("harness: manage_watch 增删查（沙盒校验/序号/落盘/能力清单）")
+def _():
+    from pet import config as C
+    from pet import harness as H
+    from pet.chat import HARNESS_HINT
+    w = CTX["win"]
+    names = {t["function"]["name"] for t in H.TOOLS}
+    assert "manage_watch" in names, names
+    assert "manage_watch" in HARNESS_HINT, HARNESS_HINT
+    assert C.DEFAULT_CFG["watchDirs"] == []
+    assert "watchDirs" in C.MANAGED_KEYS
+    probe = {"watchDirs": "not-a-list"}
+    C.validate(probe)
+    assert probe["watchDirs"] == [], probe
+    old_cfg = dict(w.cfg)
+    d = os.path.join(CTX["tmpdir"], "watchroot")
+    outside = os.path.join(CTX["tmpdir"], "outside")
+    os.makedirs(d, exist_ok=True)
+    os.makedirs(outside, exist_ok=True)
+    try:
+        w.cfg["aiFileRoot"] = d
+        out = H.execute_tool(w, "manage_watch",
+                             json.dumps({"action": "add", "path": outside}), {})
+        assert "越界" in out, out
+        out = H.execute_tool(w, "manage_watch",
+                             json.dumps({"action": "add", "path": d}), {})
+        assert "开始监看" in out, out
+        assert w.cfg["watchDirs"] == [d], w.cfg["watchDirs"]
+        saved = C.read_jsonc(C.P.config)
+        assert saved.get("watchDirs") == [d], saved.get("watchDirs")
+        out = H.execute_tool(w, "manage_watch",
+                             json.dumps({"action": "add", "path": d}), {})
+        assert "已经在监看" in out, out
+        out = H.execute_tool(w, "manage_watch",
+                             json.dumps({"action": "add",
+                                         "path": os.path.join(d, "nope")}), {})
+        assert "不存在" in out, out
+        out = H.execute_tool(w, "manage_watch",
+                             json.dumps({"action": "list"}), {})
+        assert "1. " in out and d in out, out
+        out = H.execute_tool(w, "manage_watch",
+                             json.dumps({"action": "remove", "path": "1"}), {})
+        assert "不再监看" in out and w.cfg["watchDirs"] == [], out
+        out = H.execute_tool(w, "manage_watch",
+                             json.dumps({"action": "xx"}), {})
+        assert "未知 action" in out, out
+        assert "manage_watch" in H._tool_capabilities(w)
+    finally:
+        w.cfg.clear()
+        w.cfg.update(old_cfg)
+        try:
+            w._save_cfg()
+        except Exception:
+            pass
+
+
+@check("heartbeat: 观察到的变化注入提示词并消费（_watch_events）")
+def _():
+    from collections import deque
+    from pet import harness as H
+    from pet.heartbeat import Decision
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_hist = list(w.chat_history)
+    old_sessions, old_sid = w._sessions, w._current_sid
+    old_events = getattr(w, "_watch_events", None)
+    seen = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        seen.append(messages[0]["content"])
+        return ({"content": "看见新文件了"}, None, "stop")
+
+    H.deepseek_transport = fake
+    w._watch_events = deque([
+        {"path": "D:/dl/报告.pdf", "kind": "created", "ts": 1000.0},
+        {"path": "D:/dl/旧文件.txt", "kind": "modified", "ts": 1001.0}])
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        eng._speak(Decision(action="speak", reason="ok", urgency=1.0, gates={}))
+        assert seen and "【你观察到的变化】" in seen[0], seen[0][:300]
+        assert "新文件：D:/dl/报告.pdf" in seen[0], seen[0]
+        assert "有改动：D:/dl/旧文件.txt" in seen[0], seen[0]
+        assert len(w._watch_events) == 0, w._watch_events
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        w._chat_queue.clear()
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        w._watch_events = old_events
+
+
 @check("memory_recall: 相关度/衰减/legacy/空context/K截断")
 def _():
     import time as _t

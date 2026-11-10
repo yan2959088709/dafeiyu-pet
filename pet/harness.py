@@ -51,7 +51,10 @@ ARG_MAX_CHARS = 64           # 工具参数字符串截断（防回灌放大）
 # （write_file 64K / manage_self_prompt 1500 / schedule 800 / run_shell 500 /
 # clipboard 4000）。这些参数的内容都不会回灌进上下文（工具结果只报
 # 长度/版本号/退出码）。
-ARG_LONG_KEYS = {"content", "note", "command", "text", "goal", "context"}
+# 不吃 64 字符通用截断的参数：长文本（下游各有更严 Cap）与路径（绝对路径
+# 动辄超过 64 字符，截断即毁掉这个参数）
+ARG_LONG_KEYS = {"content", "note", "command", "text", "goal", "context",
+                 "path"}
 DESC_MAX_CHARS = 80          # 本地素材描述截断（进上下文前清洗）
 FACT_MAX_CHARS = 60          # 记忆条目长度上限
 FILE_READ_MAX_CHARS = 8000   # 单次读文件返回上限
@@ -203,6 +206,16 @@ TOOLS = [
             "action": {"type": "string", "description": "read | write | undo"},
             "note": {"type": "string", "description": "write 时的新提示词，最多 1500 字"},
             "version": {"type": "integer", "description": "undo 时可指定版本号，省略=上一版"}},
+            "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "manage_watch",
+        "description": ("管理你监看的目录（文件系统感知）。action=add/remove/list。"
+                        "目录里出现新文件/改动/删除，会在你下次心跳醒来时作为"
+                        "「你观察到的变化」告诉你。只能监看白名单（沙盒）内的目录，"
+                        "remove 可以给 list 里的序号。"),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "add | remove | list"},
+            "path": {"type": "string", "description": "add/remove 的目录路径（remove 也可给序号）"}},
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "manage_heartbeat",
@@ -1353,6 +1366,64 @@ def delegate_enabled(win):
     return bool((getattr(win, "cfg", {}) or {}).get("aiDshEnabled", False))
 
 
+def _save_watch_cfg(win, dirs):
+    cfg = getattr(win, "cfg", None)
+    if cfg is None:
+        return
+    cfg["watchDirs"] = dirs
+    try:
+        win._save_cfg()
+    except Exception:
+        pass
+
+
+def _tool_watch(win, args):
+    """文件系统感知：监看目录的增/删/查（路径须过沙盒校验）。"""
+    action = str(args.get("action") or "").strip()
+    cfg = getattr(win, "cfg", {}) or {}
+    dirs = [str(d).strip() for d in (cfg.get("watchDirs") or [])
+            if isinstance(d, str) and d.strip()]
+    if action == "list":
+        if not dirs:
+            return "你还没有监看任何目录（add 一个，比如下载文件夹）"
+        lines = []
+        for i, d in enumerate(dirs, 1):
+            mark = "在" if os.path.isdir(d) else "不在（路径失效）"
+            lines.append("%d. %s（%s）" % (i, _clip(d, 120), mark))
+        return "\n".join(lines)
+    raw = str(args.get("path") or "").strip()
+    if action == "add":
+        if not raw:
+            return "add 需要 path（要监看的目录）"
+        real = os.path.realpath(os.path.expandvars(os.path.expanduser(raw)))
+        if not _inside_any_root(win, real):
+            return ("路径越界：只能监看白名单目录内的目录"
+                    "（主人可以在设置里把目录加进沙盒）")
+        if not os.path.isdir(real):
+            return "目录不存在：%s" % _clip(real, 120)
+        if real in dirs:
+            return "这个目录已经在监看了"
+        dirs.append(real)
+        _save_watch_cfg(win, dirs)
+        return ("开始监看：%s（有新变化我会在下次醒来时注意到）"
+                % _clip(real, 100))
+    if action == "remove":
+        if not raw:
+            return "remove 需要 path（或 list 里的序号）"
+        target = None
+        if raw.isdigit() and 1 <= int(raw) <= len(dirs):
+            target = dirs[int(raw) - 1]
+        else:
+            real = os.path.realpath(os.path.expandvars(os.path.expanduser(raw)))
+            target = real if real in dirs else (raw if raw in dirs else None)
+        if not target:
+            return "没有在监看这个目录（先 list 确认）"
+        dirs.remove(target)
+        _save_watch_cfg(win, dirs)
+        return "不再监看：%s" % _clip(target, 100)
+    return "未知 action：%s（add / remove / list）" % action
+
+
 def _tool_delegate(win, args):
     """把重活外包给执行内核（DSH）：与设置页/右键同一条 start_task 路。"""
     goal = _clip(args.get("goal") or "", 500).strip()
@@ -1539,7 +1610,8 @@ def _tool_capabilities(win):
         "9. 心跳：manage_heartbeat —— 查看/开关/调整你自己的心跳间隔（status/on/off/set_interval）",
         "10. 目标：manage_goal —— 你自己的长期目标（add/list/done/remove，进心跳由你自主推进）",
         "11. 感知：system_status（电脑的CPU/内存/电量/网络状态），"
-        "active_window（主人在用什么程序、多久没动电脑）",
+        "active_window（主人在用什么程序、多久没动电脑），"
+        "manage_watch（监看目录里的文件变化，醒来时呈报给你）",
         "12. 行动：clipboard（读写剪贴板），open_target（打开白名单内文件/目录或网址）",
         "13. 命令：run_shell —— 本机执行白名单命令（默认开；白名单外可申请主人审批）"
         if shell_enabled(win) else "13. 命令：已关闭（config.aiShellEnabled = false）",
@@ -1624,6 +1696,8 @@ def execute_tool(win, name, raw_args, state):
             return _tool_balance(win, args)
         if name == "delegate_task":
             return _tool_delegate(win, args)
+        if name == "manage_watch":
+            return _tool_watch(win, args)
         if name == "check_time":
             return _tool_time(win, args)
         if name == "active_window":
