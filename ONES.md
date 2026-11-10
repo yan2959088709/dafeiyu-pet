@@ -418,6 +418,17 @@
 
 > claude [x] 2026-11-10: TASK-020~025 総合批交付完成（commit 335bf49/12dd994/b3e3aaf/ab2e04d/ea9be36，另 92bd8f7 为前五批未提交工作的追加快捷提交）。冒烟 223→240（+17 检查），offscreen 与 windows 双平台全绿（windows 全量下 api 鉴权用例一次 flaky，单独复跑通过——端口/时序类环境性，非本次引入）。Gate 1：020/021 代理审查 1 High+5 Medium 全修复；022-025 终审代理跑批中。Gate 2 安全审计代理跑批中。ADR: docs/decisions/2026-11-10-life-loop-memory.md。遗留：桌宠需重启加载新代码（用户未请求重启）；TASK-009 剩余流式 transport 仍未做（非流式为刻意决策）。
 
+> claude [x] 2026-11-10: 门禁代理全部返回并处置完毕（commit 37684ab，冒烟 240→242 双平台绿）。安全审计 1 High + 6 中低级、终审 2 High + 6 Medium + 若干 Low 全部修复：①写保护扩面（看门狗 bat/quit.flag/桌宠.py/启动桌宠.bat + 可执行脚本扩展名禁写 + config/api-runtime 禁读）②PowerShell .lnk 改环境变量传值（单引号注入面归零）③文件名进提示词剥控制字符+限长+数据声明 ④delegate_task 拒 - 开头 goal ⑤监看目录 TOCTOU 复核 + junction 剪除 + 噪声目录排除 ⑥start_task 门禁原子化 + UI busy 前置 ⑦**H1 看门狗 bat 改 mbcs 编码**（cmd 按 ANSI/OEM 解析，UTF-8 会让中文路径静默失败——自启等于瘫痪，真 cmd 探针用例钉住）⑧**H2 托盘退出也写 quit.flag**（漏了这条主人关不掉桌宠）。审计遗留（自觉力小/设计层）登记 TASK-026。
+
+### TASK-026: 门禁审计遗留项（外泄链硬化/看门狗握手/边角）
+- **Executor**: claude
+- **Status**: [ ]
+- **Dependencies**: none
+- **Contract**: TASK-020~025 门禁代理（安全+终审）处置后剩余项
+- **Acceptance**: 逐项裁决或修复后勾销
+- **Handoff log**:
+  > claude [ ] 2026-11-10: 登记：①read_file/web_fetch 外泄链剩余侧——工具输出脱密钥样式（sk-/Bearer  Pattern 掩码）+ 更广的禁读名单复审（config.json/api-runtime.json 已禁）；②看门狗 vs CrashGuard 双重重拉握手（CrashGuard 子进程写 recovered 标记、bat 见标记不拉——当前靠单实例锁仲裁，最坏多几次进程拉起，看门狗 5 次预算后自停）；③设置页保存失败后 .lnk 指向错误 target 不重建的边角；④list_dir 等错误回显路径 _clip；⑤TASK-009 剩余流式 transport（非流式为刻意决策，排期时重申）。
+
 > claude [Blueprint] 2026-11-06（TASK-008，Harness Phase 1）：已获用户批准「批准并执行」。
 > DATA FLOW: 输入=用户消息(+表情 chip/附件)；变换=Harness loop（组上下文→带工具请求→执行工具回喂→≤3 跳→最终回复），表情目录从每轮提示词移除改为工具按需召回；输出=最终回复+表情意图（meme/sticker 各 ≤1），经既有 _chat_out 渲染；状态变化=chat_history 仍只落 user+assistant，tool 消息瞬态不落盘。
 > MODULE: ①pet/harness.py（新）：loop + 工具注册表 + 本地检索 + 可注入 transport ②pet/chat.py：_call_ds 委托 harness（保留 busy 排队/返回值），_build_system_prompt 移除目录两块，废除 90 字截断 ③桌宠.py：_chat_queue 元组扩展携带 meme 意图 ④tools/smoke_check.py：假 transport 两跳链路用例。
