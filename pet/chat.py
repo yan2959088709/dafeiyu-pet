@@ -36,7 +36,7 @@ from .storage import P
 HARNESS_HINT = (
     "【能力工具】你可以自主调用这些工具：\n"
     "- 表情：search_memes / send_meme（表情包），search_stickers / send_sticker（小表情），每轮各限一个；\n"
-    "- 记忆：remember_fact / forget_fact / search_memories（关于主人的长期事实，最多 200 条）；\n"
+    "- 记忆：remember_fact / forget_fact / search_memories / manage_memory（关于主人的长期事实，最多 200 条；manage_memory 可 review 全部、consolidate 巩固合并、forget 按序号淡忘）；\n"
     "- 文件：list_dir / read_file / write_file（只能访问白名单目录；config、会话、记忆等运行期数据文件禁止写入）；\n"
     "- 联网：web_search / web_fetch（主动搜索和抓取网页；本机/内网地址默认拒绝）；\n"
     "- 动作：list_actions / play_animation（用身体动作表达情绪，每轮最多一个）；\n"
@@ -49,6 +49,9 @@ HARNESS_HINT = (
     "- 命令：run_shell（本机执行白名单内的命令，白名单外可申请主人审批）；\n"
     "- 自我：feel_heartbeat（查看自己的心跳/精力/情绪），set_mood（自己决定情绪），"
     "manage_self_prompt（查看/修改/回滚你自己写的提示词）；\n"
+    "- 生命循环：每次心跳醒来选一个意图写在回复开头，格式【意图：休息|学习|整理|玩耍|关心|开口|静默】"
+    "（不写就当开口；学习/整理只有你自己知道，玩耍/关心/开口主人会看到）；\n"
+    "- 自查：query_balance（你的令牌余额），check_time（现在的日期/星期/时段）；\n"
     "- list_capabilities：查看自己的完整能力清单。\n"
     "需要时自主调用；正文只写字，不要把任何标记写进回复。"
 )

@@ -10,6 +10,8 @@ import time
 
 import requests
 
+from . import log as pet_log
+from . import memory_maintain
 from . import memory_recall
 from .pricing import DS_BASE_URL, DS_MODEL
 from .storage import P, load_json
@@ -143,25 +145,61 @@ class MemoryMixin:
         except Exception:
             return ""
 
+    def _archive_facts(self, items, reason):
+        """软遗忘：被淘汰的事实写 memory_archive.jsonl，不硬删。
+
+        归档失败返回 None——调用方必须据此放弃本轮淘汰（数据不丢优先于
+        存储干净）。
+        """
+        if not items:
+            return []
+        records = memory_maintain.archive_records(
+            items, getattr(self, "_fact_meta", None) or {}, reason)
+        if not memory_maintain.append_archive(P.memory_archive, records):
+            pet_log.warn("记忆归档失败（%s），本轮不淘汰 %d 条"
+                         % (reason, len(items)))
+            return None
+        return records
+
     def _expire_temp_facts(self):
-        """临时事实隔天淡出：超 TTL 的临时条目直接丢，长期条目不动。"""
+        """临时事实隔天淡出：超 TTL 且被跨时段反复 recall 过的升长期，
+        其余归档后摘掉（软删，不硬丢）；长期条目不动。
+
+        分类与变更都在 _mem_lock 内；归档先于任何变更——归档失败则整体
+        放弃本轮（返回 False，内存里也不留半点改动）。
+        """
         meta = getattr(self, "_fact_meta", None)
         meta = meta if isinstance(meta, dict) else {}
         now = time.time()
-        dropped = []
-        for f in list(self.facts):
-            item = meta.get(f)
-            if not isinstance(item, dict) or item.get("kind") != KIND_TEMP:
-                continue
-            ts = _num(item.get("ts"), 0.0)
-            if ts > 0 and now - ts > TEMP_TTL_SEC:
-                dropped.append(f)
-        if not dropped:
-            return False
         with self._mem_lock:
-            self.facts = [f for f in self.facts if f not in dropped]
-            for f in dropped:
-                meta.pop(f, None)
+            # meta 快照也必须在锁内取：_add_fact/_tool_memory 会在锁内整体
+            # 替换 self._fact_meta，锁外取到的是过期字典，晋升会写丢
+            meta = getattr(self, "_fact_meta", None)
+            meta = meta if isinstance(meta, dict) else {}
+            promote, dropped = [], []
+            for f in list(self.facts):
+                item = meta.get(f)
+                if not isinstance(item, dict) or item.get("kind") != KIND_TEMP:
+                    continue
+                ts = _num(item.get("ts"), 0.0)
+                if ts > 0 and now - ts > TEMP_TTL_SEC:
+                    if memory_maintain.promotable(item, now):
+                        promote.append(f)
+                    else:
+                        dropped.append(f)
+            if not promote and not dropped:
+                return False
+            if dropped and self._archive_facts(dropped, "temp_expired") is None:
+                return False
+            for f in promote:
+                item = meta.setdefault(
+                    f, {"ts": 0.0, "last_access": 0.0, "hits": 0,
+                        "kind": KIND_LONG})
+                item["kind"] = KIND_LONG
+            if dropped:
+                self.facts = [f for f in self.facts if f not in dropped]
+                for f in dropped:
+                    meta.pop(f, None)
             self._save_mem()
         return True
 
@@ -255,21 +293,29 @@ class MemoryMixin:
             for f in self.facts:
                 if fact in f or f in fact:
                     # 重复记录不新增条目，但顺带纠正分类（临时↔长期），
-                    # 否则同一条事实被换成另一种分类时旧分类赶不走
+                    # 否则同一条事实被换成另一种分类时旧分类赶不走；
+                    # 重复提及同时累计 hits 并刷新 last_access——「被反复
+                    # 想起」是巩固/晋升的唯一证据源
                     item = getattr(self, "_fact_meta", {}).get(f)
-                    if isinstance(item, dict) and item.get("kind") != kind:
-                        item["kind"] = kind
+                    if isinstance(item, dict):
+                        if item.get("kind") != kind:
+                            item["kind"] = kind
+                        item["hits"] = int(_num(item.get("hits"), 0)) + 1
+                        item["last_access"] = time.time()
                         self._save_mem()
                     return
-            # 冲突消解：新事实与旧事实同主题反极性 → 删掉旧事实
+            # 冲突消解：新事实与旧事实同主题反极性 → 旧事实归档后删掉
             to_del = [f for f in self.facts if self._fact_conflict(fact, f)]
             if to_del:
-                self.facts = [f for f in self.facts if f not in to_del]
-                for old in to_del:
-                    getattr(self, "_fact_meta", {}).pop(old, None)
+                if self._archive_facts(to_del, "conflict") is not None:
+                    self.facts = [f for f in self.facts if f not in to_del]
+                    for old in to_del:
+                        getattr(self, "_fact_meta", {}).pop(old, None)
             self.facts.append(fact)
             if len(self.facts) > MAX_FACTS:
-                self.facts = self.facts[-MAX_FACTS:]
+                overflow = self.facts[:-MAX_FACTS]
+                if self._archive_facts(overflow, "overflow") is not None:
+                    self.facts = self.facts[-MAX_FACTS:]
             meta = self._sync_fact_meta()
             meta[fact] = {"ts": time.time(), "last_access": 0.0, "hits": 0,
                           "kind": kind}
@@ -306,10 +352,15 @@ class MemoryMixin:
         return False
 
     def _cleanup_facts(self):
-        """启动时清理记忆冲突：同主题正反矛盾时只保留更新的说法"""
+        """启动时清理记忆冲突：同主题正反矛盾时只保留更新的说法。
+
+        被清理掉的旧说法进归档（reason=conflict_cleanup）；归档失败则保留
+        原状，等下一次启动再试。
+        """
         if not self.facts:
             return
         keep = []
+        removed = []
         changed = False
         for f in self.facts:
             if f in keep:
@@ -317,9 +368,10 @@ class MemoryMixin:
             conflict_idx = [i for i, g in enumerate(keep) if self._fact_conflict(f, g)]
             if conflict_idx:
                 for i in sorted(conflict_idx, reverse=True):
-                    keep.pop(i)
+                    removed.append(keep.pop(i))
                 changed = True
             keep.append(f)
         if changed:
-            self.facts = keep[:MAX_FACTS]
-            self._save_mem()
+            if self._archive_facts(removed, "conflict_cleanup") is not None:
+                self.facts = keep[:MAX_FACTS]
+                self._save_mem()

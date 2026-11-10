@@ -33,6 +33,7 @@ from . import interoception
 from . import log as pet_log
 from . import memes as pet_memes
 from . import memory as pet_memory
+from . import memory_maintain
 from . import self_prompt as pet_self_prompt
 from . import stickers
 from .pricing import DS_BASE_URL, DS_MODEL
@@ -40,6 +41,7 @@ from .storage import P
 
 MAX_HOPS = 4                 # 工具跳数上限；用尽后不带工具逼一句正文
 SEARCH_TOP_K = 5             # 检索返回条数上限
+MEMORY_REVIEW_MAX = 80       # manage_memory review 单次展示条数（序号仍覆盖全量）
 DEFAULT_MAX_TOKENS = 1024
 TIMEOUT_SEC = 30             # 单次请求超时（不是整轮预算，整轮见 deadline）
 ARG_MAX_CHARS = 64           # 工具参数字符串截断（防回灌放大）
@@ -65,6 +67,7 @@ PROTECTED_WRITE_NAMES = {
     "pet_memory.json", "usage_ledger.json", "logs.txt", "api-runtime.json",
     "self_prompt.json", "heartbeat_journal.json", "pet_runtime.json",
     "life_log.jsonl", "schedule.json", "dsh-runtime.patch.yml",
+    "memory_archive.jsonl", "life_state.json", "goals.json", "episodes.jsonl",
 }
 PROTECTED_WRITE_DIRS = (".venv", "avatars")
 
@@ -124,6 +127,18 @@ TOOLS = [
                         "keyword 留空返回全部。记新记忆前先用它查重。"),
         "parameters": {"type": "object", "properties": {
             "keyword": {"type": "string", "description": "检索关键词，可留空"}}}}},
+    {"type": "function", "function": {
+        "name": "manage_memory",
+        "description": ("整理你自己的长期记忆。action=review：按序号查看全部事实"
+                        "（长期/临时、被想起次数、年龄）；action=consolidate：立即"
+                        "巩固（合并近重复条目、把跨时段反复想起的临时事实转长期）；"
+                        "action=forget：按 review 里的序号淡忘一条（进归档不硬删，"
+                        "以后 review 看不到但数据还在）。拿不准要不要删就先 review。"),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string",
+                       "description": "review=查看全部 | consolidate=巩固整理 | forget=按序号淡忘"},
+            "index": {"type": "integer", "description": "forget 用：review 里的序号"}},
+            "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "list_dir",
         "description": "列出工作目录下的文件与子目录。path 为相对路径，留空为根目录。",
@@ -197,6 +212,14 @@ TOOLS = [
             "action": {"type": "string", "description": "status | on | off | set_interval"},
             "seconds": {"type": "integer", "description": "set_interval 的间隔秒数（30-86400）"}},
             "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "query_balance",
+        "description": "查看你自己的令牌余额（那笔还能聊多久的钱）。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "check_time",
+        "description": "查看现在的日期、星期、时段（安排日程或决定要不要吵主人前先看）。",
+        "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "manage_goal",
         "description": ("管理你自己的长期目标——你想做成的事（不是主人安排的日程，"
@@ -381,6 +404,8 @@ def _tool_forget(win, args):
         hits = [f for f in facts if kw in f or f in kw]
         if not hits:
             return "没有找到含「%s」的记忆（共记住 %d 条）" % (kw, len(facts))
+        if win._archive_facts(hits, "ai_forget") is None:
+            return "归档失败，没有忘记任何内容"
         win.facts[:] = [f for f in facts if f not in hits]
         win._save_mem()
     return "忘掉了：%s" % "；".join(_clip(h, 30) for h in hits[:5])
@@ -404,6 +429,61 @@ def _tool_search_mem(win, args):
         stamp = time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts > 0 else "时间未知"
         lines.append("- [%s·%s] %s" % (kind, stamp, _clip(f, FACT_MAX_CHARS)))
     return DATA_HEADER + "\n我记得：\n" + "\n".join(lines)
+
+
+def _tool_memory(win, args):
+    """记忆自主进化入口：review 自省 / consolidate 巩固 / forget 软忘。"""
+    action = str(args.get("action") or "").strip()
+    with _mem_lock_ctx(win):
+        facts = [str(f).strip() for f in (getattr(win, "facts", []) or [])
+                 if str(f).strip()]
+        meta = dict(getattr(win, "_fact_meta", {}) or {})
+        if action == "review":
+            rows = memory_maintain.review_rows(facts, meta)
+            if not rows:
+                return "你的长期记忆还是空的。"
+            lines = ["你的长期记忆（共 %d 条，序号可用于 forget）：" % len(rows)]
+            for row in rows[:MEMORY_REVIEW_MAX]:
+                tag = "临时" if row["kind"] == pet_memory.KIND_TEMP else "长期"
+                age = ("%.1f 天前记录" % row["age_days"]
+                       if row["age_days"] >= 0 else "记录时间未知")
+                lines.append("%d. [%s] %s（想起过 %d 次・%s）"
+                             % (row["i"], tag, _clip(row["text"], 60),
+                                row["hits"], age))
+            if len(rows) > MEMORY_REVIEW_MAX:
+                lines.append("……其余 %d 条未显示，序号仍然有效"
+                             % (len(rows) - MEMORY_REVIEW_MAX))
+            return "\n".join(lines)
+        if action == "consolidate":
+            new_facts, new_meta, stats = memory_maintain.consolidate(facts, meta)
+            absorbed = stats.get("absorbed") or []
+            if absorbed and not memory_maintain.append_archive(
+                    P.memory_archive,
+                    memory_maintain.archive_records(absorbed, meta, "merged")):
+                return "归档失败，没有改动任何记忆"
+            win.facts[:] = new_facts
+            win._fact_meta = new_meta
+            win._save_mem()
+            return ("整理完成：合并近重复 %d 条，临时转长期 %d 条；现存 %d 条。"
+                    % (stats["merged"], stats["promoted"], len(new_facts)))
+        if action == "forget":
+            try:
+                idx = int(args.get("index"))
+            except (TypeError, ValueError):
+                return "forget 需要 index（review 里的序号）"
+            rows = memory_maintain.review_rows(facts, meta)
+            row = next((r for r in rows if r["i"] == idx), None)
+            if not row:
+                return "序号 %d 不存在（1-%d）" % (idx, len(rows))
+            new_facts, new_meta, records = memory_maintain.soft_forget(
+                [row["text"]], facts, meta, "ai_forget")
+            if not memory_maintain.append_archive(P.memory_archive, records):
+                return "归档失败，没有删除任何记忆"
+            win.facts[:] = new_facts
+            win._fact_meta = new_meta
+            win._save_mem()
+            return "已淡忘：「%s」（进了归档，没硬删）" % _clip(row["text"], 60)
+    return "未知 action：%s（review / consolidate / forget）" % action
 
 
 # ------------------------------------------------------------ 文件工具（限定项目目录）
@@ -1224,6 +1304,37 @@ def _tool_goal(win, args):
     return "action 只能是 add / list / done / remove"
 
 
+def _tool_balance(win, args):
+    """查余额：收编 _local_skill 的余额分支，AI 能自己掌握开销。"""
+    try:
+        text = win._balance_skill()
+    except Exception as e:
+        return "余额查询失败：%s" % e
+    return str(text or "余额未知")
+
+
+def _tool_time(win, args):
+    now = time.localtime()
+    week = "一二三四五六日"[now.tm_wday]
+    hour = now.tm_hour
+    if hour < 5:
+        period = "凌晨"
+    elif hour < 9:
+        period = "早上"
+    elif hour < 12:
+        period = "上午"
+    elif hour < 14:
+        period = "中午"
+    elif hour < 18:
+        period = "下午"
+    elif hour < 23:
+        period = "晚上"
+    else:
+        period = "深夜"
+    return "现在是 %s 星期%s %s。" % (time.strftime("%Y-%m-%d %H:%M", now),
+                                    week, period)
+
+
 # ------------------------------------------------------------ 系统感知工具
 def _tool_system_status(win, args):
     from . import sysmon as pet_sysmon
@@ -1383,7 +1494,10 @@ def _tool_capabilities(win):
         if shell_enabled(win) else "13. 命令：已关闭（config.aiShellEnabled = false）",
         "14. 截图：screenshot —— 主动截取屏幕画面并直接看到它（每轮限一次）"
         if screen_enabled(win) else "14. 截图：已关闭（config.aiScreenEnabled = false）",
-        "15. 自知：list_capabilities（本清单）",
+        "15. 生命循环：每次心跳醒来你可以选一个意图（休息/学习/整理/玩耍/关心/开口/静默），"
+        "写在回复开头如【意图：整理】",
+        "16. 自查：query_balance（你的令牌余额），check_time（现在的日期/星期/时段）",
+        "17. 自知：list_capabilities（本清单）",
         "另外，用户直接输入「查余额 / 查天气 / 记住… / 忘记… / 你记得什么」会由本地技能处理，不经过你。",
     ]
     return "\n".join(lines)
@@ -1416,6 +1530,8 @@ def execute_tool(win, name, raw_args, state):
             return _tool_forget(win, args)
         if name == "search_memories":
             return _tool_search_mem(win, args)
+        if name == "manage_memory":
+            return _tool_memory(win, args)
         if name == "list_dir":
             return _tool_list_dir(win, args)
         if name == "read_file":
@@ -1450,6 +1566,10 @@ def execute_tool(win, name, raw_args, state):
             return _tool_goal(win, args)
         if name == "manage_heartbeat":
             return _tool_heartbeat(win, args)
+        if name == "query_balance":
+            return _tool_balance(win, args)
+        if name == "check_time":
+            return _tool_time(win, args)
         if name == "active_window":
             return _tool_active_window(win, args)
         if name == "manage_self_prompt":

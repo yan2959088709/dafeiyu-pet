@@ -171,6 +171,8 @@ def build_sandbox(mod, tmpdir):
     p.avatars = os.path.join(tmpdir, "avatars")
     p.diary = os.path.join(tmpdir, "diary")
     p.memory = os.path.join(tmpdir, "pet_memory.json")
+    p.memory_archive = os.path.join(tmpdir, "memory_archive.jsonl")
+    p.life_state = os.path.join(tmpdir, "life_state.json")
     p.ledger = os.path.join(tmpdir, "usage_ledger.json")
     p.session = os.path.join(tmpdir, "pet_sessions.json")
     p.ui_layout = os.path.join(tmpdir, "ui_layout.json")
@@ -6299,6 +6301,144 @@ def _():
         w._reload_panel()
 
 
+@check("life_loop: 纯函数（意图建议规则/菜单/标签解析/状态记账）")
+def _():
+    from pet import life_loop as LL
+
+    class _ST:
+        def __init__(self, energy=100.0, affinity=0.0, last_user_message_time=0.0):
+            self.energy = energy
+            self.affinity = affinity
+            self.last_user_message_time = last_user_message_time
+
+    s, why = LL.select_intention(_ST(energy=10), {})
+    assert s == LL.REST and "精力" in why, (s, why)
+    s, _ = LL.select_intention(_ST(), {"hour": 23})
+    assert s == LL.REST, s
+    s, _ = LL.select_intention(_ST(), {"hour": 3})
+    assert s == LL.REST, s
+    s, why = LL.select_intention(_ST(), {"facts": 200})
+    assert s == LL.ORGANIZE and "200" in why, (s, why)
+    s, why = LL.select_intention(_ST(), {"since_user_hours": 8})
+    assert s == LL.CARE and "8.0" in why, (s, why)
+    s, _ = LL.select_intention(_ST(), {"consecutive_rests": 3})
+    assert s == LL.PLAY, s
+    s, why = LL.select_intention(_ST(), {"pending_events": 2})
+    assert s == LL.SPEAK and "2" in why, (s, why)
+    s, _ = LL.select_intention(_ST(energy=80), {})
+    assert s == LL.LEARN, s
+    s, _ = LL.select_intention(_ST(energy=50, affinity=70), {})
+    assert s == LL.SPEAK, s
+    s, _ = LL.select_intention(_ST(energy=50), {})
+    assert s == LL.LEARN, s
+    # drives 也接受 dict 形态
+    s, _ = LL.select_intention({"energy": 5}, {})
+    assert s == LL.REST, s
+    # 规则优先级：精力低压过 facts 多
+    s, _ = LL.select_intention(_ST(energy=10), {"facts": 300, "hour": 2})
+    assert s == LL.REST, s
+    menu = LL.menu_text(LL.ORGANIZE, "记忆攒了")
+    for name in LL.INTENTIONS:
+        assert LL.CN[name] in menu, menu
+    assert "【意图：整理】" in menu and "← 你身体此刻更想这个" in menu, menu
+    assert LL.parse_intention("【意图：整理】合并完毕") == (LL.ORGANIZE, "合并完毕")
+    assert LL.parse_intention("【意图：organize】done") == (LL.ORGANIZE, "done")
+    assert LL.parse_intention("【意图：Rest】") == (LL.REST, "")
+    assert LL.parse_intention("今天天气不错") == (LL.SPEAK, "今天天气不错")
+    assert LL.parse_intention("【意图：xyz】hi") == (LL.SPEAK, "hi")
+    assert LL.parse_intention("【意图：休息】") == (LL.REST, "")
+    assert LL.parse_intention("") == (LL.SPEAK, "")
+    path = os.path.join(CTX["tmpdir"], "life_state_probe.json")
+    try:
+        st = LL.note(path, LL.REST)
+        assert st["consecutive_rests"] == 1 and st["current"] == LL.REST, st
+        st = LL.note(path, LL.REST)
+        assert st["consecutive_rests"] == 2, st
+        st = LL.note(path, LL.SPEAK)
+        assert st["consecutive_rests"] == 0, st
+        back = LL.load(path)
+        assert back["current"] == LL.SPEAK, back
+        assert back["last_intention_ts"][LL.SPEAK] > 0, back
+        open(path, "w").write("not json")
+        assert LL.load(path)["consecutive_rests"] == 0
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+@check("heartbeat: LifeLoop 意图路由（inner/rest/坏标签/play + 菜单注入）")
+def _():
+    import time as _t
+    from pet import harness as H
+    from pet import heartbeat_journal as pet_journal
+    from pet import life_loop as LL
+    from pet.heartbeat import Decision
+    w = CTX["win"]
+    eng = w._heartbeat
+    old_tr, old_key = H.deepseek_transport, w.cfg.get("ds_api_key")
+    old_hist = list(w.chat_history)
+    old_sessions, old_sid = w._sessions, w._current_sid
+    life_path = CTX["mod"].P.life_state
+    old_life = open(life_path, "rb").read() if os.path.exists(life_path) else None
+    replies = iter(["【意图：整理】合并了 3 条近重复",
+                    "【意图：休息】",
+                    "【意图：休息】",
+                    "【意图：xyz】正常说话",
+                    "【意图：玩耍】来接我一个表情"])
+    seen_system = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        seen_system.append(messages[0]["content"])
+        return ({"content": next(replies)}, None, "stop")
+
+    H.deepseek_transport = fake
+    decision = Decision(action="speak", reason="ok", urgency=1.0, gates={})
+    try:
+        w.cfg["ds_api_key"] = "sk-test"
+        # inner：不上屏、不落历史，journal 留痕
+        eng._speak(decision)
+        assert not w._chat_queue, w._chat_queue
+        assert w.chat_history == old_hist, w.chat_history[-1:]
+        entries = pet_journal.recent(eng.drives.storage_dir, eng.drives.pet_id, 5)
+        assert entries[-1]["outcome"] == "inner", entries[-1]
+        assert entries[-1]["intention"] == LL.ORGANIZE, entries[-1]
+        # rest ×2：静默 + 连续休息计数
+        eng._speak(decision)
+        eng._speak(decision)
+        st = LL.load(life_path)
+        assert st["current"] == LL.REST and st["consecutive_rests"] == 2, st
+        entries = pet_journal.recent(eng.drives.storage_dir, eng.drives.pet_id, 3)
+        assert entries[-1]["outcome"] == "silent", entries[-1]
+        assert entries[-1]["intention"] == LL.REST, entries[-1]
+        # 坏标签：剥掉标签按 speak 上屏
+        eng._speak(decision)
+        assert w._chat_queue and w._chat_queue[-1][0] == "正常说话", w._chat_queue
+        assert w.chat_history[-1]["content"] == "正常说话", w.chat_history[-1:]
+        # play：同样上屏
+        w._chat_queue.clear()
+        eng._speak(decision)
+        assert w._chat_queue and w._chat_queue[-1][0] == "来接我一个表情", w._chat_queue
+        st = LL.load(life_path)
+        assert st["current"] == LL.PLAY and st["consecutive_rests"] == 0, st
+        # 菜单进了系统提示词
+        assert seen_system and "【这一刻你想做什么】" in seen_system[0], \
+            seen_system[0][:200]
+        assert "【意图：整理】" in seen_system[0], seen_system[0][:200]
+    finally:
+        H.deepseek_transport = old_tr
+        w.cfg["ds_api_key"] = old_key
+        w._chat_queue.clear()
+        w._sessions, w._current_sid = old_sessions, old_sid
+        cur = next((s for s in old_sessions if s["id"] == old_sid), None)
+        if cur is not None:
+            w.chat_history = cur["messages"]
+        w.chat_history[:] = old_hist
+        if old_life is not None:
+            open(life_path, "wb").write(old_life)
+        elif os.path.exists(life_path):
+            os.remove(life_path)
+
+
 @check("heartbeat: 主动发言恰好扣 1 能量（_chat_out 唯一计费点）")
 def _():
     import time as _t
@@ -8739,6 +8879,279 @@ def _():
         w._sync_fact_meta()
         if old_disk is not None:
             open(mem_path, "wb").write(old_disk)
+
+
+@check("memory_maintain: 纯函数（相似度/合并/巩固晋升/软忘/自省视图）")
+def _():
+    from pet import memory_maintain as MM
+    assert MM.bigram_sim("主人喜欢喝咖啡", "主人喜欢喝咖啡") == 1.0
+    assert MM.bigram_sim("主人喜欢喝咖啡", "主人喜欢喝咖啡加糖") >= 0.85
+    assert MM.bigram_sim("主人喜欢喝咖啡", "主人是汕头人") < 0.5
+    assert MM.bigram_sim("", "x") == 0.0
+    assert MM.bigram_sim("单", "单") == 1.0
+    facts = ["主人喜欢喝咖啡", "无关事实甲", "主人喜欢喝咖啡加糖"]
+    meta = {"主人喜欢喝咖啡": {"ts": 100.0, "last_access": 0.0, "hits": 2, "kind": "long"},
+            "无关事实甲": {"ts": 100.0, "last_access": 0.0, "hits": 0, "kind": "long"},
+            "主人喜欢喝咖啡加糖": {"ts": 200.0, "last_access": 250.0, "hits": 1, "kind": "temp"}}
+    nf, nm, merged, absorbed = MM.merge_similar(facts, meta)
+    assert merged == 1 and len(nf) == 2, (nf, merged)
+    assert nf[0] == "主人喜欢喝咖啡" and "主人喜欢喝咖啡加糖" not in nf
+    assert absorbed == ["主人喜欢喝咖啡加糖"], absorbed
+    assert nm["主人喜欢喝咖啡"]["hits"] == 3, nm
+    assert nm["主人喜欢喝咖啡"]["kind"] == "long", nm
+    assert nm["主人喜欢喝咖啡"]["last_access"] == 250.0, nm
+    assert nm["主人喜欢喝咖啡"]["ts"] == 100.0, nm
+    # 精确重复：必须折叠且保留原 hits（同一事实共享一条 meta，不可双累计）
+    nf, nm, merged, absorbed = MM.merge_similar(
+        ["重复项", "别的", "重复项"],
+        {"重复项": {"ts": 1.0, "last_access": 9.0, "hits": 12, "kind": "long"}})
+    assert merged == 1 and nf == ["重复项", "别的"], (nf, merged)
+    assert nm["重复项"]["hits"] == 12, nm
+    assert absorbed == [], absorbed
+    # 两边皆临时→保持临时；缺失 kind→长期（合并不降级）
+    nf, nm, _, _ = MM.merge_similar(
+        ["同临时甲", "同临时甲"],
+        {"同临时甲": {"ts": 1.0, "hits": 1, "kind": "temp"}})
+    assert nm["同临时甲"]["kind"] == "temp", nm
+    nf, nm, _, _ = MM.merge_similar(["无元数据甲", "无元数据甲"], {})
+    assert nm["无元数据甲"]["kind"] == "long", nm
+    now = 10 ** 9
+    old_ts = now - 30 * 3600
+    facts2 = ["跨时段临时", "一晚内临时"]
+    meta2 = {"跨时段临时": {"ts": old_ts, "last_access": old_ts + 13 * 3600, "hits": 3, "kind": "temp"},
+             "一晚内临时": {"ts": old_ts, "last_access": old_ts + 2 * 3600, "hits": 9, "kind": "temp"}}
+    nf2, nm2, stats = MM.consolidate(facts2, meta2, now=now)
+    assert nm2["跨时段临时"]["kind"] == "long", nm2
+    assert nm2["一晚内临时"]["kind"] == "temp", nm2
+    assert stats == {"merged": 0, "promoted": 1, "absorbed": []}, stats
+    assert MM.promotable({"ts": 1.0, "last_access": 2.0, "hits": 9, "kind": "temp"}) is False
+    assert MM.promotable({"ts": 1.0, "last_access": 1.0 + 13 * 3600, "hits": 3, "kind": "temp"}) is True
+    assert MM.promotable({"ts": 1.0, "last_access": 1.0 + 13 * 3600, "hits": 3, "kind": "long"}) is False
+    nf3, nm3, recs = MM.soft_forget(["忘掉它"], ["留下", "忘掉它"],
+                                    {"忘掉它": {"ts": 5.0, "hits": 2, "kind": "temp"}},
+                                    "ai_forget", now=99.0)
+    assert nf3 == ["留下"] and "忘掉它" not in nm3, (nf3, nm3)
+    assert len(recs) == 1 and recs[0]["reason"] == "ai_forget" and recs[0]["hits"] == 2, recs
+    rows = MM.review_rows(["甲", "", "乙"], {"甲": {"ts": 0.0, "hits": 1, "kind": "temp"}},
+                          now=86400.0)
+    assert [r["i"] for r in rows] == [1, 2], rows
+    assert rows[0]["kind"] == "temp" and rows[0]["hits"] == 1, rows
+    assert rows[0]["age_days"] == -1.0, rows
+
+
+@check("memory: 临时过期归档不硬删；跨时段反复想起晋升长期")
+def _():
+    import time as _t
+    w = CTX["win"]
+    old_facts = list(w.facts)
+    old_meta = {k: dict(v) for k, v in (getattr(w, "_fact_meta", {}) or {}).items()}
+    mem_path = CTX["mod"].P.memory
+    arc_path = CTX["mod"].P.memory_archive
+    old_disk = open(mem_path, "rb").read() if os.path.exists(mem_path) else None
+    old_arc = open(arc_path, "rb").read() if os.path.exists(arc_path) else None
+    try:
+        w.facts = []
+        w._fact_meta = {}
+        now = _t.time()
+        w._add_fact("过时临时", "temp")
+        w._add_fact("持久临时", "temp")
+        w._add_fact("长期喜好", "long")
+        w._fact_meta["过时临时"].update(
+            {"ts": now - 25 * 3600, "last_access": now - 20 * 3600, "hits": 1})
+        w._fact_meta["持久临时"].update(
+            {"ts": now - 25 * 3600, "last_access": now - 10 * 3600, "hits": 4})
+        assert w._expire_temp_facts() is True
+        assert "过时临时" not in w.facts, w.facts
+        assert w._fact_meta["持久临时"]["kind"] == "long", w._fact_meta
+        assert "长期喜好" in w.facts
+        assert os.path.exists(arc_path)
+        lines = [json.loads(x) for x in open(arc_path, encoding="utf-8") if x.strip()]
+        rec = [r for r in lines if r["text"] == "过时临时"]
+        assert rec and rec[-1]["reason"] == "temp_expired", lines
+        assert "持久临时" not in [r["text"] for r in lines], lines
+    finally:
+        w.facts[:] = old_facts
+        w._fact_meta = old_meta
+        w._sync_fact_meta()
+        if old_disk is not None:
+            open(mem_path, "wb").write(old_disk)
+        if old_arc is not None:
+            open(arc_path, "wb").write(old_arc)
+        elif os.path.exists(arc_path):
+            os.remove(arc_path)
+
+
+@check("memory: 重复提及累计 hits；超上限最早一条走归档不硬删")
+def _():
+    from pet import memory as pet_memory
+    from pet import memory_maintain as MM
+    w = CTX["win"]
+    old_facts = list(w.facts)
+    old_meta = {k: dict(v) for k, v in (getattr(w, "_fact_meta", {}) or {}).items()}
+    mem_path = CTX["mod"].P.memory
+    arc_path = CTX["mod"].P.memory_archive
+    old_disk = open(mem_path, "rb").read() if os.path.exists(mem_path) else None
+    old_arc = open(arc_path, "rb").read() if os.path.exists(arc_path) else None
+    try:
+        w.facts = []
+        w._fact_meta = {}
+        w._add_fact("主人喜欢喝咖啡")
+        w._add_fact("主人喜欢喝咖啡")
+        assert len(w.facts) == 1, w.facts
+        assert w._sync_fact_meta()["主人喜欢喝咖啡"]["hits"] == 1
+        for i in range(pet_memory.MAX_FACTS):
+            w._add_fact("填充事实%03d" % i)
+        assert len(w.facts) == pet_memory.MAX_FACTS, len(w.facts)
+        assert "主人喜欢喝咖啡" not in w.facts
+        lines = [json.loads(x) for x in open(arc_path, encoding="utf-8") if x.strip()]
+        rec = [r for r in lines if r["text"] == "主人喜欢喝咖啡"]
+        assert rec and rec[-1]["reason"] == "overflow", lines[-3:]
+        # 归档失败时超限不淘汰：宁多一条，不丢数据
+        old_append = MM.append_archive
+        try:
+            MM.append_archive = lambda path, records: False
+            w._add_fact("又多一条")
+            assert len(w.facts) == pet_memory.MAX_FACTS + 1, len(w.facts)
+            assert "填充事实000" in w.facts, w.facts[:3]
+        finally:
+            MM.append_archive = old_append
+    finally:
+        w.facts[:] = old_facts
+        w._fact_meta = old_meta
+        w._sync_fact_meta()
+        if old_disk is not None:
+            open(mem_path, "wb").write(old_disk)
+        if old_arc is not None:
+            open(arc_path, "wb").write(old_arc)
+        elif os.path.exists(arc_path):
+            os.remove(arc_path)
+
+
+@check("memory: 归档失败时放弃淘汰（数据不丢优先于存储干净）")
+def _():
+    import time as _t
+    from pet import memory_maintain as MM
+    w = CTX["win"]
+    old_facts = list(w.facts)
+    old_meta = {k: dict(v) for k, v in (getattr(w, "_fact_meta", {}) or {}).items()}
+    mem_path = CTX["mod"].P.memory
+    old_disk = open(mem_path, "rb").read() if os.path.exists(mem_path) else None
+    old_append = MM.append_archive
+    try:
+        w.facts = []
+        w._fact_meta = {}
+        w._add_fact("过期临时", "temp")
+        w._fact_meta["过期临时"]["ts"] = _t.time() - 25 * 3600
+        MM.append_archive = lambda path, records: False
+        assert w._expire_temp_facts() is False
+        assert "过期临时" in w.facts, w.facts
+        from pet import harness as H
+        out = H.execute_tool(w, "manage_memory",
+                             json.dumps({"action": "forget", "index": 1}), {})
+        assert "归档失败" in out and "过期临时" in w.facts, (out, w.facts)
+    finally:
+        MM.append_archive = old_append
+        w.facts[:] = old_facts
+        w._fact_meta = old_meta
+        w._sync_fact_meta()
+        if old_disk is not None:
+            open(mem_path, "wb").write(old_disk)
+
+
+@check("harness: manage_memory review/consolidate/forget（含归档落盘与边界）")
+def _():
+    from pet import harness as H
+    from pet.chat import HARNESS_HINT
+    w = CTX["win"]
+    old_facts = list(w.facts)
+    old_meta = {k: dict(v) for k, v in (getattr(w, "_fact_meta", {}) or {}).items()}
+    mem_path = CTX["mod"].P.memory
+    arc_path = CTX["mod"].P.memory_archive
+    old_disk = open(mem_path, "rb").read() if os.path.exists(mem_path) else None
+    old_arc = open(arc_path, "rb").read() if os.path.exists(arc_path) else None
+    names = {t["function"]["name"] for t in H.TOOLS}
+    assert "manage_memory" in names, names
+    assert "manage_memory" in HARNESS_HINT, HARNESS_HINT
+    try:
+        w.facts = []
+        w._fact_meta = {}
+        w._add_fact("主人是汕头人")
+        # 直接构造一对近重复（_add_fact 的子串去重使「咖啡」/「咖啡加糖」
+        # 无法共存，近重复只能绕过后门造，merge_similar 才是它们的归处）
+        w.facts.append("主人喜欢喝咖啡加糖")
+        w.facts.append("主人喜欢喝咖啡加奶")
+        w.facts.append("无关事实戊")
+        w._sync_fact_meta()
+        out = H.execute_tool(w, "manage_memory", json.dumps({"action": "review"}), {})
+        assert "共 4 条" in out and "1. [长期] 主人是汕头人" in out, out
+        # review 截断分支：展示上限可压，序号仍覆盖全量
+        old_max = H.MEMORY_REVIEW_MAX
+        try:
+            H.MEMORY_REVIEW_MAX = 2
+            out = H.execute_tool(w, "manage_memory",
+                                 json.dumps({"action": "review"}), {})
+            assert "其余 2 条未显示" in out, out
+        finally:
+            H.MEMORY_REVIEW_MAX = old_max
+        out = H.execute_tool(w, "manage_memory",
+                             json.dumps({"action": "forget", "index": 4}), {})
+        assert "已淡忘" in out and "无关事实戊" in out, out
+        assert "无关事实戊" not in w.facts
+        recs = [json.loads(x) for x in open(arc_path, encoding="utf-8") if x.strip()]
+        assert any(r["text"] == "无关事实戊" and r["reason"] == "ai_forget"
+                   for r in recs), recs
+        out = H.execute_tool(w, "manage_memory",
+                             json.dumps({"action": "consolidate"}), {})
+        assert "合并近重复 1 条" in out and "现存 2 条" in out, out
+        assert len(w.facts) == 2, w.facts
+        recs = [json.loads(x) for x in open(arc_path, encoding="utf-8") if x.strip()]
+        assert any(r["text"] == "主人喜欢喝咖啡加奶" and r["reason"] == "merged"
+                   for r in recs), recs
+        assert "不存在" in H.execute_tool(
+            w, "manage_memory", json.dumps({"action": "forget", "index": 99}), {})
+        assert "未知 action" in H.execute_tool(
+            w, "manage_memory", json.dumps({"action": "xx"}), {})
+        assert "需要 index" in H.execute_tool(
+            w, "manage_memory", json.dumps({"action": "forget"}), {})
+    finally:
+        w.facts[:] = old_facts
+        w._fact_meta = old_meta
+        w._sync_fact_meta()
+        if old_disk is not None:
+            open(mem_path, "wb").write(old_disk)
+        if old_arc is not None:
+            open(arc_path, "wb").write(old_arc)
+        elif os.path.exists(arc_path):
+            os.remove(arc_path)
+
+
+@check("harness: query_balance/check_time 收编（TASK-009 剩余项）")
+def _():
+    from pet import harness as H
+    from pet.chat import HARNESS_HINT
+    w = CTX["win"]
+    names = {t["function"]["name"] for t in H.TOOLS}
+    assert {"query_balance", "check_time"} <= names, names
+    assert "query_balance" in HARNESS_HINT and "check_time" in HARNESS_HINT
+    out = H.execute_tool(w, "check_time", "{}", {})
+    assert "现在是" in out and "星期" in out, out
+    old = w._balance_skill
+    try:
+        w._balance_skill = lambda: "主人余额还有 ¥1.00，够我们聊好久啦～"
+        out = H.execute_tool(w, "query_balance", "{}", {})
+        assert "¥1.00" in out, out
+
+        def boom():
+            raise RuntimeError("net down")
+
+        w._balance_skill = boom
+        out = H.execute_tool(w, "query_balance", "{}", {})
+        assert "查询失败" in out and "net down" in out, out
+    finally:
+        w._balance_skill = old
+    caps = H._tool_capabilities(w)
+    assert "query_balance" in caps and "check_time" in caps, caps
+    assert "生命循环" in caps and "【意图：" in caps, caps
 
 
 @check("harness: 记忆上限文案与 MAX_FACTS 一致；新工具进 TOOLS/HARNESS_HINT")

@@ -30,7 +30,7 @@ REASON_CN = {
     "max_consecutive": "连续主动太多了",
 }
 OUTCOME_CN = {"speak": "说出口", "silent": "忍住了", "skip": "还没醒",
-              "error": "尝试失败"}
+              "error": "尝试失败", "inner": "内在活动"}
 
 
 def path(storage_dir, pet_id):
@@ -89,8 +89,9 @@ def summary(storage_dir, pet_id, now=None):
     silent = sum(1 for e in day if e.get("outcome") == "silent")
     blocked = sum(1 for e in day if e.get("outcome") == "skip")
     failed = sum(1 for e in day if e.get("outcome") == "error")
+    inner = sum(1 for e in day if e.get("outcome") == "inner")
     return {"total": len(day), "spoken": spoken, "silent": silent,
-            "blocked": blocked, "failed": failed,
+            "blocked": blocked, "failed": failed, "inner": inner,
             "last": entries[-1] if entries else None}
 
 
@@ -99,8 +100,9 @@ def summary_text(storage_dir, pet_id, now=None):
     if not data["total"]:
         return "过去 24 小时没有心跳记录。"
     text = ("过去 24 小时：主动尝试 %d 次，说出口 %d 次，忍住 %d 次，"
-            "被门禁拦下 %d 次。" % (data["spoken"] + data["silent"] + data["failed"],
-                                   data["spoken"], data["silent"], data["blocked"]))
+            "被门禁拦下 %d 次，内在活动（学习/整理）%d 次。"
+            % (data["spoken"] + data["silent"] + data["failed"],
+               data["spoken"], data["silent"], data["blocked"], data["inner"]))
     last = data["last"]
     if last:
         reason = REASON_CN.get(str(last.get("reason") or ""), str(last.get("reason") or ""))

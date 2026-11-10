@@ -28,6 +28,7 @@ from pet import goals as pet_goals
 from pet import harness as pet_harness
 from pet import heartbeat_journal as pet_journal
 from pet import heartbeat_prompt
+from pet import life_loop as pet_life_loop
 from pet import log as pet_log
 from pet import persona as pet_persona
 from pet import self_prompt as pet_self_prompt
@@ -35,7 +36,7 @@ from pet import stickers
 from pet import time_context as pet_time
 from pet.drives import cfg_num
 from pet.pricing import DS_MODEL, calc_turn_cost
-from pet.storage import load_json
+from pet.storage import P, load_json
 
 HB_FILE = "heartbeat_state.json"
 DEFAULT_HB_STATE = {"last_speak_time": 0.0, "last_attempt_time": 0.0,
@@ -206,7 +207,7 @@ class HeartbeatEngine:
             t for t in (self._hb.get("attempts_24h") or [])
             if 0.0 <= now - float(t) < pet_drives.DAY_SEC] + [now]
 
-    def _journal(self, decision, now, outcome, text=""):
+    def _journal(self, decision, now, outcome, text="", intention=""):
         """把这次心跳写进内在日志；skip 最多 10 分钟记一次，避免刷屏。
 
         返回是否真的写入了：on_tick 只在写入时更新 last_* 状态，避免每
@@ -218,16 +219,25 @@ class HeartbeatEngine:
                 return False
             self._journal_last_skip = now
         try:
+            record = {"outcome": outcome, "reason": decision.reason,
+                      "urgency": round(float(decision.urgency), 3),
+                      "gates": dict(decision.gates or {}),
+                      "text": str(text or "")[:200]}
+            if intention:
+                record["intention"] = intention
             pet_journal.append(
-                self.drives.storage_dir, self.drives.pet_id,
-                {"outcome": outcome, "reason": decision.reason,
-                 "urgency": round(float(decision.urgency), 3),
-                 "gates": dict(decision.gates or {}),
-                 "text": str(text or "")[:200]}, now=now)
+                self.drives.storage_dir, self.drives.pet_id, record, now=now)
             return True
         except Exception as e:
             pet_log.warn("心跳日志写入失败: %s" % e)
             return False
+
+    def _note_intention(self, intention):
+        """LifeLoop 记账：连续休息计数与各意图上次时间。失败不影响主流程。"""
+        try:
+            pet_life_loop.note(P.life_state, intention)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 主循环
     def on_tick(self):
@@ -342,6 +352,17 @@ class HeartbeatEngine:
             goals = pet_goals.active_text(5)
             if goals:
                 system += "\n【你当前的目标】\n" + goals
+            life_state = pet_life_loop.load(P.life_state)
+            last_user = float(getattr(self._drives_st, "last_user_message_time",
+                                      0.0) or 0.0)
+            suggestion, reason = pet_life_loop.select_intention(
+                self._drives_st,
+                {"facts": len(facts),
+                 "since_user_hours": ((now - last_user) / 3600.0
+                                      if last_user > 0 else 99.0),
+                 "consecutive_rests": life_state.get("consecutive_rests", 0),
+                 "pending_events": len(getattr(chat, "_watch_events", None) or [])})
+            system += "\n" + pet_life_loop.menu_text(suggestion, reason)
         except Exception:
             pass
         messages = [{"role": "system", "content": system},
@@ -370,12 +391,21 @@ class HeartbeatEngine:
                 sticker = stickers.MAP[m.group(1).strip()]
         reply = re.sub(r"<sticker:[^>]+>", "", reply).strip()
         reply = re.sub(r"\s+", " ", reply)
-        if not reply or is_silence_reply(reply):
+        intention, reply = pet_life_loop.parse_intention(reply)
+        self._note_intention(intention)
+        if intention in pet_life_loop.INNER:
+            # 学习/整理：她用自己的工具真的做了事，但不上屏、不落对话历史
+            # ——内心活动不进主人的对话流，内在日志里留痕
+            self._journal(decision, time.time(), outcome="inner",
+                          text=reply[:100], intention=intention)
+            self._save_hb()
+            return
+        if not reply or is_silence_reply(reply) or intention == pet_life_loop.REST:
             # 静默 = 这轮没发生：不存储/不显示/不计成功配额、不更新连续计数，
             # 只推进 attempt 时间并计入尝试配额（_note_attempt 已做），
             # 防同一紧迫度下一拍接一拍地重复触发。内在日志里保留「想过」。
             self._journal(decision, time.time(), outcome="silent",
-                          text=reply[:100])
+                          text=reply[:100], intention=intention)
             self._save_hb()
             return
 
@@ -402,7 +432,8 @@ class HeartbeatEngine:
             self._hb["consecutive_speaks"] = int(self._hb.get("consecutive_speaks")
                                                  or 0) + 1
             self._hb["last_speak_content"] = reply[:50]
-            self._journal(decision, now, outcome="speak", text=reply)
+            self._journal(decision, now, outcome="speak", text=reply,
+                          intention=intention)
         except Exception as e:
             # 出口/落盘任一抛桩：这句话不当成功发言计（配额/连发/避复述都不记），
             # 但 attempt 已在 _note_attempt 推进，finally 再确保它落盘
