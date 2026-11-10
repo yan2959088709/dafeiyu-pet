@@ -320,7 +320,103 @@
 
 ---
 
+### TASK-020: 记忆自主进化（巩固/合并/软遗忘/自主整理）
+- **Executor**: claude
+- **Status**: [x]
+- **Dependencies**: TASK-013
+- **Contract**: 用户 2026-11-10「可自主进化的电子生命，记忆管理相关也需要考虑」（/full-auto 批准并执行）
+- **Acceptance**:
+  1. `pet/memory_maintain.py`（新，纯函数）：consolidate（临时 fact hits≥3 升长期）、merge_similar（字符二元组相似度≥0.85 合并、hits 相加保留新 ts）、soft_forget（超限/淘汰 → `memory_archive.jsonl` 软删不硬丢）
+  2. `pet/memory.py` 接线：MAX_FACTS 超限的 FIFO 硬删改走 archive；`_add_fact` 去重时合并 hits 而非丢弃
+  3. harness `manage_memory` 工具（review 列全部带 kind/分数 / consolidate 立即整理 / forget 按序号软忘），AI 可自主整理记忆
+  4. consolidation 入口同时供 TASK-021 LifeLoop organize 意图调用
+  5. smoke 新增用例（纯函数四分支 + 工具三分支 + archive 落盘），既有 223 项不回归
+- **Handoff log**:
+  > claude [x] 2026-11-10: 交付，commit 335bf49（与 TASK-021 合并提交——两任务文件交织）。新增 pet/memory_maintain.py 纯函数模块（bigram_sim/merge_similar/consolidate/soft_forget/review_rows）+ harness manage_memory 工具；memory.py 接线：临时过期 hits≥3 且 (last_access-ts)≥12h 升长期、其余归档不硬删、_add_fact 重复提及累计 hits、超上限/冲突消解/启动清理全部留档 memory_archive.jsonl；归档失败整体放弃淘汰（数据不丢优先）。Gate 1 代理审查 1 High + 5 Medium 全部修复：merge_similar 精确重复双累计 hits、锁外分类写丢、归档失败半提交、memory_archive 可被 write_file 截断（入 PROTECTED_WRITE_NAMES，连带 life_state/goals/episodes）、软删范围界定（AI 生命周期全留档；主人显式命令直接删）。冒烟 223→228。ADR 随本批统一补。
+
+### TASK-021: LifeLoop v1 — 意图驱动的行动循环
+- **Executor**: claude
+- **Status**: [x]
+- **Dependencies**: TASK-020
+- **Contract**: 本块 [Blueprint]（2026-11-10 /full-auto，用户「考虑的全面一点…批准并执行」）
+- **Acceptance**:
+  1. `pet/life_loop.py`（新）：意图枚举 rest/learn/organize/play/care/speak/silent；`select_intention(drives, ctx)` 纯函数；`life_state.json` 持久化（当前意图/连续休息计数/上次行动时间）
+  2. 心跳醒来改「选意图→执行」：提示词给意图菜单+身体段+近期经历，解析意图标签；speak/silent 完全保持现有行为，其余意图执行对应动作并记 life_log
+  3. 能量只做软加权（低精力 learn/organize 降权），最终选择权在 AI（遵循 feedback-autonomy-over-gates，不设硬门禁）
+  4. 顺带收编 query_balance/check_time 两个本地技能为 harness 工具（TASK-009 剩余项）
+  5. smoke 新增用例（意图选择纯函数/各意图执行分支/提示词含菜单/既有心跳用例不回归）
+- **Handoff log**:
+  > claude [x] 2026-11-10: 交付，commit 335bf49。新增 pet/life_loop.py：七意图枚举 + select_intention 纯函数（精力<20/夜深/facts>150/6h 无主人/连休3轮/有新事件→具身建议，建议非门禁）+ life_state.json 记账 + parse_intention（【意图：X】中英文标签，无标签逐字节兼容旧行为）。heartbeat._speak 注入意图菜单，按意图路由三出口：speak/play/care 上屏、silent/rest 静默、learn/organize 只进内在日志（journal outcome=inner，新增 inner 统计）。顺带收编 query_balance/check_time（TASK-009 剩余项）。冒烟 228→231。实测修复两处自测 bug：标签中文映射缺失、精确重复双累计 hits。
+
+### TASK-022: 开机自启 + 崩溃自恢复
+- **Executor**: claude
+- **Status**: [x]
+- **Dependencies**: none
+- **Contract**: 用户 2026-11-10 差距分析确认「搬进新电脑的门槛：重启后它得自己活过来」
+- **Acceptance**:
+  1. `pet/autostart.py`（新）：enable/disable/status；登录时启动（每用户 Startup 目录快捷方式，无需管理员权限）
+  2. 看门狗 supervisor：进程消失即重拉；用户经 API /quit 主动退出时不重启（quit 标记文件）
+  3. 设置页「自主与AI」页新增两个开关；config 键 autoStartEnabled/autoRecoverEnabled 进 DEFAULT_CFG（batch5 MANAGED_KEYS 教训）
+  4. smoke 新增用例（纯逻辑 + 配置登记断言 + supervisor 脚本生成）
+- **Handoff log**:
+  > claude [x] 2026-11-10: 交付，commit 12dd994。Scout 发现自启（menus.set_autostart）与进程内崩溃重拉（guard.CrashGuard）已存在，范围缩小为「设置页面化 + 硬崩溃看门狗」：新增 pet/autostart.py（.lnk 构建提为可复用模块，事实口径 enabled()；看门狗 pet-watchdog.bat：start /wait + quit.flag 判定，主动退出不重拉、异常消失重拉、单轮最多 5 次）；petservice.quit_app 退出前写 quit.flag；menus 改调 autostart 模块并清理失效导入/常量；设置页「开机与自恢复」组两开关，_apply_live 幂等热生效；autoRecoverEnabled 进 DEFAULT_CFG + validate 兜底。冒烟 231→234。
+
+### TASK-023: DSH 重任务外包工具
+- **Executor**: claude
+- **Status**: [x]
+- **Dependencies**: TASK-016
+- **Contract**: 用户 2026-11-10 差距分析确认「AI 不能自己把重任务外包给它，有必要」
+- **Acceptance**:
+  1. harness `delegate_task` 工具（goal 必填、context 可选），复用既有 DSHHeadlessRuntime 调用路径（与右键/设置页同一条）
+  2. 门禁：`aiDshEnabled` 配置（默认关）+ 既有 RuntimeGate 日预算 50k/单次预估 15k/24h 最多 3 次
+  3. 结果经 _chat_queue 回屏 + life_log 记账；运行中再次调用给出进行中提示
+  4. smoke 新增用例（假 runtime 注入：正常/门禁关闭/预算超限/进行中）
+- **Handoff log**:
+  > claude [x] 2026-11-10: 交付，commit b3e3aaf。runtime_manager.start_task（新）：门禁→构建→记账→daemon 线程→回调封送的核心抽取，runtime_ui._runtime_start 改薄成 GUI 表现层，AI 工具与设置页/右键同一条路；harness delegate_task 工具三层门禁（aiDshEnabled 默认关 + 既有 RuntimeGate + 运行中拒第二次），结果经既有 _runtime_finish 回屏记账；goal/context 进 ARG_LONG_KEYS。冒烟 234→236。注：测试发现真实 RuntimeGate 在 key 检查前会先因 Node 路径未配返回——门禁顺序保留原样，测试用钉住门禁隔离。
+
+### TASK-024: 文件系统事件感知
+- **Executor**: claude
+- **Status**: [x]
+- **Dependencies**: none
+- **Contract**: 用户 2026-11-10 差距分析确认「新文件进下载文件夹→主动汇报/整理，事件驱动感知」
+- **Acceptance**:
+  1. `pet/filewatch.py`（新）：轮询快照 diff（mtime+size），无新依赖
+  2. 桌宠.py `_tick_background_polls` 挂 5s 轮询；事件入 pending_events（上限 50，超出丢最旧）
+  3. 下次心跳提示词注入【你观察到的变化】段
+  4. harness `manage_watch` 工具（add/remove/list；路径须过 `_inside_any_root` 沙盒校验）；config 键 watchDirs 进 DEFAULT_CFG
+  5. smoke 新增用例（diff 纯函数/事件注入/工具校验/既有轮询用例不回归）
+- **Handoff log**:
+  > claude [x] 2026-11-10: 交付，commit ab2e04d。新增 pet/filewatch.py（snapshot 递归快照 mtime+size 上限 2000/diff/describe，零新依赖不引 watchdog）；桌宠.py _tick_background_polls 挂 10s 轮询 → _watch_poll（首轮只播种，事件进 _watch_events deque 上限 50）；heartbeat._speak 注入【你观察到的变化】并即读即消费（只呈报不代决）；manage_watch 工具（add/remove/list，_inside_any_root 沙盒校验，remove 支持序号）+ watchDirs 配置键；path 加入 ARG_LONG_KEYS（实测发现 tmpdir 绝对路径被 64 字符截断毁掉——顺带修复所有路径类工具的深路径限制）。冒烟 236→239。
+
+### TASK-025: 窗口管理工具
+- **Executor**: claude
+- **Status**: [x]
+- **Dependencies**: none
+- **Contract**: 用户 2026-11-10 差距分析确认「active_window 只能读，接管包括管窗口」
+- **Acceptance**:
+  1. sysmon.py Win32 助手（风格同 foreground_window）：enum_windows（标题匹配）、window_op（minimize/maximize/restore/activate）
+  2. harness `manage_window` 工具（action + 可选 title 子串匹配；无 title 作用于前台窗口）
+  3. smoke 新增用例（ctypes patch 假窗口：匹配/未匹配/各 action/空列表）
+- **Handoff log**:
+  > claude [x] 2026-11-10: 交付，commit ea9be36。sysmon.py 增 Win32 助手（enum_windows EnumWindows+可见+标题非空 / find_window 子串不区分大小写 / window_op，未知动作在触 ctypes 前就被拒）；foreground_window 补返回 hwnd（加键向后兼容）；harness manage_window 工具（title 留空=前台窗，抢焦点被拒时如实报告，刻意不做 close）；清理 _tool_system_status 冗余局部导入。冒烟 239→240。
+
+---
+
 ## Messages
+
+> claude [Blueprint] 2026-11-10（TASK-020~025 电子生命総合批，/full-auto 用户「考虑的全面一点…可自主进化…记忆管理也需要考虑…批准并执行」）：
+> **总设计**：六个工作流共用一条原则——AI 自主决策（遵循 feedback-autonomy-over-gates），代码只提供身体化的建议与出口，不设硬门禁（结构性安全除外）。新逻辑全部落新模块（黑盒），既有模块只做最小接线。
+> **TASK-020 记忆自主进化**：新 `pet/memory_maintain.py` 纯函数——`bigram_sim(a,b)` 字符二元组 Dice；`merge_similar(facts,meta,threshold=0.85)` 合并近重复（hits 相加、保留新 ts）；`consolidate(facts,meta,now,hits_threshold=3)` 临时 hits 达标升长期；`soft_forget(items,facts,meta,archive_path)` 写 `memory_archive.jsonl` 软删。接线：memory.py `_expire_temp_facts` 硬删改 archive；`_add_fact` 去重时合并 hits；新增 mixin `_archive_facts`。harness `manage_memory` 工具（review 列序号/kind/hits/年龄；consolidate 立即整理；forget 按序号软忘）。parse_facts 防御性 trim 保持硬删（写入侧已守不变式，加载侧归档会重复归档）。
+> **TASK-021 LifeLoop v1**：新 `pet/life_loop.py`——`INTENTIONS=(rest,learn,organize,play,care,speak,silent)` 带 CN 描述；`select_intention(drives,ctx)` 纯函数返回建议+权重（精力<20→rest、facts>150→organize、23-6 点→rest、6h 无主人→care、连休≥3→play，兜底 learn/speak）；`life_state.json`（当前意图/连续休息/各意图上次时间）；`menu_text()` 生成提示词段。heartbeat._speak：prompt 追加意图菜单；回复解析 `【意图：X】` 标签（缺失→speak 兼容旧行为）；路由三出口——用户可见（speak/play/care）、静默（silent/rest）、内省（learn/organize 只记 journal+life_log）；journal 增 intention 字段。storage 增 `P.life_state`。顺带收编 `query_balance`/`check_time` 工具（TASK-009 剩余项）。
+> **TASK-022 自启+自恢复**（ Scout 发现已存在大半，缩小范围）：menus.set_autostart 的 PowerShell .lnk 核心提取为 `pet/autostart.py` `set_enabled(on)->(ok,err)`/`enabled()->bool`，menus 与设置页共用；新增看门狗 `pet-watchdog.bat`（`start /wait` 桌宠、退出后查 `quit.flag`：主动退出清flag退出，异常消失重拉，3 次/10 分钟退避）；petservice.quit_app 退出前写 quit.flag；设置页两个开关；config `autoRecoverEnabled` 进 DEFAULT_CFG（autostart 键已在）。
+> **TASK-023 DSH 外包**：runtime_ui._runtime_start 的 gate+runtime+daemon 核心提取为 runtime_manager `run_goal(goal,*,runtime_cfg,usage_cfg,on_event,on_finish)`，UI 改薄封装调用同一函数；harness `delegate_task` 工具走 run_goal；门禁 `aiDshEnabled`（默认关）+既有 RuntimeGate（日 50k/单次 15k/24h 3 次）；结果经 _chat_queue 回屏+life_log 记账；运行中拒第二次。
+> **TASK-024 文件事件**：新 `pet/filewatch.py` 纯函数 `snapshot(dirs)->{path:(mtime,size)}`/`diff(prev,cur,now)->events`；桌宠.py `_tick_background_polls` 挂 10s 轮询，事件入 `win._watch_events`（deque 上限 50）；heartbeat._speak prompt 注入【你观察到的变化】并清空；harness `manage_watch` 工具（add/remove/list，路径过 `_inside_any_root`）；config `watchDirs` 进 DEFAULT_CFG。快照不落盘（重启重建）。
+> **TASK-025 窗口管理**：sysmon.py 增 Win32 助手（风格同 foreground_window）：`enum_windows()->[{hwnd,title}]`、`window_op(hwnd,action)`、`find_window(substr)`；harness `manage_window` 工具（minimize/maximize/restore/activate，可选 title 子串，缺省前台窗）。不做 close（数据损失风险）。
+> **测试策略**：全部走 smoke_check 既有范式（@check+沙箱 P 重定向+假 transport/patch 最外层缝）；每任务新增用例后跑全量；baseline 223。**风险**：heartbeat 解析变更影响既有 6 个心跳用例→无标签必须逐字节兼容；memory 归档引入新写路径→REAL_DATA 哈希断言防沙箱泄漏；DSH 提取重构→runtime_ui 既有行为不能变（smoke 有覆盖）。
+
+> claude [Blueprint-Approved] 2026-11-10: 用户随 /full-auto 指令预批准「批准并执行」，进入实现。顺序 020→021→022→023→024→025，每任务 Gate 3 全量冒烟后 Gate 5 单独提交。
+
+> claude [x] 2026-11-10: TASK-020~025 総合批交付完成（commit 335bf49/12dd994/b3e3aaf/ab2e04d/ea9be36，另 92bd8f7 为前五批未提交工作的追加快捷提交）。冒烟 223→240（+17 检查），offscreen 与 windows 双平台全绿（windows 全量下 api 鉴权用例一次 flaky，单独复跑通过——端口/时序类环境性，非本次引入）。Gate 1：020/021 代理审查 1 High+5 Medium 全修复；022-025 终审代理跑批中。Gate 2 安全审计代理跑批中。ADR: docs/decisions/2026-11-10-life-loop-memory.md。遗留：桌宠需重启加载新代码（用户未请求重启）；TASK-009 剩余流式 transport 仍未做（非流式为刻意决策）。
 
 > claude [Blueprint] 2026-11-06（TASK-008，Harness Phase 1）：已获用户批准「批准并执行」。
 > DATA FLOW: 输入=用户消息(+表情 chip/附件)；变换=Harness loop（组上下文→带工具请求→执行工具回喂→≤3 跳→最终回复），表情目录从每轮提示词移除改为工具按需召回；输出=最终回复+表情意图（meme/sticker 各 ≤1），经既有 _chat_out 渲染；状态变化=chat_history 仍只落 user+assistant，tool 消息瞬态不落盘。
