@@ -31,6 +31,7 @@ heartbeat_state*.json
 heartbeat_journal*.json
 self_prompt.json
 life_log.jsonl
+schedule.json
 pet_runtime*.json
 dsh-runtime.patch.yml
 dsh-home/

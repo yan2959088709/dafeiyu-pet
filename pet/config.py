@@ -136,6 +136,7 @@ DEFAULT_CFG = {
     "apiEnabled": True,
     "apiPort": 7340,
     "hitPassthrough": True,
+    "scheduleEnabled": True,
     "aiEnabled": False,
     "aiProtocol": "openai",
     "aiBaseUrl": "",
@@ -339,6 +340,9 @@ def validate(cfg):
 
     if cfg.get("voiceName") not in VOICE_NAMES:
         bad("voiceName", "音色非法，已回落到 %s" % DEFAULT_VOICE, DEFAULT_VOICE)
+
+    if not isinstance(cfg.get("scheduleEnabled"), bool):
+        bad("scheduleEnabled", "内容调度开关必须是布尔值，已按关闭处理", False)
 
     font = cfg.get("font")
     if isinstance(font, dict) and font.get("family") not in FONT_FAMILIES:

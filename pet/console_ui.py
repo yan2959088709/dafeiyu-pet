@@ -11,6 +11,7 @@
 右键菜单只保留少量高频入口，其余全部落到这里，避免继续往菜单里堆项。
 """
 import os
+import time
 
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QIcon
@@ -130,7 +131,10 @@ class ConsoleWindow(QMainWindow):
         self.nav.setFrameShape(QFrame.Shape.NoFrame)
         self.nav.setSpacing(int(layout_cfg["nav_spacing"]))
         self.nav.setViewportMargins(0, int(layout_cfg["nav_top_pad"]), 0, 0)
-        for text in _pad(texts["nav"], 5, ui_layout.DEFAULT["console_texts"]["nav"]):
+        nav_texts = list(texts["nav"] or [])
+        if len(nav_texts) == 5:      # 旧布局文件：在固定页序的槽位插入新页名
+            nav_texts = nav_texts[:3] + ["内容调度"] + nav_texts[3:]
+        for text in _pad(nav_texts, 6, ui_layout.DEFAULT["console_texts"]["nav"]):
             item = QListWidgetItem(text, self.nav)
             item.setSizeHint(QSize(0, int(layout_cfg["nav_item_h"])))
         self.nav.currentRowChanged.connect(self._on_nav)
@@ -140,13 +144,15 @@ class ConsoleWindow(QMainWindow):
         root.addWidget(self.stack, 1)
         self.layout_editor = None      # 懒加载：首次切到该页才建（动作解码不便宜）
         self.action_editor = None
+        self.schedule_editor = None
         self.page_home = self._build_home()
         self.page_layout = self._build_layout_page()
         self.page_action = self._build_action_page()
+        self.page_schedule = self._build_schedule_page()
         self.page_settings, self.settings = self._build_settings()
         self.page_manage = self._build_manage()
         for page in (self.page_home, self.page_layout, self.page_action,
-                     self.page_settings, self.page_manage):
+                     self.page_schedule, self.page_settings, self.page_manage):
             self.stack.addWidget(page)
 
         # 主窗口页的"当前动作/待播"会变，只在停留该页时轻量刷新
@@ -228,7 +234,55 @@ class ConsoleWindow(QMainWindow):
                               ("当前动作", self.home_emote),
                               ("待播动作", self.home_queue)):
             form.addRow(label, widget)
-        outer.addWidget(info)
+        life = QGroupBox("生命状态")
+        life_form = QFormLayout(life)
+        self.home_energy = QLabel("-")
+        self.home_mood = QLabel("-")
+        self.home_affinity = QLabel("-")
+        self.home_heartbeat = QLabel("-")
+        self.home_last = QLabel("-")
+        for label, widget in (("精力", self.home_energy),
+                              ("情绪", self.home_mood),
+                              ("亲密度", self.home_affinity),
+                              ("心跳", self.home_heartbeat),
+                              ("上次主动", self.home_last)):
+            life_form.addRow(label, widget)
+
+        sched = QGroupBox("今日调度")
+        sched_box = QVBoxLayout(sched)
+        self.home_schedule = QLabel("还没有启用的调度。")
+        self.home_schedule.setWordWrap(True)
+        sched_box.addWidget(self.home_schedule)
+        sched_btn = QPushButton("打开内容调度")
+        sched_btn.setAutoDefault(False)
+        sched_btn.clicked.connect(lambda: self.show_page("schedule"))
+        sched_box.addWidget(sched_btn)
+
+        columns = QHBoxLayout()
+        columns.addWidget(info, 1)
+        right_col = QVBoxLayout()
+        right_col.addWidget(life)
+        right_col.addWidget(sched)
+        right_col.addStretch(1)
+        columns.addLayout(right_col, 1)
+        outer.addLayout(columns)
+
+        quick = QHBoxLayout()
+        quick.setSpacing(6)
+        for text, slot in (
+                ("聊天", lambda: self._call("_show_chat_dialog")),
+                ("内在状态", lambda: self._call("_show_inner_state")),
+                ("自我提示词", lambda: self._call("_open_self_prompt")),
+                ("生活日志", lambda: self._call("_runtime_show_log")),
+                ("重型任务", lambda: self._call("_runtime_run_dialog")),
+                ("内容调度", lambda: self.show_page("schedule")),
+                ("全部设置", lambda: self.show_page("settings"))):
+            btn = QPushButton(text)
+            btn.setAutoDefault(False)
+            btn.clicked.connect(slot)
+            quick.addWidget(btn)
+        quick.addStretch(1)
+        outer.addLayout(quick)
 
         hint = QLabel(texts["home_hint"])
         hint.setWordWrap(True)
@@ -290,6 +344,27 @@ class ConsoleWindow(QMainWindow):
             self._action_hint = None
         self._action_host.addWidget(self.action_editor)
 
+    def _build_schedule_page(self):
+        page = QWidget()
+        box = QVBoxLayout(page)
+        box.setContentsMargins(0, 0, 0, 0)
+        self._schedule_host = box
+        self._schedule_hint = QLabel("正在准备内容调度…")
+        self._schedule_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box.addWidget(self._schedule_hint)
+        return page
+
+    def _ensure_schedule_editor(self):
+        if self.schedule_editor is not None:
+            return
+        from pet.schedule_editor import ScheduleEditor
+        self.schedule_editor = ScheduleEditor(self.owner)
+        if getattr(self, "_schedule_hint", None) is not None:
+            self._schedule_hint.hide()
+            self._schedule_hint.deleteLater()
+            self._schedule_hint = None
+        self._schedule_host.addWidget(self.schedule_editor)
+
     def _refresh_home(self):
         win = self.owner
         key = getattr(win, "character", "whale-girl")
@@ -315,6 +390,34 @@ class ConsoleWindow(QMainWindow):
         queue = getattr(win, "_emote_queue", None) or []
         self.home_queue.setText("%s（播完当前动作后接上）" % queue[0][0]
                                 if queue else "无")
+        try:
+            from pet import interoception
+            stats = interoception.short_status(win)
+        except Exception:
+            stats = {}
+        if stats:
+            self.home_energy.setText("%.0f/100" % stats.get("energy", 0))
+            self.home_mood.setText(str(stats.get("mood") or "-"))
+            self.home_affinity.setText("%.1f/100" % stats.get("affinity", 0))
+            self.home_heartbeat.setText(str(stats.get("reason_cn") or "无记录"))
+            last = float(stats.get("last_speak") or 0)
+            self.home_last.setText(
+                time.strftime("%m-%d %H:%M", time.localtime(last))
+                if last else "还没主动说过")
+        else:
+            self.home_energy.setText("心跳未初始化")
+            self.home_mood.setText("-")
+            self.home_affinity.setText("-")
+            self.home_heartbeat.setText("-")
+            self.home_last.setText("-")
+        self._home_tick_n = getattr(self, "_home_tick_n", 0) + 1
+        if self._home_tick_n % 10 == 1:
+            try:
+                from pet import schedule_store
+                self.home_schedule.setText(schedule_store.summary_text(
+                    schedule_store.load()["entries"]))
+            except Exception:
+                self.home_schedule.setText("-")
 
     def _tick_home(self):
         if self.isVisible() and self.stack.currentIndex() == 0:
@@ -709,11 +812,11 @@ class ConsoleWindow(QMainWindow):
 
     def show_page(self, page="home"):
         row = {"home": 0, "layout": 1, "action": 2,
-               "settings": 3, "manage": 4}.get(str(page), 0)
+               "schedule": 3, "settings": 4, "manage": 5}.get(str(page), 0)
         self.nav.setCurrentRow(row)
 
     def _on_nav(self, row):
-        row = max(0, min(4, int(row)))
+        row = max(0, min(5, int(row)))
         self.stack.setCurrentIndex(row)
         if row == 0:
             self._home_timer.start()
@@ -724,13 +827,15 @@ class ConsoleWindow(QMainWindow):
         elif row == 2:
             self._ensure_action_editor()
         elif row == 3:
-            self.settings._load_pets()
+            self._ensure_schedule_editor()
         elif row == 4:
+            self.settings._load_pets()
+        elif row == 5:
             self._refresh_gallery()
             self._refresh_actions()
             self._refresh_pets()
             self._refresh_service()
-        else:
+        if row == 0:
             self._refresh_home()
         # 离开布局页要撤掉预览气泡，否则桌宠会一直挂着"拆解中"的气泡
         if self.layout_editor is not None and row != 1:

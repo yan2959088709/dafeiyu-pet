@@ -36,6 +36,24 @@ def _state_of(win):
     return st, hb, storage_dir, pet_id
 
 
+def short_status(win, now=None):
+    """控制台快速面板用的轻量状态（不拼提示词、不读日志文件）。"""
+    st, hb, _, _ = _state_of(win)
+    if st is None:
+        return {}
+    reason = str(hb.get("last_reason") or "")
+    return {
+        "energy": max(0.0, min(100.0, float(getattr(st, "energy", 0.0) or 0.0))),
+        "mood": pet_drives.MOOD_CN.get(str(st.mood or "calm"),
+                                       str(st.mood or "平静")),
+        "affinity": max(0.0, min(100.0, float(getattr(st, "affinity", 0.0) or 0.0))),
+        "reason": reason,
+        "reason_cn": heartbeat_journal.REASON_CN.get(reason, reason or "无记录"),
+        "last_speak": float(hb.get("last_speak_time") or 0.0),
+        "last_speak_text": str(hb.get("last_speak_content") or ""),
+    }
+
+
 def _feel(table, value):
     for threshold, label in table:
         if value >= threshold:

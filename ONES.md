@@ -303,6 +303,20 @@
   > claude [Blueprint] 2026-11-10（用户已预批准）：DATA FLOW: drives.tick/apply_ai_reply → energy；heartbeat.decide 增加 not_tired 门禁；interoception.body/gates 解释代谢与疲惫；配置默认值同步。MODULE: ①drives.py 默认值/门禁区间/tired 阈值 ②heartbeat.py decide ③heartbeat_journal/interoception reason 映射+代谢说明 ④smoke 更新 drives/能量测试 + 新增疲惫门禁用例 ⑤ADR。INTEGRATION: 不改行动选择/权限/预算；本任务只让「累」可解释、可恢复、会阻止主动开口。TEST: 参数/门禁/内感受/全量 smoke。
   > claude [x] 2026-11-10: 交付，commit 30295e9。代谢：msg_energy_cost 2→1、energy_recovery_per_300s 2→3、energy_full_secs 4h→3h；新增 tired_threshold=15 与 heartbeat `not_tired` 门禁；旧默认三元组自动迁移（显式改过任一项或已带 tired_threshold 的配置保留）；interoception 增加代谢说明与「你现在很累」建议；心跳/内感受 reason 映射「太累了」。冒烟 187→189，189/189。ADR: docs/decisions/2026-11-10-metabolism-rhythm.md。未做（LifeLoop）：rest 自主意图、昼夜恢复调制、精力↔token 生存经济。
 
+### TASK-019: 桌宠面板 v2 — 快速面板 + 可编辑内容调度
+- **Executor**: claude
+- **Status**: [~]
+- **Dependencies**: TASK-017, TASK-018
+- **Contract**: 2026-11-10 用户「更新迭代桌宠面板，提供一个简易但俱全的快速面板以及在设计内提供更加详细具体的可编辑内容调度」
+- **Acceptance**:
+  1. 控制台主页升级为快速面板：生命状态（精力/情绪/亲密/心跳原因/上次主动）、快捷动作（聊天/内在状态/自我提示词/生活日志/重型任务/内容调度/设置）、今日调度摘要
+  2. 新增「内容调度」页：条目表（启用/时间/星期/类型/内容/上次执行）+ 新增/编辑/删除/启停/保存/重载；类型 say/reminder/care
+  3. 调度真正执行：每 30s 检查，按星期/时间/每日一次触发；reminder 走气泡+通知，say/care 走聊天出口；care 有精力门禁；生活日志记录
+  4. 节律与门禁可编辑：min_silent/min_interval/urgency/max_per_24h/max_consecutive/tired_threshold/energy cost/recovery/quiet window，保存后热更新引擎
+  5. smoke 更新 console/nav 用例 + 新增 schedule 用例，既有 189 项不回归
+- **Handoff log**:
+  > claude [~] 2026-11-10: claimed（用户直接要求面板迭代）。蓝图：①pet/schedule_store.py 数据层（条目校验/到期/下次/标记）②pet/schedule_runner.py 30s 调度执行 ③pet/schedule_editor.py 表格+编辑对话框+节律门禁表单 ④console_ui 主页快速面板 + 新增第 6 页「内容调度」⑤桌宠.py 挂 ScheduleMixin ⑥ui_layout nav 6 项 ⑦smoke 更新 console/nav + schedule 用例 ⑧ADR。边界：调度是用户显式安排，不受安睡窗限制；care 走模型但暂不单独记 token；schedule.json 属运行期数据，file 工具禁写。
+
 ---
 
 ## Messages

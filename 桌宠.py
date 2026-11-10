@@ -63,6 +63,7 @@ from pet import time_context as pet_time                           # noqa: E402
 from pet.workstatus_ui import WorkStatusMixin                      # noqa: E402
 from pet.runtime_ui import RuntimeMixin                            # noqa: E402
 from pet.self_prompt_ui import SelfPromptMixin                     # noqa: E402
+from pet.schedule_runner import ScheduleMixin                      # noqa: E402
 from pet import geometry as pet_geometry                           # noqa: E402
 from pet.drag import DragState                                     # noqa: E402
 from pet import font_ui                                            # noqa: E402
@@ -1232,7 +1233,7 @@ def _pos_key(pos):
 class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
                 GadgetMixin, BalanceMixin, MenuMixin, FactsPanelMixin, SoundMixin,
                 ServiceHooksMixin, DesktopMixin, PointPickMixin, WorkStatusMixin,
-                RuntimeMixin, SelfPromptMixin, QWidget):
+                RuntimeMixin, SelfPromptMixin, ScheduleMixin, QWidget):
     def __init__(self, pet=None, with_tray=True):
         self.pet_conf = pet or {}
         self.pet_id = str(self.pet_conf.get("id") or "main")
@@ -1273,6 +1274,7 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         self.drag_state = DragState()        # 起手阈值/弹弓/松手三态（新状态机）
         self._desktop_init()                 # 置顶看门狗（多屏兜底/穿透在同模块）
         self._work_status_init()             # 工作状态 → 气泡/动作（轮询状态叶子）
+        self._schedule_init()                # 内容调度（30s 一拍，按时间表触发）
         self.mode = self.cfg.get("mode", "wander")
         if self.mode not in ("wander", "follow", "still"):
             self.mode = "wander"

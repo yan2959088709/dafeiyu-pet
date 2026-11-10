@@ -53,7 +53,7 @@ PROTECTED_WRITE_NAMES = {
     "config.json", "config.jsonc", "pet_sessions.json", "pet_sessions.json.bak",
     "pet_memory.json", "usage_ledger.json", "logs.txt", "api-runtime.json",
     "self_prompt.json", "heartbeat_journal.json", "pet_runtime.json",
-    "life_log.jsonl", "dsh-runtime.patch.yml",
+    "life_log.jsonl", "schedule.json", "dsh-runtime.patch.yml",
 }
 PROTECTED_WRITE_DIRS = (".venv",)
 

@@ -1412,7 +1412,7 @@ def _():
     assert sub is not None
     assert [a.text() for a in sub.actions()] == ["网页", "桌面", "两者都显示", "都不显示"]
     console = w._open_settings()
-    assert console is not None and console.stack.count() == 5
+    assert console is not None and console.stack.count() == 6
     assert console.settings.embedded is True
     console.hide()
 
@@ -1424,16 +1424,18 @@ def _():
     w = CTX["win"]
     ui = ConsoleWindow(w)
     try:
-        assert ui.nav.count() == 5, ui.nav.count()
-        assert ui.stack.count() == 5, ui.stack.count()
-        # 导航顺序：主窗口 / 界面布局 / 动作绑定 / 设置 / 管理
-        assert [ui.nav.item(i).text() for i in range(5)] == [
-            "主窗口", "界面布局", "动作绑定", "设置", "管理"], \
-            [ui.nav.item(i).text() for i in range(5)]
+        assert ui.nav.count() == 6, ui.nav.count()
+        assert ui.stack.count() == 6, ui.stack.count()
+        # 导航顺序：主窗口 / 界面布局 / 动作绑定 / 内容调度 / 设置 / 管理
+        assert [ui.nav.item(i).text() for i in range(6)] == [
+            "主窗口", "界面布局", "动作绑定", "内容调度", "设置", "管理"], \
+            [ui.nav.item(i).text() for i in range(6)]
         assert ui.skin_list.count() == len(SKIN_ORDER)
         icons = [ui.skin_list.item(i).icon() for i in range(ui.skin_list.count())]
         assert any(not icon.isNull() for icon in icons), "皮肤库应有预览图标"
         assert ui.settings.cb_voice is not None
+        assert ui.home_energy.text() != "-", ui.home_energy.text()
+        assert ui.home_schedule.text(), "今日调度摘要不能为空"
         ui._refresh_actions()
         old = w.character
         ui.apply_skin("dsh-pet")
@@ -3648,7 +3650,7 @@ def _():
     _reset_motion_state(w)
 
 
-@check("panel: 导航五页 / 懒加载 / 内嵌编辑器 / 撤销重做与键盘微调")
+@check("panel: 导航六页 / 懒加载 / 内嵌编辑器 / 撤销重做与键盘微调")
 def _():
     from PySide6.QtCore import QEvent, QRectF, Qt
     from PySide6.QtGui import QKeyEvent
@@ -3660,12 +3662,17 @@ def _():
 
     ui = ConsoleWindow(w)
     try:
-        assert ui.nav.count() == 5, ui.nav.count()
-        assert ui.stack.count() == 5, ui.stack.count()
-        assert [ui.nav.item(i).text() for i in range(5)] == [
-            "主窗口", "界面布局", "动作绑定", "设置", "管理"]
+        assert ui.nav.count() == 6, ui.nav.count()
+        assert ui.stack.count() == 6, ui.stack.count()
+        assert [ui.nav.item(i).text() for i in range(6)] == [
+            "主窗口", "界面布局", "动作绑定", "内容调度", "设置", "管理"]
         # 懒加载：没切过去之前不构造（动作解码不便宜）
         assert ui.layout_editor is None and ui.action_editor is None
+        assert ui.schedule_editor is None
+        ui.show_page("schedule")
+        assert ui.schedule_editor is not None
+        assert ui.stack.currentIndex() == 3
+        ui.show_page("home")
         ui.show_page("layout")
         assert ui.layout_editor is not None and ui.layout_editor.embedded is True
         assert ui.stack.currentIndex() == 1
@@ -3677,7 +3684,7 @@ def _():
         assert ui.action_editor is not None and ui.action_editor.embedded is True
         assert ui.action_editor.tabs.count() == 9, ui.action_editor.tabs.count()
         ui.show_page("manage")
-        assert ui.stack.currentIndex() == 4
+        assert ui.stack.currentIndex() == 5
         # 主页的当前动作/待播只在停留该页时刷新
         assert not ui._home_timer.isActive(), "非主页应停掉定时刷新"
         ui.show_page("home")
@@ -7614,6 +7621,115 @@ def _():
     st.energy = 15.0
     dec = eng.decide(st, eng._hb, _t.time())
     assert dec.reason != "not_tired", dec
+
+
+@check("schedule_store: 校验/到期/下次/标记")
+def _():
+    import datetime as _dt
+    from pet import schedule_store as S
+    p = os.path.join(CTX["tmpdir"], "schedule_unit.json")
+    now = _dt.datetime(2026, 11, 10, 8, 30, 30)
+    ts = now.timestamp()
+    wd = now.weekday()
+    good = {"id": "s1", "enabled": True, "time": "08:30", "days": [wd],
+            "kind": "say", "content": "早上好"}
+    assert S.due_entries([good], ts)
+    assert not S.due_entries([dict(good, last_fired="2026-11-10")], ts)
+    assert not S.due_entries([dict(good, enabled=False)], ts)
+    assert not S.due_entries([dict(good, time="08:29")], ts)
+    assert not S.due_entries([dict(good, days=[(wd + 1) % 7])], ts)
+    assert S.validate_entry(good) == ""
+    assert S.validate_entry(dict(good, time="25:00"))
+    assert S.validate_entry(dict(good, content=""))
+    assert S.validate_entry(dict(good, days=[]))
+    S.save([good], p)
+    assert S.load(p)["entries"][0]["content"] == "早上好"
+    S.mark_fired("s1", "ok", ts, p)
+    saved = S.load(p)["entries"][0]
+    assert saved["last_fired"] == "2026-11-10", saved
+    S.save([dict(saved, content="早上好呀")], p)
+    assert S.load(p)["entries"][0]["last_fired"] == "2026-11-10"
+    upcoming = S.next_entries([dict(good, time="09:00")], ts, 1)
+    assert upcoming and upcoming[0][0].hour == 9, upcoming
+    assert S.weekday_text([0, 1, 2, 3, 4]) == "周一至周五"
+    assert S.weekday_text(list(range(7))) == "每天"
+
+
+@check("schedule: runner 触发 say 一次并写 last_fired")
+def _():
+    import datetime as _dt
+    import time as _t
+    from pet import schedule_store as S
+    w = CTX["win"]
+    runner = getattr(w, "_schedule", None)
+    if runner is None:
+        w._schedule_init()
+        runner = getattr(w, "_schedule", None)
+    assert runner is not None
+    path = S.path()
+    backup = open(path, "rb").read() if os.path.exists(path) else None
+    old_say = w.say
+    old_enabled = w.cfg.get("scheduleEnabled", True)
+    seen = []
+    now = _t.time()
+    lt = _t.localtime(now)
+    today = "%04d-%02d-%02d" % (lt.tm_year, lt.tm_mon, lt.tm_mday)
+    entry = {"id": "s-run", "enabled": True,
+             "time": "%02d:%02d" % (lt.tm_hour, lt.tm_min),
+             "days": [_dt.date.today().weekday()], "kind": "say",
+             "content": "调度测试句子"}
+    try:
+        w.cfg["scheduleEnabled"] = True
+        w.say = lambda text, **kwargs: seen.append(text)
+        S.save([entry], path)
+        runner._fire(dict(S.load(path)["entries"][0]), now)
+        assert "调度测试句子" in seen, seen
+        saved = S.load(path)["entries"][0]
+        assert saved["last_fired"] == today, saved
+        assert not S.due_entries([saved], now + 30)
+    finally:
+        w.say = old_say
+        w.cfg["scheduleEnabled"] = old_enabled
+        if backup is not None:
+            open(path, "wb").write(backup)
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+@check("schedule: 节律保存热更新引擎")
+def _():
+    import copy
+    from pet.schedule_editor import ScheduleEditor
+    w = CTX["win"]
+    old_hb = copy.deepcopy(w.cfg.get("heartbeat") or {})
+    old_engine = copy.deepcopy(getattr(w._heartbeat, "cfg", {}) or {})
+    old_drives = copy.deepcopy(getattr(w._drives, "cfg", {}) or {})
+    try:
+        editor = ScheduleEditor(w)
+        editor.spin_tired.setValue(22)
+        editor.spin_cost.setValue(1.5)
+        editor.spin_recovery.setValue(4.0)
+        editor.combo_quiet.setCurrentIndex(1)
+        editor.spin_qs.setValue(1)
+        editor.spin_qe.setValue(7)
+        editor._save_rhythm()
+        assert w.cfg["heartbeat"]["tired_threshold"] == 22
+        assert w._heartbeat.cfg["tired_threshold"] == 22
+        assert w._drives.cfg["msg_energy_cost"] == 1.5
+        assert w.cfg["heartbeat"]["quiet_window"] == [1, 7]
+    finally:
+        w.cfg["heartbeat"] = old_hb
+        if getattr(w, "_heartbeat", None) is not None:
+            w._heartbeat.cfg = dict(old_engine)
+        if getattr(w, "_drives", None) is not None:
+            w._drives.cfg = dict(old_drives)
+        try:
+            w._save_cfg()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- 运行器

@@ -371,6 +371,10 @@ class ChatMixin:
         所以整拍挪到工作线程；上屏由 _whisper_generate 内部封送回来。
         busy 闸门防重入：上一拍还没回来就跳过这一拍。
         """
+        try:
+            self._schedule_tick()   # 用户显式内容调度，与心跳/碎碎念开关无关
+        except Exception:
+            pass
         if self._heartbeat is not None:
             # 心跳引擎接管这一拍（仍在 GUI 线程；关闭时 legacy 路径原样不动）。
             # 开关读活配置（self.cfg）：_hb_init 缓存的段引用会被 _api_reload /
