@@ -215,7 +215,7 @@
 
 ### TASK-013: Stage 2a 记忆相关度召回（替代 facts 全量注入）
 - **Executor**: claude
-- **Status**: [~]
+- **Status**: [x]
 - **Dependencies**: TASK-010
 - **Contract**: 本块 [Blueprint]（2026-11-09 主会话设计，Stage 2 第一捻）
 - **Acceptance**:
@@ -229,6 +229,7 @@
   > TEST: ①相关度排序（上下文提「加班」→加班 fact 进、无关的出列）②时间衰减（同相关度新 fact 胜旧 fact）③legacy 纯字符串不崩且可排序 ④K 截断/空 facts/全不相关 ⑤命中回写落盘 ⑥既有 prompt 构建与 _call_ds 链路用例不回归。
   > ELEGANCE: 无新依赖（不引 jieba/向量库）；二元组重叠对 ≤30 字短 fact 足够；embedding/向量检索留 Stage 2b（facts 过百再上，TASK-009 同款判断）。
   > RISK: 全量→相关注入是行为变化，可能漏「当前不相关但重要」的事实——K=8+衰减保底+hits 加权缓解；legacy 兼容必须零迁移；回写并发走既有 _mem_lock。
+  > claude [x] 2026-11-10: 交付，commit 900c7be。新增 pet/memory_recall.py（Fact/score_facts：字符二元组相关度 × 7 天半衰期 × hits；空 context/全不相关按 recency 保底）；memory.py 旁路 fact_meta（ts/last_access/hits）与 parse_facts（legacy 字符串零迁移）；_recall_facts 命中回写并落盘；chat._build_system_prompt(context_text) 与 heartbeat._speak 改 top-K；memoryRecallK 默认 8（1-20，设置页可调）；facts_ui 编辑时元数据跟随改名。冒烟 177 → 181，181/181。ADR: docs/decisions/2026-11-10-memory-recall.md。
 
 ### TASK-014: TASK-010/012 清理与重构 backlog
 - **Executor**: claude
