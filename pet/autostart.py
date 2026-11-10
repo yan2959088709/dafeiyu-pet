@@ -49,6 +49,20 @@ def write_quit_flag(app_dir):
         return False
 
 
+def clear_quit_flag(app_dir=None):
+    """撤掉退出标记（退出投递失败时用：别让它压制下次崩溃重拉）。"""
+    try:
+        if app_dir is None:
+            from pet.storage import P
+            app_dir = P.app_dir
+        path = quit_flag_path(app_dir)
+        if os.path.exists(path):
+            os.remove(path)
+        return True
+    except Exception:
+        return False
+
+
 def enabled():
     """事实口径：.lnk 在不在（配置可能和事实脱节，以事实为准）。"""
     path = lnk_path()
@@ -56,22 +70,26 @@ def enabled():
 
 
 def _target_args(app_dir):
-    """直接启动桌宠的 (target, args, workdir)。"""
+    """直接启动桌宠的 (target, args)。"""
     import sys
 
     from pet.storage import P
     frozen = getattr(sys, "frozen", False)
-    return P.pythonw, ("" if frozen else os.path.join(app_dir, "桌宠.py")), app_dir
+    return P.pythonw, ("" if frozen else os.path.join(app_dir, "桌宠.py"))
 
 
 def watchdog_script(app_dir):
-    """看门狗 bat 内容（纯函数，便于测试）。"""
-    target, args, _workdir = _target_args(app_dir)
+    """看门狗 bat 内容（纯函数，便于测试）。
+
+    单轮最多重拉 4 次（共启动 5 次）：启动即崩的崩溃循环空转 5 回就停，
+    重新登录重置计数。
+    """
+    target, args = _target_args(app_dir)
     cmd = '"%s" "%s"' % (target, args) if args else '"%s"' % target
     return (
         "@echo off\n"
         "rem 桌宠看门狗：进程消失就重拉；主人主动退出（quit.flag）不重启。\n"
-        "rem 单轮最多重拉 %d 次，防崩溃循环空转；重新登录重置计数。\n"
+        "rem 单轮最多重拉 4 次（共启动 5 次），防崩溃循环空转；重新登录重置。\n"
         "cd /d \"%s\"\n"
         "set /a runs=0\n"
         ":watch\n"
@@ -82,19 +100,31 @@ def watchdog_script(app_dir):
         "if %%runs%% GEQ %d exit /b 0\n"
         "timeout /t 3 /nobreak >nul\n"
         "goto watch\n"
-        % (MAX_RELAUNCH, app_dir, QUIT_FLAG_NAME, QUIT_FLAG_NAME, cmd,
+        % (app_dir, QUIT_FLAG_NAME, QUIT_FLAG_NAME, cmd,
            QUIT_FLAG_NAME, QUIT_FLAG_NAME, MAX_RELAUNCH)
     )
 
 
 def write_watchdog(app_dir):
-    """落盘看门狗脚本。失败返回 False（调用方据此不指 .lnk 过去）。"""
+    """落盘看门狗脚本。失败返回 False（调用方据此不指 .lnk 过去）。
+
+    编码用 mbcs（= 系统 ANSI 码页）：cmd 解析 bat 用的是 ANSI/OEM 码页，
+    写 UTF-8 会让中文路径/「桌宠.py」变乱码，start 静默失败——看门狗等于
+    瘫痪（zh-CN Windows 上 ANSI 与 OEM 都是 936，短名方案备选但没必要）。
+    """
     try:
-        with open(watchdog_path(app_dir), "w", encoding="utf-8") as fh:
+        with open(watchdog_path(app_dir), "w",
+                  encoding="mbcs" if os.name == "nt" else "utf-8") as fh:
             fh.write(watchdog_script(app_dir))
         return True
     except Exception:
         return False
+
+
+def flag_quit():
+    """主动退出标记（便捷入口：自己取 app_dir）。"""
+    from pet.storage import P
+    return write_quit_flag(P.app_dir)
 
 
 def set_enabled(on, *, recover=True, app_dir=None):
@@ -116,11 +146,22 @@ def set_enabled(on, *, recover=True, app_dir=None):
                     return False, "看门狗脚本写入失败"
                 target, args = watchdog_path(app_dir), ""
             else:
-                target, args, _wd = _target_args(app_dir)
-            ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}');"
-                  "$s.TargetPath='{}';$s.Arguments='\"{}\"';$s.WorkingDirectory='{}';$s.Save()"
-                  .format(path, target, args, app_dir))
+                target, args = _target_args(app_dir)
+            # 值一律经子进程环境变量传递，脚本本体是固定字符串：路径里带
+            # 单引号/分号（如 O'Brien 用户名、it's a pet 目录名）既不能注入
+            # PowerShell，也不会把自启悄悄弄坏
+            ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
+                  "$env:DSH_PET_LNK);$s.TargetPath=$env:DSH_PET_TARGET;"
+                  "$s.Arguments=$env:DSH_PET_ARGS;"
+                  "$s.WorkingDirectory=$env:DSH_PET_WORKDIR;"
+                  "$s.WindowStyle=7;$s.Save()")
+            env = dict(os.environ)
+            env["DSH_PET_LNK"] = path
+            env["DSH_PET_TARGET"] = target
+            env["DSH_PET_ARGS"] = args
+            env["DSH_PET_WORKDIR"] = app_dir
             subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           env=env,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                            check=True, timeout=30)
         else:

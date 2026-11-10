@@ -486,12 +486,8 @@ class PetService:
     def quit_app(self):
         # 主动退出先留标记：看门狗（pet-watchdog.bat）看到 quit.flag 就
         # 不重拉；崩溃路径没有这个旗标，看门狗才会把它拉起来
-        try:
-            from pet import autostart
-            from pet.storage import P
-            autostart.write_quit_flag(P.app_dir)
-        except Exception:
-            pass
+        from pet import autostart
+        autostart.flag_quit()
         delivered = 0
         for _pid, hooks in self._pets.items():
             fn = hooks.get("quit")
@@ -501,6 +497,10 @@ class PetService:
                     delivered += 1
                 except Exception:
                     pass
+        if not delivered:
+            # 一个窗口都没退出成功：进程不会退，残留旗标会压制下一次真正的
+            # 崩溃重拉——撤掉它
+            autostart.clear_quit_flag()
         return ok(quit=True, delivered=delivered)
 
     def pet_config(self, body):

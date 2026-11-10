@@ -26,6 +26,9 @@ DEFAULT_RUNTIME = {
 }
 PERMISSION_MODES = ("workspace-write", "read-only")
 RUNS_FILE = "pet_runtime.json"
+# 门禁检查与记账的原子锁：两条路（设置页/右键 与 AI delegate_task）并发时，
+# check→record 之间的窗口会放进两个内核（双倍成本）
+_START_LOCK = threading.Lock()
 ESTIMATE_TOKENS = 15000      # DSH trivial 任务实测 ~14.2k；预检按 15k 留余量
 TOOL_DISABLE = (
     "tool-bash", "tool-pwsh", "tool-jobs", "tool-todo", "tool-goal",
@@ -62,37 +65,39 @@ def start_task(goal, *, cfg, pet_id, key, persona, ledger_loader=None,
     if not rt.get("enabled"):
         return False, "执行内核还没启用（设置 → 执行内核）"
     gate = RuntimeGate(rt, pet_id, os.path.dirname(P.memory), ledger_loader)
-    ok, reason = gate.check()
-    if not ok:
-        return False, reason
-    if not key:
-        return False, "先设置 DeepSeek Key 才能跑重型任务"
-    try:
-        runtime = build_dsh_runtime(rt, key=key, persona=persona,
-                                    app_dir=app_dir or P.app_dir)
-    except Exception as exc:
-        return False, "执行内核构建失败：%s" % exc
-    gate.record_run()
-    timeout = max(30, int(rt.get("timeoutSec") or 300))
-
-    def worker():
+    with _START_LOCK:
+        ok, reason = gate.check()
+        if not ok:
+            return False, reason
+        if not key:
+            return False, "先设置 DeepSeek Key 才能跑重型任务"
         try:
-            result = runtime.run(goal, timeout=timeout)
+            runtime = build_dsh_runtime(rt, key=key, persona=persona,
+                                        app_dir=app_dir or P.app_dir)
         except Exception as exc:
-            result = agent_runtime.RuntimeResult(
-                runtime="dsh", text="", exit_code=1, error=str(exc))
-        if on_finish is None:
-            return
-        if ui_call is not None:
-            ui_call(on_finish, goal, result)
-        else:
-            on_finish(goal, result)
+            return False, "执行内核构建失败：%s" % exc
 
-    try:
-        threading.Thread(target=worker, name="dsh-runtime",
-                         daemon=True).start()
-    except Exception as exc:
-        return False, "重型任务启动失败：%s" % exc
+        def worker():
+            try:
+                result = runtime.run(goal, timeout=timeout)
+            except Exception as exc:
+                result = agent_runtime.RuntimeResult(
+                    runtime="dsh", text="", exit_code=1, error=str(exc))
+            if on_finish is None:
+                return
+            if ui_call is not None:
+                ui_call(on_finish, goal, result)
+            else:
+                on_finish(goal, result)
+
+        timeout = max(30, int(rt.get("timeoutSec") or 300))
+        try:
+            threading.Thread(target=worker, name="dsh-runtime",
+                             daemon=True).start()
+        except Exception as exc:
+            return False, "重型任务启动失败：%s" % exc
+        # 起线程成功才记账：启动就失败的那次不该烧掉日预算
+        gate.record_run()
     return True, ""
 
 

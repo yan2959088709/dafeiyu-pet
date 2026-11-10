@@ -550,6 +550,11 @@ class MenuMixin:
             self.raise_()
 
     def quit_app(self):
+        # 主动退出先留标记：看门狗（pet-watchdog.bat）看到 quit.flag 才不
+        # 重拉。托盘退出与 API /quit 是并列的两条主动退出口，漏了这条
+        # 主人就关不掉桌宠（退出 3 秒后又被拉起来）
+        from pet import autostart
+        autostart.flag_quit()
         self.cfg["x"], self.cfg["y"] = self.x(), self.y()
         self._save_cfg()
         # 多宠只有第一只有托盘；第 2..N 只与「关托盘图标」时 tray 为 None

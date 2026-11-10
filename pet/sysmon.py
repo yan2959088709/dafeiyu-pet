@@ -225,13 +225,16 @@ def window_op(hwnd, action):
         import ctypes
         user32 = ctypes.windll.user32
         hwnd = int(hwnd)
+        if not user32.IsWindow(hwnd):
+            return False, "窗口已不在（句柄失效）"
         if act == "activate":
             if user32.IsIconic(hwnd):
                 user32.ShowWindow(hwnd, SW_RESTORE)
             if not user32.SetForegroundWindow(hwnd):
                 return False, "系统不允许直接抢焦点（她不是前台进程）"
             return True, ""
-        user32.ShowWindow(hwnd, _WINDOW_ACTS[act])
+        if not user32.ShowWindow(hwnd, _WINDOW_ACTS[act]):
+            return False, "系统拒绝了这个窗口操作"
         return True, ""
     except Exception as e:
         return False, str(e)

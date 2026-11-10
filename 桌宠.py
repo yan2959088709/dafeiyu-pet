@@ -1907,7 +1907,8 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
 
         # 文件系统事件感知：轮询快照 diff，新变化进 _watch_events 供下次
         # 心跳观察（器灵的基本感知——下载文件夹来了新文件，她得知道）
-        if now_ms - self.last_watch_check > 10000:
+        from pet import filewatch
+        if now_ms - self.last_watch_check > filewatch.POLL_SECS * 1000:
             self.last_watch_check = now_ms
             try:
                 self._watch_poll()
@@ -1930,10 +1931,16 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         首轮只播种不产事件（否则启动即把整个目录当「新文件」刷屏）。
         """
         from pet import filewatch
+        from pet import harness as _harness
         dirs = [str(d) for d in (self.cfg.get("watchDirs") or [])
                 if isinstance(d, str) and d.strip()]
+        # 每轮复核沙盒：add 之后目录可能被换成联接点/移出白名单，
+        # 轮询侧必须自己再判一次（TOCTOU）
+        dirs = [d for d in dirs if _harness.watch_allowed(self, d)]
         if not dirs:
-            self._watch_prev = {}
+            # 置 None 而不是 {}：之后 add 了目录要重新播种，否则整份现存
+            # 文件会被当成「新文件」刷屏
+            self._watch_prev = None
             return
         cur = filewatch.snapshot(dirs)
         prev = self._watch_prev

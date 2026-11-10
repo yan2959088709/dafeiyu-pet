@@ -113,20 +113,23 @@ class RuntimeMixin:
 
     def _runtime_start(self, goal):
         # 核心逻辑（门禁/构建/记账/线程/封送）抽在 runtime_manager.start_task，
-        # AI 的 delegate_task 工具与这里走同一条路；本方法只剩 GUI 表现
+        # AI 的 delegate_task 工具与这里走同一条路；本方法只剩 GUI 表现。
+        # busy 先置位：start_task 内部会起线程，置位晚了会被 AI 工具的
+        # 并发调用钻空子（双内核）
         key = (getattr(self, "cfg", {}) or {}).get("ds_api_key", "")
         persona = pet_persona.persona_text(
             (getattr(self, "pet_conf", None) or {}).get("whisperPrompt"),
             (getattr(self, "cfg", {}) or {}).get("whisperPrompt"), "")
+        self._runtime_busy = True
         ok, reason = runtime_manager.start_task(
             goal, cfg=getattr(self, "cfg", {}) or {},
             pet_id=getattr(self, "pet_id", None), key=key, persona=persona,
             ledger_loader=getattr(self, "_load_ledger", None),
             on_finish=self._runtime_finish, ui_call=self._ui_call)
         if not ok:
+            self._runtime_busy = False
             self.say(reason)
             return
-        self._runtime_busy = True
         self._runtime_work("working", "重型任务：%s" % goal[:36])
         self.say("开始跑重型任务（DSH），可能要几十秒…")
 
