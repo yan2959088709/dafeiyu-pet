@@ -274,7 +274,7 @@
 
 ### TASK-017: 内在感受与自我提示词（心跳可感知 / 自主修改 Prompt）
 - **Executor**: claude
-- **Status**: [~]
+- **Status**: [x]
 - **Dependencies**: TASK-010, TASK-013
 - **Contract**: 2026-11-10 用户「从 AI 生命体的角度出发，其应当具备自己状态的完整查看，甚至可以修改自己的 Prompt」
 - **Acceptance**:
@@ -286,6 +286,7 @@
 - **Handoff log**:
   > claude [~] 2026-11-10: claimed（用户明确批准）。用户观察到普通聊天里 AI 说「没有心跳」——根因：drives/心跳只进主动提示词，普通聊天无身体状态，且静默尝试不落记忆；实机精力 1.3/100。本任务让状态可感知、可查询、可记忆、可自改 Prompt。
   > claude [Blueprint] 2026-11-10（用户已预批准）：DATA FLOW: drives.st + heartbeat.state + heartbeat_journal + self_prompt → interoception.body_text/feel_heartbeat → chat prompt/harness tool；heartbeat 判定/静默/发言写 journal；manage_self_prompt 写 self_prompt.json（版本化）。MODULE: ①pet/heartbeat_journal.py（ring buffer/摘要）②pet/interoception.py（身体状态/门禁/降级）③pet/self_prompt.py（版本化/回滚）④pet/self_prompt_ui.py（人工编辑/内在状态面板）⑤heartbeat.py（last_reason/last_urgency + 日志）⑥chat.py（内感受+自我提示词注入）⑦harness.py（feel_heartbeat/manage_self_prompt + 能力清单 + 写保护）⑧settings/menus/桌宠.py 挂 UI ⑨smoke ⑩ADR。INTEGRATION: 不改精力结算与权限；self_prompt 只做补充提示词，核心人设/权限不可被它覆盖；journal 属运行期数据，file 工具禁写。TEST: 纯函数 + 提示词注入 + 工具 dispatch + 心跳静默日志 + 全量 smoke。
+  > claude [x] 2026-11-10: 交付，commit 8f6477f。新增 pet/interoception.py（body_text/gates_text/feel_heartbeat/recent_text）、pet/heartbeat_journal.py（200 条/7 天 ring，skip 10 分钟限流，24h 摘要）、pet/self_prompt.py（版本化/回滚/1500 字上限）、pet/self_prompt_ui.py（自我提示词编辑器 + 内在状态面板）；heartbeat 状态新增 last_reason/last_urgency/last_gates 并写 journal；chat 提示词注入身体段+自我提示词；harness 新增 feel_heartbeat/manage_self_prompt，能力清单 7/8 项，写保护扩展到 self_prompt/heartbeat_journal/pet_runtime/life_log 与前缀族；右键数据菜单加「自我提示词…」「内在状态…」。冒烟 181 → 187，187/187。ADR: docs/decisions/2026-11-10-interoception-self-prompt.md。未改：精力消耗/恢复数值（真实「累」保留，调参另开任务）。
 
 ---
 
