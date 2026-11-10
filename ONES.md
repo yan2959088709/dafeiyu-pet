@@ -290,7 +290,7 @@
 
 ### TASK-018: 代谢与节律 v1（精力消耗/恢复/疲惫门禁）
 - **Executor**: claude
-- **Status**: [~]
+- **Status**: [x]
 - **Dependencies**: TASK-010, TASK-017
 - **Contract**: 2026-11-10 用户「从生命体出发，考虑全面一点」；实机精力 1.3/100、心跳长期不触发
 - **Acceptance**:
@@ -301,6 +301,7 @@
 - **Handoff log**:
   > claude [~] 2026-11-10: claimed（用户「可以按照你的推荐来」）。生命体审计：当前只有状态没有行动选择、只有事件没有情节、只有表达没有反馈；代谢是行动循环的货币，先修正「长期 1.3/100」与疲惫不解释。
   > claude [Blueprint] 2026-11-10（用户已预批准）：DATA FLOW: drives.tick/apply_ai_reply → energy；heartbeat.decide 增加 not_tired 门禁；interoception.body/gates 解释代谢与疲惫；配置默认值同步。MODULE: ①drives.py 默认值/门禁区间/tired 阈值 ②heartbeat.py decide ③heartbeat_journal/interoception reason 映射+代谢说明 ④smoke 更新 drives/能量测试 + 新增疲惫门禁用例 ⑤ADR。INTEGRATION: 不改行动选择/权限/预算；本任务只让「累」可解释、可恢复、会阻止主动开口。TEST: 参数/门禁/内感受/全量 smoke。
+  > claude [x] 2026-11-10: 交付，commit 30295e9。代谢：msg_energy_cost 2→1、energy_recovery_per_300s 2→3、energy_full_secs 4h→3h；新增 tired_threshold=15 与 heartbeat `not_tired` 门禁；旧默认三元组自动迁移（显式改过任一项或已带 tired_threshold 的配置保留）；interoception 增加代谢说明与「你现在很累」建议；心跳/内感受 reason 映射「太累了」。冒烟 187→189，189/189。ADR: docs/decisions/2026-11-10-metabolism-rhythm.md。未做（LifeLoop）：rest 自主意图、昼夜恢复调制、精力↔token 生存经济。
 
 ---
 
