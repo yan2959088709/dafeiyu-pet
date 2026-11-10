@@ -8377,6 +8377,178 @@ def _():
         pass
 
 
+@check("runtime: start_task 抽取（门禁/无Key/构建失败/起线程回调）")
+def _():
+    from pet import runtime_manager as R
+    from pet.agent_runtime import RuntimeResult
+    w = CTX["win"]
+    cfg = dict(w.cfg)
+    cfg["runtime"] = dict(R.DEFAULT_RUNTIME, enabled=True)
+    old_gate, old_build = R.RuntimeGate, R.build_dsh_runtime
+
+    class _Gate:
+        def __init__(self, *a, **kw):
+            pass
+
+        def check(self, estimate=None):
+            return (True, "")
+
+        def record_run(self):
+            pass
+
+    class _RT:
+        def run(self, goal, timeout=None):
+            return RuntimeResult(runtime="dsh", text="done", exit_code=0)
+
+    try:
+        # 执行内核没启用
+        ok, reason = R.start_task("x", cfg=w.cfg, pet_id=None,
+                                  key="sk-test", persona="p")
+        assert ok is False and "启用" in reason, (ok, reason)
+        # 门禁不过
+        R.RuntimeGate = type("G", (_Gate,), {
+            "check": lambda self, estimate=None: (False, "今天预算用完了")})
+        ok, reason = R.start_task("x", cfg=cfg, pet_id=None,
+                                  key="sk-test", persona="p")
+        assert ok is False and "预算" in reason, (ok, reason)
+        R.RuntimeGate = _Gate
+        # 无 Key
+        ok, reason = R.start_task("x", cfg=cfg, pet_id=None,
+                                  key="", persona="p")
+        assert ok is False and "Key" in reason, (ok, reason)
+        # 构建失败
+        def boom_build(rt, **kw):
+            raise RuntimeError("node not found")
+
+        R.build_dsh_runtime = boom_build
+        ok, reason = R.start_task("x", cfg=cfg, pet_id=None,
+                                  key="sk-test", persona="p")
+        assert ok is False and "node not found" in reason, (ok, reason)
+        # 正常：起 daemon 线程，on_finish 收到结果（无 ui_call 时原地调用）
+        R.build_dsh_runtime = lambda rt, **kw: _RT()
+        done = []
+        ok, reason = R.start_task("跑个活", cfg=cfg, pet_id=None,
+                                  key="sk-test", persona="p",
+                                  on_finish=lambda g, r: done.append((g, r.text)))
+        assert ok, reason
+        for _ in range(50):
+            if done:
+                break
+            time.sleep(0.1)
+        assert done and done[0] == ("跑个活", "done"), done
+        # runtime.run 抛桩也变成 Result 送到 on_finish（不卡 busy）
+
+        class _Boom:
+            def run(self, goal, timeout=None):
+                raise RuntimeError("worker exploded")
+
+        R.build_dsh_runtime = lambda rt, **kw: _Boom()
+        done.clear()
+        ok, reason = R.start_task("会炸的活", cfg=cfg, pet_id=None,
+                                  key="sk-test", persona="p",
+                                  on_finish=lambda g, r: done.append((g, r.error)))
+        assert ok, reason
+        for _ in range(50):
+            if done:
+                break
+            time.sleep(0.1)
+        assert done and "worker exploded" in done[0][1], done
+        # ui_call 封送：on_finish 经 ui_call 回调（UI/AI 两条路都走它）
+        R.build_dsh_runtime = lambda rt, **kw: _RT()
+        sealed = []
+        ok, reason = R.start_task("封送活", cfg=cfg, pet_id=None,
+                                  key="sk-test", persona="p",
+                                  on_finish=lambda g, r: sealed.append(g),
+                                  ui_call=lambda fn, *a: fn(*a))
+        assert ok, reason
+        for _ in range(50):
+            if sealed:
+                break
+            time.sleep(0.1)
+        assert sealed == ["封送活"], sealed
+    finally:
+        R.RuntimeGate, R.build_dsh_runtime = old_gate, old_build
+
+
+@check("harness: delegate_task 外包工具（默认关/总线/无Key/放行/失败复位）")
+def _():
+    from pet import config as C
+    from pet import harness as H
+    from pet import runtime_manager as R
+    from pet.chat import HARNESS_HINT
+    w = CTX["win"]
+    names = {t["function"]["name"] for t in H.TOOLS}
+    assert "delegate_task" in names, names
+    assert "delegate_task" in HARNESS_HINT, HARNESS_HINT
+    assert {"goal", "context"} <= H.ARG_LONG_KEYS, H.ARG_LONG_KEYS
+    assert C.DEFAULT_CFG["aiDshEnabled"] is False
+    assert "aiDshEnabled" in C.MANAGED_KEYS
+    old_cfg = dict(w.cfg)
+    old_busy = getattr(w, "_runtime_busy", False)
+    st = {"meme": None, "sticker": None, "anim": None}
+    calls = []
+    old_start = R.start_task
+
+    class _Gate:
+        def __init__(self, *a, **kw):
+            pass
+
+        def check(self, estimate=None):
+            return (True, "")
+
+        def record_run(self):
+            pass
+
+    old_gate = R.RuntimeGate
+    R.RuntimeGate = _Gate
+    try:
+        out = H.execute_tool(w, "delegate_task",
+                             json.dumps({"goal": "整理下载文件夹"}), st)
+        assert "没开" in out, out
+        w.cfg["aiDshEnabled"] = True
+        out = H.execute_tool(w, "delegate_task",
+                             json.dumps({"goal": "整理下载文件夹"}), st)
+        assert "启用" in out, out          # runtime.enabled=False（总闸）
+        w.cfg["runtime"] = dict(R.DEFAULT_RUNTIME, enabled=True)
+        w._runtime_busy = True
+        out = H.execute_tool(w, "delegate_task",
+                             json.dumps({"goal": "x"}), st)
+        assert "还在跑" in out, out
+        w._runtime_busy = False
+        w.cfg["ds_api_key"] = ""
+        out = H.execute_tool(w, "delegate_task",
+                             json.dumps({"goal": "x"}), st)
+        assert "Key" in out, out
+        w.cfg["ds_api_key"] = "sk-test"
+        R.start_task = lambda goal, **kw: calls.append((goal, kw)) or (True, "")
+        out = H.execute_tool(w, "delegate_task",
+                             json.dumps({"goal": "归档下载文件夹",
+                                         "context": "按类型分子目录"}), st)
+        assert "外包" in out and "归档下载文件夹" in out, out
+        assert calls and calls[0][0].startswith("归档下载文件夹"), calls
+        assert "按类型" in calls[0][0], calls
+        assert calls[0][1]["on_finish"] == w._runtime_finish, calls[0][1]
+        assert calls[0][1]["ui_call"] == w._ui_call, calls[0][1]
+        # start_task 失败：原样返回原因，busy 复位
+        w._runtime_busy = False
+        R.start_task = lambda goal, **kw: (False, "今天预算用完了")
+        out = H.execute_tool(w, "delegate_task",
+                             json.dumps({"goal": "y"}), st)
+        assert "预算" in out, out
+        assert w._runtime_busy is False
+        # 能力清单随开关变化
+        caps = H._tool_capabilities(w)
+        assert "delegate_task" in caps and "默认关" in caps, caps
+        w.cfg["aiDshEnabled"] = False
+        assert "没给你开" in H._tool_capabilities(w)
+    finally:
+        R.start_task = old_start
+        R.RuntimeGate = old_gate
+        w._runtime_busy = old_busy
+        w.cfg.clear()
+        w.cfg.update(old_cfg)
+
+
 @check("memory_recall: 相关度/衰减/legacy/空context/K截断")
 def _():
     import time as _t

@@ -180,6 +180,7 @@ DEFAULT_CFG = {
     "aiShellAllow": ["git", "ipconfig", "systeminfo", "tasklist", "where", "ping"],
     "aiShellTimeout": 15,
     "aiLocalFetch": True,
+    "aiDshEnabled": False,
     "sandbox_dirs": [],
 }
 
@@ -418,6 +419,10 @@ def validate(cfg):
     local_fetch = cfg.get("aiLocalFetch")
     if local_fetch is not None and not isinstance(local_fetch, bool):
         bad("aiLocalFetch", "本机抓取开关必须是布尔值，已按开启处理", True)
+    # 重型任务外包：非法值按关闭回落（默认关，见 harness.delegate_enabled）
+    dsh = cfg.get("aiDshEnabled")
+    if dsh is not None and not isinstance(dsh, bool):
+        bad("aiDshEnabled", "重型任务外包开关必须是布尔值，已按关闭处理", False)
     # 崩溃自恢复：非法值按开启回落（autostart 键是既有本地键，无校验块）
     recover = cfg.get("autoRecoverEnabled")
     if recover is not None and not isinstance(recover, bool):

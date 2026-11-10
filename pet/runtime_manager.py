@@ -6,11 +6,12 @@
 翻译成 pricing/ledger 认识的 snake_case，避免账本和成本各算一套。
 """
 import os
+import threading
 import time
 
 from pet import agent_runtime
 from pet import drives
-from pet.storage import load_json
+from pet.storage import P, load_json
 
 DEFAULT_RUNTIME = {
     "enabled": False,
@@ -43,6 +44,56 @@ def normalize_runtime_cfg(seg):
             if key in out and val is not None:
                 out[key] = val
     return out
+
+
+def start_task(goal, *, cfg, pet_id, key, persona, ledger_loader=None,
+               on_finish=None, ui_call=None, app_dir=None):
+    """跑一个重型任务：门禁 → 构建 → 记账 → daemon 线程执行 → 回调收尾。
+
+    UI（runtime_ui._runtime_start）与 AI 工具（harness delegate_task）共用
+    同一条路。调用方只提供回调：on_finish 在 daemon 线程里被 ui_call 封送
+    回 GUI 线程（无 ui_call 时原地调用）；runtime.run 抛桩也保证变成
+    RuntimeResult 送到 on_finish，不会把 busy 状态永久卡住。
+
+    返回 (ok, reason)：ok=False 时 reason 是给用户看的原因（门禁/无 Key/
+    构建失败/起线程失败），且没有任何状态被改动。
+    """
+    rt = normalize_runtime_cfg((cfg or {}).get("runtime"))
+    if not rt.get("enabled"):
+        return False, "执行内核还没启用（设置 → 执行内核）"
+    gate = RuntimeGate(rt, pet_id, os.path.dirname(P.memory), ledger_loader)
+    ok, reason = gate.check()
+    if not ok:
+        return False, reason
+    if not key:
+        return False, "先设置 DeepSeek Key 才能跑重型任务"
+    try:
+        runtime = build_dsh_runtime(rt, key=key, persona=persona,
+                                    app_dir=app_dir or P.app_dir)
+    except Exception as exc:
+        return False, "执行内核构建失败：%s" % exc
+    gate.record_run()
+    timeout = max(30, int(rt.get("timeoutSec") or 300))
+
+    def worker():
+        try:
+            result = runtime.run(goal, timeout=timeout)
+        except Exception as exc:
+            result = agent_runtime.RuntimeResult(
+                runtime="dsh", text="", exit_code=1, error=str(exc))
+        if on_finish is None:
+            return
+        if ui_call is not None:
+            ui_call(on_finish, goal, result)
+        else:
+            on_finish(goal, result)
+
+    try:
+        threading.Thread(target=worker, name="dsh-runtime",
+                         daemon=True).start()
+    except Exception as exc:
+        return False, "重型任务启动失败：%s" % exc
+    return True, ""
 
 
 def normalize_usage(usage):

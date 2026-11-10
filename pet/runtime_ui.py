@@ -4,8 +4,6 @@
 worker 只跑 subprocess；所有 Qt 操作经 _ui_call 回 GUI 线程。结果走既有
 _chat_queue 出口上屏，复用聊天记录/气泡/TTS；不另造渲染路径。
 """
-import os
-import threading
 import time
 
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QPlainTextEdit,
@@ -15,7 +13,6 @@ from pet import life_log
 from pet import persona as pet_persona
 from pet import runtime_manager
 from pet import tooldetail
-from pet.storage import P
 
 
 class GoalDialog(QDialog):
@@ -115,44 +112,23 @@ class RuntimeMixin:
             self._runtime_start(goal)
 
     def _runtime_start(self, goal):
-        rt = runtime_manager.normalize_runtime_cfg(
-            (getattr(self, "cfg", {}) or {}).get("runtime"))
-        gate = runtime_manager.RuntimeGate(
-            rt, getattr(self, "pet_id", None), os.path.dirname(P.memory),
-            getattr(self, "_load_ledger", None))
-        ok, reason = gate.check()
-        if not ok:
-            self.say(reason)
-            return
+        # 核心逻辑（门禁/构建/记账/线程/封送）抽在 runtime_manager.start_task，
+        # AI 的 delegate_task 工具与这里走同一条路；本方法只剩 GUI 表现
         key = (getattr(self, "cfg", {}) or {}).get("ds_api_key", "")
-        if not key:
-            self.say("先设置 DeepSeek Key 才能跑重型任务")
-            return
         persona = pet_persona.persona_text(
             (getattr(self, "pet_conf", None) or {}).get("whisperPrompt"),
             (getattr(self, "cfg", {}) or {}).get("whisperPrompt"), "")
-        try:
-            runtime = runtime_manager.build_dsh_runtime(
-                rt, key=key, persona=persona, app_dir=P.app_dir)
-        except Exception as exc:
-            self.say("执行内核构建失败：%s" % exc)
+        ok, reason = runtime_manager.start_task(
+            goal, cfg=getattr(self, "cfg", {}) or {},
+            pet_id=getattr(self, "pet_id", None), key=key, persona=persona,
+            ledger_loader=getattr(self, "_load_ledger", None),
+            on_finish=self._runtime_finish, ui_call=self._ui_call)
+        if not ok:
+            self.say(reason)
             return
-        gate.record_run()
         self._runtime_busy = True
         self._runtime_work("working", "重型任务：%s" % goal[:36])
         self.say("开始跑重型任务（DSH），可能要几十秒…")
-        timeout = max(30, int(rt.get("timeoutSec") or 300))
-
-        def worker():
-            result = runtime.run(goal, timeout=timeout)
-            self._ui_call(self._runtime_finish, goal, result)
-
-        try:
-            threading.Thread(target=worker, name="dsh-runtime", daemon=True).start()
-        except Exception as exc:
-            self._runtime_busy = False
-            self._runtime_work("error", "重型任务启动失败")
-            self.say("重型任务启动失败：%s" % exc)
 
     def _runtime_finish(self, goal, result):
         self._runtime_busy = False

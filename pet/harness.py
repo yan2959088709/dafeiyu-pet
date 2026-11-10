@@ -34,6 +34,8 @@ from . import log as pet_log
 from . import memes as pet_memes
 from . import memory as pet_memory
 from . import memory_maintain
+from . import persona as pet_persona
+from . import runtime_manager
 from . import self_prompt as pet_self_prompt
 from . import stickers
 from .pricing import DS_BASE_URL, DS_MODEL
@@ -49,7 +51,7 @@ ARG_MAX_CHARS = 64           # 工具参数字符串截断（防回灌放大）
 # （write_file 64K / manage_self_prompt 1500 / schedule 800 / run_shell 500 /
 # clipboard 4000）。这些参数的内容都不会回灌进上下文（工具结果只报
 # 长度/版本号/退出码）。
-ARG_LONG_KEYS = {"content", "note", "command", "text"}
+ARG_LONG_KEYS = {"content", "note", "command", "text", "goal", "context"}
 DESC_MAX_CHARS = 80          # 本地素材描述截断（进上下文前清洗）
 FACT_MAX_CHARS = 60          # 记忆条目长度上限
 FILE_READ_MAX_CHARS = 8000   # 单次读文件返回上限
@@ -216,6 +218,17 @@ TOOLS = [
         "name": "query_balance",
         "description": "查看你自己的令牌余额（那笔还能聊多久的钱）。",
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "delegate_task",
+        "description": ("把一件复杂的重活外包给执行内核（DSH）：它能多步骤规划、"
+                        "在沙箱里执行、用工具跑完整个任务（默认关闭，主人没开就"
+                        "用不了）。goal=要完成的事；context=可选背景。一次只跑一个，"
+                        "跑完结果会气泡告诉你。日常小事自己用现有工具做，别动辄外包"
+                        "（它很贵：单次约一万五千 token）。"),
+        "parameters": {"type": "object", "properties": {
+            "goal": {"type": "string", "description": "要完成的任务目标，如：把下载文件夹按类型归档"},
+            "context": {"type": "string", "description": "可选：背景信息或约束"}},
+            "required": ["goal"]}}},
     {"type": "function", "function": {
         "name": "check_time",
         "description": "查看现在的日期、星期、时段（安排日程或决定要不要吵主人前先看）。",
@@ -1335,6 +1348,44 @@ def _tool_time(win, args):
                                     week, period)
 
 
+def delegate_enabled(win):
+    """重型任务外包总闸：默认关（DSH 单次约 15k token，主人显式开启才用）。"""
+    return bool((getattr(win, "cfg", {}) or {}).get("aiDshEnabled", False))
+
+
+def _tool_delegate(win, args):
+    """把重活外包给执行内核（DSH）：与设置页/右键同一条 start_task 路。"""
+    goal = _clip(args.get("goal") or "", 500).strip()
+    if not goal:
+        return "请给出要外包的任务目标（goal）"
+    if not delegate_enabled(win):
+        return "重型任务外包没开（config.aiDshEnabled = false，主人在设置里开）"
+    if getattr(win, "_runtime_busy", False):
+        return "上一个重型任务还在跑，等它结束"
+    ctx = _clip(args.get("context") or "", 500).strip()
+    full = "%s\n\n背景：%s" % (goal, ctx) if ctx else goal
+    persona = pet_persona.persona_text(
+        (getattr(win, "pet_conf", None) or {}).get("whisperPrompt"),
+        (getattr(win, "cfg", {}) or {}).get("whisperPrompt"), "")
+    win._runtime_busy = True
+    try:
+        ok, reason = runtime_manager.start_task(
+            full, cfg=getattr(win, "cfg", {}) or {},
+            pet_id=getattr(win, "pet_id", None),
+            key=(getattr(win, "cfg", {}) or {}).get("ds_api_key", ""),
+            persona=persona,
+            ledger_loader=getattr(win, "_load_ledger", None),
+            on_finish=getattr(win, "_runtime_finish", None),
+            ui_call=getattr(win, "_ui_call", None))
+    except Exception as exc:
+        ok, reason = False, "外包启动失败：%s" % exc
+    if not ok:
+        win._runtime_busy = False
+        return reason
+    return ("已把任务外包给执行内核（DSH）：%s。它跑完会气泡告诉你结果。"
+            % goal[:60])
+
+
 # ------------------------------------------------------------ 系统感知工具
 def _tool_system_status(win, args):
     from . import sysmon as pet_sysmon
@@ -1497,7 +1548,10 @@ def _tool_capabilities(win):
         "15. 生命循环：每次心跳醒来你可以选一个意图（休息/学习/整理/玩耍/关心/开口/静默），"
         "写在回复开头如【意图：整理】",
         "16. 自查：query_balance（你的令牌余额），check_time（现在的日期/星期/时段）",
-        "17. 自知：list_capabilities（本清单）",
+        "17. 外包：delegate_task —— 复杂重活外包给执行内核（默认关；一次一个，很贵）"
+        if delegate_enabled(win) else
+        "17. 外包：已关闭（config.aiDshEnabled = false，主人没给你开）",
+        "18. 自知：list_capabilities（本清单）",
         "另外，用户直接输入「查余额 / 查天气 / 记住… / 忘记… / 你记得什么」会由本地技能处理，不经过你。",
     ]
     return "\n".join(lines)
@@ -1568,6 +1622,8 @@ def execute_tool(win, name, raw_args, state):
             return _tool_heartbeat(win, args)
         if name == "query_balance":
             return _tool_balance(win, args)
+        if name == "delegate_task":
+            return _tool_delegate(win, args)
         if name == "check_time":
             return _tool_time(win, args)
         if name == "active_window":
