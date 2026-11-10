@@ -305,7 +305,7 @@
 
 ### TASK-019: 桌宠面板 v2 — 快速面板 + 可编辑内容调度
 - **Executor**: claude
-- **Status**: [~]
+- **Status**: [x]
 - **Dependencies**: TASK-017, TASK-018
 - **Contract**: 2026-11-10 用户「更新迭代桌宠面板，提供一个简易但俱全的快速面板以及在设计内提供更加详细具体的可编辑内容调度」
 - **Acceptance**:
@@ -316,6 +316,7 @@
   5. smoke 更新 console/nav 用例 + 新增 schedule 用例，既有 189 项不回归
 - **Handoff log**:
   > claude [~] 2026-11-10: claimed（用户直接要求面板迭代）。蓝图：①pet/schedule_store.py 数据层（条目校验/到期/下次/标记）②pet/schedule_runner.py 30s 调度执行 ③pet/schedule_editor.py 表格+编辑对话框+节律门禁表单 ④console_ui 主页快速面板 + 新增第 6 页「内容调度」⑤桌宠.py 挂 ScheduleMixin ⑥ui_layout nav 6 项 ⑦smoke 更新 console/nav + schedule 用例 ⑧ADR。边界：调度是用户显式安排，不受安睡窗限制；care 走模型但暂不单独记 token；schedule.json 属运行期数据，file 工具禁写。
+  > claude [x] 2026-11-10: 交付，commit f1ef569。主页改两栏快速面板（左当前状态/右生命状态+今日调度+快捷入口）；新增第 6 页「内容调度」（条目表 + 新增/编辑/删除/启停/保存/重载 + 节律门禁热更新）；新增 30s ScheduleRunner（say 气泡/reminder 通知/care 模型+精力门禁/每日一次/生活日志/30min 日程提示）；schedule.json 入 .gitignore+写保护；旧 5 项导航自动插入新页名。冒烟 189→192，192/192。ADR: docs/decisions/2026-11-10-panel-v2-schedule.md。
 
 ---
 
