@@ -7117,10 +7117,13 @@ def _():
 
     rt = R.DshHeadlessRuntime(node_path="node", dsh_bin="dsh.js", home="H",
                               cwd="C", permission_mode="workspace-write",
+                              launcher_args=["--patch", "p.yml"],
                               runner=runner, env={"X": "1"}, secrets=("sk",))
     res = rt.run("hi")
     assert res.text == "OK" and res.exit_code == 0 and not res.error
-    assert seen["argv"][:4] == ["node", "dsh.js", "headless", "--json"]
+    # 带 launcher 参数时必须显式 --profile；app 选项 --json 排在 launcher 之后
+    assert seen["argv"][:7] == ["node", "dsh.js", "--profile", "headless",
+                                "--patch", "p.yml", "--json"], seen["argv"]
     assert "workspace-write" in seen["argv"] and seen["argv"][-1] == "hi"
     assert seen["env"]["DSH_HOME"] == "H" and seen["env"]["X"] == "1"
 
@@ -7160,6 +7163,130 @@ def _():
 
     bad = R.NativeHarnessRuntime(win, runner=boom).run("你好")
     assert bad.exit_code == 1 and "RuntimeError" in bad.error, bad.error
+
+
+@check("runtime: 配置段默认/非法回落/权限白名单")
+def _():
+    from pet import config as C
+    c = C.merge(C.DEFAULT_CFG, {})
+    assert c["runtime"]["enabled"] is False
+    assert c["runtime"]["dailyBudgetTokens"] == 50000
+    # 段缺子键 → 整段非法，回退默认
+    c = C.merge(C.DEFAULT_CFG, {"runtime": {"enabled": True}})
+    assert c["runtime"]["enabled"] is False
+    # 单键非法 → validate 按 fail-closed 纠正
+    c = C.merge(C.DEFAULT_CFG, {})
+    c["runtime"] = {"enabled": "yes", "nodePath": 1, "dshBin": "",
+                    "home": "", "workspace": "", "permissionMode": "root",
+                    "dailyBudgetTokens": 0, "maxRunsPerDay": 0,
+                    "timeoutSec": 1}
+    C.validate(c)
+    assert c["runtime"]["enabled"] is False
+    assert c["runtime"]["nodePath"] == ""
+    assert c["runtime"]["permissionMode"] == "workspace-write"
+    assert c["runtime"]["dailyBudgetTokens"] == 50000
+    assert c["runtime"]["maxRunsPerDay"] == 3
+    assert c["runtime"]["timeoutSec"] == 300
+
+
+@check("runtime: 预算门禁（日预算/24h 次数）")
+def _():
+    import time as _t
+    from pet import runtime_manager as R
+    d = os.path.join(CTX["tmpdir"], "runtime_gate")
+    os.makedirs(d, exist_ok=True)
+    cfg = dict(R.DEFAULT_RUNTIME)
+    cfg.update({"enabled": True, "nodePath": "node.exe", "dshBin": "dsh.js",
+                "dailyBudgetTokens": 20000, "maxRunsPerDay": 2})
+    gate = R.RuntimeGate(cfg, "g1", d, lambda: {"today_tokens": 0})
+    ok, reason = gate.check(15000)
+    assert ok, reason
+    over = R.RuntimeGate(cfg, "g1", d, lambda: {"today_tokens": 10000})
+    ok, reason = over.check(15000)
+    assert not ok and "预算" in reason, reason
+    now = _t.time()
+    gate.record_run(now=now)
+    gate.record_run(now=now)
+    ok, reason = R.RuntimeGate(cfg, "g1", d, lambda: {"today_tokens": 0}).check(15000)
+    assert not ok and "跑满" in reason, reason
+    assert not R.RuntimeGate(R.DEFAULT_RUNTIME, "g1", d, lambda: {}).check(15000)[0]
+    missing = dict(cfg)
+    missing["nodePath"] = ""
+    assert not R.RuntimeGate(missing, "g1", d, lambda: {}).check(15000)[0]
+
+
+@check("runtime: usage 翻译（DSH camelCase / 原生 snake_case）")
+def _():
+    from pet import runtime_manager as R
+    dsh = R.normalize_usage({"inputTokens": 8541, "outputTokens": 2,
+                             "cacheReadTokens": 5632, "cacheWriteTokens": 0,
+                             "totalTokens": 14175})
+    assert dsh == {"prompt_tokens": 14173, "completion_tokens": 2,
+                   "prompt_cache_hit_tokens": 5632, "total_tokens": 14175}, dsh
+    native = R.normalize_usage({"prompt_tokens": 10, "completion_tokens": 3,
+                                "prompt_cache_hit_tokens": 2, "total_tokens": 13})
+    assert native == {"prompt_tokens": 10, "completion_tokens": 3,
+                      "prompt_cache_hit_tokens": 2, "total_tokens": 13}, native
+    assert R.normalize_usage(None) == {"prompt_tokens": 0, "completion_tokens": 0,
+                                       "prompt_cache_hit_tokens": 0,
+                                       "total_tokens": 0}
+
+
+@check("life_log: append/read/字段截断")
+def _():
+    from pet import life_log
+    path = os.path.join(CTX["tmpdir"], "life_log_test.jsonl")
+    life_log.append({"ts": 1, "kind": "heavy_task", "goal": "a" * 3000,
+                     "text": "b" * 3000}, path=path)
+    life_log.append({"ts": 2, "kind": "heavy_task", "goal": "ok"}, path=path)
+    items = life_log.read(10, path=path)
+    assert len(items) == 2 and items[-1]["goal"] == "ok"
+    assert len(items[0]["goal"]) == 2000 and len(items[0]["text"]) == 2000
+    assert life_log.read(10, path=os.path.join(CTX["tmpdir"], "missing.jsonl")) == []
+
+
+@check("runtime: DSH patch 生成（人格/工具裁剪）")
+def _():
+    from pet import runtime_manager as R
+    path = os.path.join(CTX["tmpdir"], "dsh_runtime.patch.yml")
+    R.write_dsh_patch(path, "你是桌宠小鲸鱼\n第二行")
+    text = open(path, encoding="utf-8").read()
+    assert "personaPrefix: |-" in text
+    assert "你是桌宠小鲸鱼" in text and "第二行" in text
+    assert "- id: system-prompt" in text
+    assert "- id: tool-pwsh" in text and "disabled: true" in text
+    R.write_dsh_patch(path, "")
+    assert R.FALLBACK_PERSONA in open(path, encoding="utf-8").read()
+
+
+@check("runtime: 完成后入账/生活日志/上屏（假结果）")
+def _():
+    from pet import life_log
+    from pet.agent_runtime import RuntimeResult
+    w = CTX["win"]
+    before = int((w._load_ledger() or {}).get("today_tokens") or 0)
+    result = RuntimeResult(
+        runtime="dsh", text="重型任务完成", exit_code=0, latency_ms=123,
+        usage={"inputTokens": 100, "outputTokens": 2, "cacheReadTokens": 0,
+               "totalTokens": 102},
+        events=[{"type": "tool_call", "tool": "web_fetch",
+                 "input": {"url": "https://example.com"}}])
+    w._runtime_finish("测试重型任务", result)
+    after = int((w._load_ledger() or {}).get("today_tokens") or 0)
+    assert after >= before + 102, (before, after)
+    entries = life_log.read(5)
+    assert entries and entries[-1].get("goal") == "测试重型任务", entries[-1:]
+    assert entries[-1].get("tokens") == 102
+    assert entries[-1].get("tools") and entries[-1]["tools"][0]["tool"] == "web_fetch"
+    queue = list(getattr(w, "_chat_queue", []))
+    assert any(str(item[0]) == "重型任务完成" for item in queue), queue
+    try:
+        from PySide6.QtWidgets import QApplication
+        svc = getattr(QApplication.instance(), "_pet_service", None)
+        if svc is not None:
+            svc.work.clear_external()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- 运行器

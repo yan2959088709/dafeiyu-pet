@@ -20,6 +20,7 @@ import re
 import threading
 
 from pet import credentials
+from pet import runtime_manager
 from pet.drives import DEFAULT_HEARTBEAT
 from pet.storage import P, backup_corrupt
 
@@ -164,11 +165,12 @@ DEFAULT_CFG = {
     "eventsRefreshSec": {"balance": 1800, "whisper": 300},
     "animationWeights": {"idle": 10, "turn": 5, "move": 5},
     "heartbeat": DEFAULT_HEARTBEAT,
+    "runtime": runtime_manager.DEFAULT_RUNTIME,
 }
 
 # 整段替换的对象键：缺子键 = 整段非法，告警后回退默认（与上游合并器一致）
 OBJECT_KEYS = ("physics", "font", "eventsRefreshSec", "animationWeights",
-               "whisperModel", "chatModel")
+               "whisperModel", "chatModel", "runtime")
 
 MANAGED_KEYS = frozenset(DEFAULT_CFG)
 
@@ -365,6 +367,34 @@ def validate(cfg):
             bad("heartbeat.quiet_window",
                 "安静窗必须是 auto 或 [起始小时, 结束小时]（0-23 且不相等），已改为 auto")
             cfg["heartbeat"]["quiet_window"] = "auto"
+
+    # 执行内核段：整段非法回退默认；单键非法按 fail-closed 方向纠正。
+    # 默认关闭，用户显式打开才可能产生外部进程与 token 成本。
+    if not isinstance(cfg.get("runtime"), dict):
+        bad("runtime", "执行内核配置必须是对象，已取默认值",
+            copy.deepcopy(runtime_manager.DEFAULT_RUNTIME))
+    else:
+        rt = cfg["runtime"]
+        if not isinstance(rt.get("enabled"), bool):
+            warn_once("runtime", "enabled 必须是布尔值，已按关闭处理")
+            rt["enabled"] = False
+        for key in ("nodePath", "dshBin", "home", "workspace"):
+            if not isinstance(rt.get(key), str):
+                bad("runtime." + key, "必须是字符串", "")
+                rt[key] = ""
+        for key, lo, hi, default in (
+                ("dailyBudgetTokens", 1000, 10000000, 50000),
+                ("maxRunsPerDay", 1, 100, 3),
+                ("timeoutSec", 30, 3600, 300)):
+            val = rt.get(key)
+            if isinstance(val, bool) or not isinstance(val, int) \
+                    or not (lo <= val <= hi):
+                bad("runtime." + key, "必须是 %d-%d 的整数" % (lo, hi), default)
+                rt[key] = default
+        if rt.get("permissionMode") not in runtime_manager.PERMISSION_MODES:
+            bad("runtime.permissionMode", "权限模式非法，已回落到 workspace-write",
+                "workspace-write")
+            rt["permissionMode"] = "workspace-write"
 
     limit = cfg.get("chatImageLimit")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:

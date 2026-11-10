@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
 from pet import ai_provider as pet_ai
 from pet import apiserver as pet_api
 from pet import config as pet_config
+from pet import runtime_manager
 from pet import runtime_state
 from pet import tts, version
 from pet.storage import P
@@ -103,6 +104,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._tab_global(), "全局")
         self.tabs.addTab(self._tab_voice(), "语音")
         self.tabs.addTab(self._tab_model(), "模型")
+        self.tabs.addTab(self._tab_runtime(), "执行内核")
         self.tabs.addTab(self._tab_look(), "外观物理")
         self.tabs.addTab(self._tab_pets(), "宠物")
         self.tabs.addTab(self._tab_paths(), "路径")
@@ -183,6 +185,53 @@ class SettingsDialog(QDialog):
         form.addRow("独立模型", self.edit_ai_model)
         form.addRow("独立 Key", self.edit_ai_key)
         form.addRow("输出上限", self.spin_ai_tokens)
+        return page
+
+    # ---------------------------------------------------------- 执行内核
+    def _tab_runtime(self):
+        page = QWidget()
+        form = QFormLayout(page)
+        rt = runtime_manager.normalize_runtime_cfg(self.cfg.get("runtime"))
+        self.cb_rt_enabled = _check("启用重型任务执行内核（DSH headless）",
+                                    rt.get("enabled", False))
+        self.edit_rt_node = QLineEdit(str(rt.get("nodePath") or ""))
+        self.edit_rt_node.setPlaceholderText("node.exe 绝对路径（Node 24+）")
+        self.edit_rt_dsh = QLineEdit(str(rt.get("dshBin") or ""))
+        self.edit_rt_dsh.setPlaceholderText(".../@deepseek-ai/dsh/lib/bin.js")
+        self.edit_rt_home = QLineEdit(str(rt.get("home") or ""))
+        self.edit_rt_home.setPlaceholderText("留空 = <程序目录>/dsh-home")
+        self.edit_rt_workspace = QLineEdit(str(rt.get("workspace") or ""))
+        self.edit_rt_workspace.setPlaceholderText("留空 = <程序目录>/dsh-workspace")
+        self.combo_rt_perm = _combo(
+            (("工作区读写", "workspace-write"), ("只读", "read-only")),
+            rt.get("permissionMode", "workspace-write"))
+        self.spin_rt_budget = _spin(1000, 10000000,
+                                    rt.get("dailyBudgetTokens", 50000))
+        self.spin_rt_runs = _spin(1, 100, rt.get("maxRunsPerDay", 3))
+        self.spin_rt_timeout = _spin(30, 3600, rt.get("timeoutSec", 300))
+        form.addRow(self.cb_rt_enabled)
+        form.addRow("Node 24 路径", self.edit_rt_node)
+        form.addRow("DSH CLI（bin.js）", self.edit_rt_dsh)
+        form.addRow("DSH_HOME", self.edit_rt_home)
+        form.addRow("工作区", self.edit_rt_workspace)
+        form.addRow("权限模式", self.combo_rt_perm)
+        form.addRow("每日 token 预算", self.spin_rt_budget)
+        form.addRow("24h 次数上限", self.spin_rt_runs)
+        form.addRow("单次超时（秒）", self.spin_rt_timeout)
+        form.addRow(QLabel("默认关闭。DSH 首次建 profile，单次约 14k tokens / 50s；"
+                           "只建议重任务使用。OpenClaw 是 Gateway 形态，本版不接。"))
+        row = QHBoxLayout()
+        run_btn = QPushButton("运行一次重型任务…")
+        log_btn = QPushButton("查看生活日志")
+        run_btn.setAutoDefault(False)
+        log_btn.setAutoDefault(False)
+        run_btn.clicked.connect(
+            lambda: getattr(self.owner, "_runtime_run_dialog", lambda: None)())
+        log_btn.clicked.connect(
+            lambda: getattr(self.owner, "_runtime_show_log", lambda: None)())
+        row.addWidget(run_btn)
+        row.addWidget(log_btn)
+        form.addRow(row)
         return page
 
     # ---------------------------------------------------------- 外观物理
@@ -423,6 +472,17 @@ class SettingsDialog(QDialog):
         cfg["aiModel"] = self.edit_ai_model.text().strip()
         cfg["aiApiKey"] = self.edit_ai_key.text()
         cfg["aiMaxTokens"] = int(self.spin_ai_tokens.value())
+        cfg["runtime"] = {
+            "enabled": self.cb_rt_enabled.isChecked(),
+            "nodePath": self.edit_rt_node.text().strip(),
+            "dshBin": self.edit_rt_dsh.text().strip(),
+            "home": self.edit_rt_home.text().strip(),
+            "workspace": self.edit_rt_workspace.text().strip(),
+            "permissionMode": self.combo_rt_perm.currentData() or "workspace-write",
+            "dailyBudgetTokens": int(self.spin_rt_budget.value()),
+            "maxRunsPerDay": int(self.spin_rt_runs.value()),
+            "timeoutSec": int(self.spin_rt_timeout.value()),
+        }
         cfg["physics"] = {
             "gravity": float(self.spin_gravity.value()),
             "restitution": float(self.spin_restitution.value()),

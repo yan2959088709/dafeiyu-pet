@@ -171,21 +171,26 @@ class DshHeadlessRuntime:
     id = DSH_RUNTIME_ID
 
     def __init__(self, *, node_path, dsh_bin, home="", cwd="",
-                 permission_mode="", approval_policy="", extra_args=None,
-                 env=None, runner: Callable | None = None, secrets=()):
+                 permission_mode="", approval_policy="", launcher_args=None,
+                 extra_args=None, env=None, runner: Callable | None = None,
+                 secrets=()):
         self.node_path = str(node_path)
         self.dsh_bin = str(dsh_bin)
         self.home = str(home or "")
         self.cwd = str(cwd or "")
         self.permission_mode = str(permission_mode or "")
         self.approval_policy = str(approval_policy or "")
+        # launcher 层参数（如 --patch）必须排在 profile 名之前，否则会被
+        # headless 应用当成自己的未知选项
+        self.launcher_args = list(launcher_args or [])
         self.extra_args = list(extra_args or [])
         self.env = dict(env or {})
         self._runner = runner
         self.secrets = tuple(s for s in (secrets or ()) if s)
 
     def argv(self, goal):
-        argv = [self.node_path, self.dsh_bin, "headless", "--json"]
+        argv = [self.node_path, self.dsh_bin, "--profile", "headless"] \
+            + self.launcher_args + ["--json"]
         if self.permission_mode:
             argv += ["--permission-mode", self.permission_mode]
         if self.approval_policy:

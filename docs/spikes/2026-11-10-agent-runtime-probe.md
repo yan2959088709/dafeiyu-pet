@@ -72,6 +72,22 @@ dsh --profile headless --help
 {"type":"tool_result","callId":"call_...","status":"completed","result":"...path..."}
 ```
 
+### 生产 patch 复测（TASK-016）
+
+用 `runtime_manager` 生成的 patch（宠物人格 + 禁用 tool-bash/tool-pwsh/
+tool-jobs/tool-todo/tool-goal/tool-workflow/tool-subagent*/tool-skill，
+保留 tool-web/tool-fs）跑同一任务：
+
+| 任务 | tokens | 延迟 | 说明 |
+|---|---|---|---|
+| `Reply with exactly: OK`（未裁剪） | 14,175 | 52.9s | coding persona + 全量工具 schema |
+| `Reply with exactly: OK`（宠物 patch） | **1,938** | **4.1s** | 工具 schema 大头被裁掉 |
+
+`--dump-config` 已确认：personaPrefix = 宠物人格；tool-pwsh/tool-bash/
+tool-jobs disabled；tool-web 保留。说明 DSH 的成本主要来自工具 schema，
+裁剪 profile 是最有效的降本手段；延迟数字含热 profile 因素，token 降幅
+是稳定收益。
+
 ### 关键结论
 
 - DSH 的 headless 是**真正的可嵌入执行内核**：单任务、结构化事件、会话恢复、

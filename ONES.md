@@ -256,7 +256,7 @@
 
 ### TASK-016: DSH runtime 生产接线（预算门禁/事件总线/profile 裁剪/OpenClaw 适配）
 - **Executor**: claude
-- **Status**: [ ]
+- **Status**: [~]
 - **Dependencies**: TASK-015
 - **Contract**: ADR-2026-11-10-01 + docs/spikes/2026-11-10-agent-runtime-probe.md
 - **Acceptance**:
@@ -267,6 +267,8 @@
 - **Handoff log**:
   > claude [ ] 2026-11-10: 自 TASK-015 deferred 登记。注意：DSH 单次基线 ~14k tokens/53s，只能重任务；默认关闭，预算门禁先于一切接线。
   > claude [Notify] 2026-11-10: dependency TASK-015 resolved (commit 06e7422). You may proceed.
+  > claude [~] 2026-11-10: claimed（用户「可以开工」）。Phase 0.5：scout 正在摸 workstatus/ledger/settings/config/agent_runtime 的接线点；随后出蓝图待批。
+  > claude [Blueprint] 2026-11-10（用户「可以开工」预批准）：DATA FLOW: settings.runtime → RuntimeGate.check(estimate=15000) → build DshHeadlessRuntime → worker run(goal) → RuntimeResult(events/usage/text) → normalize usage → _record_tokens + life_log.append → workstatus 外部槽(tool_call/tool_result/final) + _notify_reply → 聊天气泡结果。MODULE: ①pet/runtime_manager.py（DEFAULT_RUNTIME/normalize/usage 翻译/RuntimeGate 24h runs/build_dsh_runtime）②pet/life_log.py（JSONL append/read）③pet/runtime_ui.py（RuntimeMixin：运行对话框/worker/事件映射/日志查看）④pet/config.py runtime 段 + OBJECT_KEYS + validate ⑤pet/settings_ui.py「执行内核」页（开关/路径/预算/次数/超时/运行/查看日志）⑥pet/menus.py 动作菜单入口 ⑦桌宠.py 挂 RuntimeMixin ⑧smoke 新增用例 ⑨ADR TASK-016。INTEGRATION: 零改动 chat/heartbeat；复用 agent_runtime；OpenClaw 做「不接」裁决（Gateway 形态 + Node24 阻塞）。TEST: 配置归一/预算门禁/24h 次数/usage 翻译/日志读写 + 全量 smoke。RISK: worker 不触 Qt（_ui_call/_chat_queue）、Key 只走子进程 env 且日志不落、DSH 首跑建 profile 慢（timeout 300s）、预算预估 15k tokens、DSH patch 工具 ID 随上游变化。
 
 ---
 
