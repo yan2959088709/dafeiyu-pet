@@ -5021,9 +5021,9 @@ def _():
         if affinity is not None:
             eng.st.affinity = affinity
 
-    # 恢复：脱离活跃期后按 elapsed/300s*2.0 线性回精力
+    # 恢复：脱离活跃期后按 elapsed/300s*3.0 线性回精力
     msg_ago(1800, energy=10.0)
-    assert abs(eng.tick(now).energy - 22.0) < 1e-6, eng.st.energy
+    assert abs(eng.tick(now).energy - 28.0) < 1e-6, eng.st.energy
     # 活跃期（<300s）不恢复也不侵蚀亲密度
     msg_ago(100, energy=10.0, affinity=5.0)
     st = eng.tick(now)
@@ -5079,11 +5079,11 @@ def _():
     for _i in range(5):
         eng.save(eng.st)      # 反复落盘：任何「刷新基准字段」的实现都会在这里现形
         eng.tick(now)
-    assert abs(eng.st.energy - 22.0) < 1e-6, eng.st.energy
+    assert abs(eng.st.energy - 28.0) < 1e-6, eng.st.energy
     assert abs(eng.st.affinity - 9.75) < 1e-6, eng.st.affinity
-    # 增量结算：再过的 600s 只回 600/300*2=4，不会把全量 elapsed 重复加一遍
+    # 增量结算：再过的 600s 只回 600/300*3=6，不会把全量 elapsed 重复加一遍
     eng.tick(now + 600)
-    assert abs(eng.st.energy - 26.0) < 1e-6, eng.st.energy
+    assert abs(eng.st.energy - 34.0) < 1e-6, eng.st.energy
     with open(eng.path, "r", encoding="utf-8") as f:
         disk = _json.load(f)
     assert set(disk) == {"mood", "mood_intensity", "energy", "affinity",
@@ -5267,8 +5267,9 @@ def _():
     hb["consecutive_speaks"] = 1
     dec = eng.decide(st, hb, now)
     assert dec.action == "speak" and all(dec.gates.values()), dec
-    assert set(dec.gates) == {"quiet_window", "low_urgency", "not_silent",
-                              "cooldown", "24h_limit", "max_consecutive"}
+    assert set(dec.gates) == {"quiet_window", "not_tired", "low_urgency",
+                              "not_silent", "cooldown", "24h_limit",
+                              "max_consecutive"}
 
 
 @check("heartbeat: 用户回复后 consecutive 重置")
@@ -5353,8 +5354,8 @@ def _():
             assert _json.load(f)["energy"] == 100.0
         w._stream_queue.clear()
         w._tick_consume_queues()   # 消费 _chat_queue → _chat_out 渲染 + 计费
-        # 主动发言恰好扣 2：能耗在上屏出口结算，随下一拍 tick 落盘
-        assert eng.drives.st.energy == 98.0, eng.drives.st.energy
+        # 主动发言恰好扣 1：能耗在上屏出口结算，随下一拍 tick 落盘
+        assert eng.drives.st.energy == 99.0, eng.drives.st.energy
         w._chat_queue.clear()
     finally:
         H.deepseek_transport = old_tr
@@ -5378,7 +5379,7 @@ def _():
         w._reload_panel()
 
 
-@check("heartbeat: 主动发言恰好扣 2 能量（_chat_out 唯一计费点）")
+@check("heartbeat: 主动发言恰好扣 1 能量（_chat_out 唯一计费点）")
 def _():
     import time as _t
     from pet import harness as H
@@ -5419,15 +5420,15 @@ def _():
             CTX["app"].processEvents()
             _t.sleep(0.005)
         assert not eng._busy and len(seen) == 1, seen
-        # worker 只封送不计费：能量还是 100（旧实现在此先扣 2，上屏再扣 = -4）
+        # worker 只封送不计费：能量还是 100（旧实现在此先扣一次，上屏再扣 = 双扣）
         assert eng.drives.st.energy == 100.0, eng.drives.st.energy
         assert w._chat_queue and w._chat_queue[-1][0] == "扣费验证专用句"
-        # 消费上屏 → _chat_out 唯一计费点：恰好 -2（不是 -4、不是 0）
+        # 消费上屏 → _chat_out 唯一计费点：恰好 -1（不是双扣、不是 0）
         w._tick_consume_queues()
-        assert eng.drives.st.energy == 98.0, eng.drives.st.energy
-        # 被动回复走同一挂点：再 -2（主动/被动两条路共用唯一计费点）
+        assert eng.drives.st.energy == 99.0, eng.drives.st.energy
+        # 被动回复走同一挂点：再 -1（主动/被动两条路共用唯一计费点）
         w._chat_out("被动回复", save=False)
-        assert eng.drives.st.energy == 96.0, eng.drives.st.energy
+        assert eng.drives.st.energy == 98.0, eng.drives.st.energy
     finally:
         H.deepseek_transport = old_tr
         w.cfg["ds_api_key"] = old_key
@@ -6752,7 +6753,7 @@ def _():
     assert st.mood == "tired", st.mood
     # 回复出口扣精力（save=False 的系统提示也走同一出口，属已知取舍）
     w._chat_out("知道啦", save=False)
-    assert st.energy == 48.0, st.energy
+    assert st.energy == 49.0, st.energy
     st.affinity, st.energy, st.mood = 0.0, 80.0, "calm"
     st.last_user_message_time = 0.0
 
@@ -7026,7 +7027,9 @@ def _():
     assert hb["enabled"] is True and hb["min_silent"] == 600
     assert hb["min_interval"] == 1800 and hb["urgency_threshold"] == 0.35
     assert hb["max_per_24h"] == 15 and hb["max_consecutive"] == 2
-    assert hb["quiet_window"] == "auto" and hb["msg_energy_cost"] == 2
+    assert hb["quiet_window"] == "auto" and hb["msg_energy_cost"] == 1
+    assert hb["energy_recovery_per_300s"] == 3.0
+    assert hb["energy_full_secs"] == 10800 and hb["tired_threshold"] == 15
     assert hb["mood_keywords"]["累"] == "tired" and hb["time_bonus"][7] == 0.8
     # validate：非对象整段回落默认
     cfg = dict(C.DEFAULT_CFG)
@@ -7460,8 +7463,10 @@ def _():
         assert "开心" in body and "亲密度 9.9/100" in body, body
         assert "主人正在互动" in body, body
         assert "忍住 1" in body, body
+        assert "代谢" in body and "你现在很累" in body, body
         gates = interoception.gates_text(w, now)
         assert "紧迫度" in gates and "沉默" in gates and "睡眠窗" in gates, gates
+        assert "疲惫阈值" in gates, gates
         feel = interoception.feel_heartbeat(w, now)
         assert "【你的身体" in feel and "【心跳门禁细节】" in feel, feel
     finally:
@@ -7563,6 +7568,52 @@ def _():
             pass
         if backup is not None:
             open(jp, "wb").write(backup)
+
+
+@check("drives: 代谢默认迁移（旧三元组→新默认）")
+def _():
+    from pet import drives as D
+    old = {"msg_energy_cost": 2, "energy_recovery_per_300s": 2.0,
+           "energy_full_secs": 14400}
+    norm = D.normalize_heartbeat_cfg(old)
+    assert norm["msg_energy_cost"] == 1, norm
+    assert norm["energy_recovery_per_300s"] == 3.0, norm
+    assert norm["energy_full_secs"] == 10800, norm
+    assert norm["tired_threshold"] == 15, norm
+    custom = dict(old)
+    custom["msg_energy_cost"] = 3
+    norm = D.normalize_heartbeat_cfg(custom)
+    assert norm["msg_energy_cost"] == 3, norm
+    assert norm["energy_recovery_per_300s"] == 2.0, norm
+    new = dict(old)
+    new["tired_threshold"] = 20
+    norm = D.normalize_heartbeat_cfg(new)
+    assert norm["msg_energy_cost"] == 2 and norm["tired_threshold"] == 20, norm
+
+
+@check("heartbeat: 疲惫门禁（energy < 15 → not_tired）")
+def _():
+    import time as _t
+    from pet import drives as D
+    from pet.heartbeat import HeartbeatEngine
+    d = os.path.join(CTX["tmpdir"], "hb_tired")
+    os.makedirs(d, exist_ok=True)
+    cfg = {}
+    hour = _t.localtime().tm_hour
+    eng = HeartbeatEngine(object(), D.DrivesEngine(d, cfg), cfg)
+    eng.cfg["quiet_window"] = [(hour + 1) % 24, (hour + 1) % 24]  # 空窗
+    eng.cfg["time_bonus"] = {h: 0.8 for h in range(24)}
+    st = eng.drives.st
+    st.energy = 14.9
+    st.last_user_message_time = 0.0
+    eng._hb.update({"last_speak_time": 0.0, "last_attempt_time": 0.0,
+                    "timestamps_24h": [], "attempts_24h": [],
+                    "consecutive_speaks": 0})
+    dec = eng.decide(st, eng._hb, _t.time())
+    assert dec.action == "skip" and dec.reason == "not_tired", dec
+    st.energy = 15.0
+    dec = eng.decide(st, eng._hb, _t.time())
+    assert dec.reason != "not_tired", dec
 
 
 # ---------------------------------------------------------------- 运行器

@@ -37,6 +37,7 @@ GATE_LIMITS = {
     # fail-closed，只有它们是 fail-open）
     "max_per_24h": (1.0, 200.0),
     "max_consecutive": (1.0, 10.0),
+    "tired_threshold": (0.0, 100.0),
 }
 
 ACTIVE_WINDOW_SEC = 300.0        # 活跃期：互动中 5 分钟内不恢复也不侵蚀（陪伴≠休息）
@@ -73,9 +74,13 @@ DEFAULT_HEARTBEAT = {
     # 学习模式：由心跳引擎按真实作息读 sleep_window；数据不足时回退 23-06，
     # 行为连续。默认值就定在这里（单一事实来源），config 侧不再 import 时改写
     "quiet_window": "auto",
-    "msg_energy_cost": 2,
-    "energy_recovery_per_300s": 2.0,
-    "energy_full_secs": 14400,
+    # 代谢 v1（TASK-018）：一句话 1 精力，安静 5 分钟后每 5 分钟恢复 3，
+    # 3 小时回满；低于 15 时心跳不再主动开口（not_tired 门禁），
+    # 让「累」成为可解释、可恢复的状态，而不是永远卡在 1/100。
+    "msg_energy_cost": 1,
+    "energy_recovery_per_300s": 3.0,
+    "energy_full_secs": 10800,
+    "tired_threshold": 15,
     "mood_decay_secs": 14400,
     "affinity_gain": 0.2,
     "affinity_decay_per_hour": 0.5,
@@ -90,7 +95,7 @@ MOOD_CN = {"calm": "平静", "happy": "开心", "tired": "疲惫", "sad": "难�
 _NUM_KEYS = ("min_silent", "min_interval", "urgency_threshold", "max_per_24h",
              "max_consecutive", "msg_energy_cost", "energy_recovery_per_300s",
              "energy_full_secs", "mood_decay_secs", "affinity_gain",
-             "affinity_decay_per_hour")
+             "affinity_decay_per_hour", "tired_threshold")
 
 
 def _clamp(val, lo=0.0, hi=1.0):
@@ -163,6 +168,16 @@ def normalize_heartbeat_cfg(cfg):
         if clamped != val:
             pet_log.warn("心跳配置 %s=%s 越界，已钳为 %s" % (key, val, clamped))
             out[key] = clamped
+    # TASK-018 代谢迁移：旧默认三元组（2 精力/句、2/300s 恢复、4h 满血）
+    # 与用户主动选择不可区分，按「未个性化」升级到新默认；显式改过任一项
+    # 或已带 tired_threshold 的配置原样保留，不覆盖用户选择。
+    legacy = isinstance(cfg, dict) and "tired_threshold" not in cfg
+    if legacy and (out.get("msg_energy_cost") == 2.0
+                   and out.get("energy_recovery_per_300s") == 2.0
+                   and out.get("energy_full_secs") == 14400.0):
+        out["msg_energy_cost"] = DEFAULT_HEARTBEAT["msg_energy_cost"]
+        out["energy_recovery_per_300s"] = DEFAULT_HEARTBEAT["energy_recovery_per_300s"]
+        out["energy_full_secs"] = DEFAULT_HEARTBEAT["energy_full_secs"]
     tb = out.get("time_bonus")
     tb = tb if isinstance(tb, dict) else {}
     bonus = {}

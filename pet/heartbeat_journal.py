@@ -19,6 +19,7 @@ _LOCK = threading.Lock()
 
 REASON_CN = {
     "quiet_window": "睡眠窗内",
+    "not_tired": "太累了",
     "low_urgency": "还没那么想说话",
     "not_silent": "主人正在互动",
     "cooldown": "冷却中",

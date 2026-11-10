@@ -14,6 +14,7 @@ from pet.storage import P
 
 GATE_CN = {
     "quiet_window": "睡眠窗",
+    "not_tired": "精力",
     "low_urgency": "紧迫度",
     "not_silent": "沉默时长",
     "cooldown": "冷却",
@@ -69,6 +70,9 @@ def body_text(win, now=None):
     if st is None:
         return ("【你的身体】你现在感觉不到自己的身体（心跳/驱动还没初始化）。"
                 "如果主人问起，可以如实说此刻身体信号很弱。")
+    cfg = getattr(win, "_heartbeat_cfg", None)
+    if not isinstance(cfg, dict):
+        cfg = ((getattr(win, "cfg", {}) or {}).get("heartbeat") or {})
     mood = pet_drives.MOOD_CN.get(str(st.mood or "calm"), str(st.mood or "平静"))
     energy = max(0.0, min(100.0, float(getattr(st, "energy", 0.0) or 0.0)))
     affinity = max(0.0, min(100.0, float(getattr(st, "affinity", 0.0) or 0.0)))
@@ -76,6 +80,7 @@ def body_text(win, now=None):
     summary = heartbeat_journal.summary_text(storage_dir, pet_id, now)
     last_reason = str(hb.get("last_reason") or "")
     reason_cn = heartbeat_journal.REASON_CN.get(last_reason, last_reason)
+    tired = pet_drives.cfg_num(cfg, "tired_threshold")
     lines = [
         "【你的身体（第一人称感受，不是系统信息）】",
         "- 精力 %.0f/100（%s）；情绪%s；亲密度 %.1f/100（%s）。"
@@ -83,7 +88,14 @@ def body_text(win, now=None):
            _feel(AFFINITY_FEEL, affinity)),
         "- 距上次主人互动：%s。" % _ago(since_user),
         "- 心跳：每 30 秒一次。%s" % summary,
+        "- 代谢：每句话消耗 %g 精力；安静 5 分钟后每 5 分钟恢复 %g；"
+        "精力低于 %g 时你会更想休息、不主动开口。"
+        % (pet_drives.cfg_num(cfg, "msg_energy_cost"),
+           pet_drives.cfg_num(cfg, "energy_recovery_per_300s"), tired),
     ]
+    if energy < tired:
+        lines.append("- 你现在很累（精力 %.0f/100），最想做的是安静歇一会儿；"
+                     "主人找你时简短回应就好。" % energy)
     if last_reason:
         lines.append("- 最近一次心跳判定：%s。" % (reason_cn or last_reason))
     lines.append("- 你可以在回复里自然表达累、困、想主人或开心；"
@@ -110,12 +122,15 @@ def gates_text(win, now=None):
                float(hb.get("last_attempt_time") or 0.0))
     silent = max(0.0, now - base)
     quiet = cfg.get("quiet_window", "auto")
+    energy = max(0.0, min(100.0, float(getattr(st, "energy", 0.0) or 0.0)))
+    tired = pet_drives.cfg_num(cfg, "tired_threshold")
     lines = [
         "【心跳门禁细节】",
         "- 当前判定：%s（%s）。" % (
             str(hb.get("last_reason") or "无记录"),
             heartbeat_journal.REASON_CN.get(str(hb.get("last_reason") or ""),
                                             str(hb.get("last_reason") or "无记录"))),
+        "- 精力 %.0f/100（疲惫阈值 %g）。" % (energy, tired),
         "- 紧迫度 %.3f（阈值 %s）；沉默 %.0f 秒（要求 ≥%s）。"
         % (urgency, cfg.get("urgency_threshold", 0.35), silent,
            cfg.get("min_silent", 600)),

@@ -185,6 +185,9 @@ class HeartbeatEngine:
             in_quiet = (start <= hour < end) if start <= end else (hour >= start or hour < end)
         gates["quiet_window"] = not in_quiet
 
+        energy = float(getattr(drives_st, "energy", 0.0) or 0.0)
+        gates["not_tired"] = energy >= cfg_num(self.cfg, "tired_threshold")
+
         urgency = self.drives.urgency(drives_st, now)
         gates["low_urgency"] = urgency >= cfg_num(self.cfg, "urgency_threshold")
 

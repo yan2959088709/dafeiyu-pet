@@ -288,6 +288,20 @@
   > claude [Blueprint] 2026-11-10（用户已预批准）：DATA FLOW: drives.st + heartbeat.state + heartbeat_journal + self_prompt → interoception.body_text/feel_heartbeat → chat prompt/harness tool；heartbeat 判定/静默/发言写 journal；manage_self_prompt 写 self_prompt.json（版本化）。MODULE: ①pet/heartbeat_journal.py（ring buffer/摘要）②pet/interoception.py（身体状态/门禁/降级）③pet/self_prompt.py（版本化/回滚）④pet/self_prompt_ui.py（人工编辑/内在状态面板）⑤heartbeat.py（last_reason/last_urgency + 日志）⑥chat.py（内感受+自我提示词注入）⑦harness.py（feel_heartbeat/manage_self_prompt + 能力清单 + 写保护）⑧settings/menus/桌宠.py 挂 UI ⑨smoke ⑩ADR。INTEGRATION: 不改精力结算与权限；self_prompt 只做补充提示词，核心人设/权限不可被它覆盖；journal 属运行期数据，file 工具禁写。TEST: 纯函数 + 提示词注入 + 工具 dispatch + 心跳静默日志 + 全量 smoke。
   > claude [x] 2026-11-10: 交付，commit 8f6477f。新增 pet/interoception.py（body_text/gates_text/feel_heartbeat/recent_text）、pet/heartbeat_journal.py（200 条/7 天 ring，skip 10 分钟限流，24h 摘要）、pet/self_prompt.py（版本化/回滚/1500 字上限）、pet/self_prompt_ui.py（自我提示词编辑器 + 内在状态面板）；heartbeat 状态新增 last_reason/last_urgency/last_gates 并写 journal；chat 提示词注入身体段+自我提示词；harness 新增 feel_heartbeat/manage_self_prompt，能力清单 7/8 项，写保护扩展到 self_prompt/heartbeat_journal/pet_runtime/life_log 与前缀族；右键数据菜单加「自我提示词…」「内在状态…」。冒烟 181 → 187，187/187。ADR: docs/decisions/2026-11-10-interoception-self-prompt.md。未改：精力消耗/恢复数值（真实「累」保留，调参另开任务）。
 
+### TASK-018: 代谢与节律 v1（精力消耗/恢复/疲惫门禁）
+- **Executor**: claude
+- **Status**: [~]
+- **Dependencies**: TASK-010, TASK-017
+- **Contract**: 2026-11-10 用户「从生命体出发，考虑全面一点」；实机精力 1.3/100、心跳长期不触发
+- **Acceptance**:
+  1. 代谢参数重标定：`msg_energy_cost` 2→1、`energy_recovery_per_300s` 2→3、`energy_full_secs` 4h→3h（行为变化，测试同步）
+  2. 新增疲惫门禁：`energy < tired_threshold`（默认 15）时心跳 skip（reason `not_tired`），日志/内感受可解释
+  3. `interoception` 身体段加入代谢说明与疲惫建议（低于阈值时倾向休息）
+  4. 冒烟更新/新增用例，既有 187 项不回归
+- **Handoff log**:
+  > claude [~] 2026-11-10: claimed（用户「可以按照你的推荐来」）。生命体审计：当前只有状态没有行动选择、只有事件没有情节、只有表达没有反馈；代谢是行动循环的货币，先修正「长期 1.3/100」与疲惫不解释。
+  > claude [Blueprint] 2026-11-10（用户已预批准）：DATA FLOW: drives.tick/apply_ai_reply → energy；heartbeat.decide 增加 not_tired 门禁；interoception.body/gates 解释代谢与疲惫；配置默认值同步。MODULE: ①drives.py 默认值/门禁区间/tired 阈值 ②heartbeat.py decide ③heartbeat_journal/interoception reason 映射+代谢说明 ④smoke 更新 drives/能量测试 + 新增疲惫门禁用例 ⑤ADR。INTEGRATION: 不改行动选择/权限/预算；本任务只让「累」可解释、可恢复、会阻止主动开口。TEST: 参数/门禁/内感受/全量 smoke。
+
 ---
 
 ## Messages

@@ -28,6 +28,13 @@ pet_sessions.json
 usage_ledger.json
 pet_drives*.json
 heartbeat_state*.json
+heartbeat_journal*.json
+self_prompt.json
+life_log.jsonl
+pet_runtime*.json
+dsh-runtime.patch.yml
+dsh-home/
+dsh-workspace/
 *.corrupt
 attachments/
 memes/
