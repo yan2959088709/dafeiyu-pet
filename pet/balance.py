@@ -80,7 +80,44 @@ class BalanceMixin:
             self._fetch_weather_async(to_chat=True)
             city = self.cfg.get("city", "")
             return f"{city}的天气我这就去看～"
+        # 命令审批：允许/批准 ap-xxxx（只有一个待审批时只说「允许」也行）
+        m = re.match(r"^(?:允许|批准|同意|执行)[：:，,\s]*(ap-[0-9a-f]{6})?$", t)
+        if m:
+            aid = m.group(1)
+            if not aid:
+                from pet import harness as pet_harness
+                pending = pet_harness.pending_approvals()
+                if len(pending) == 1:
+                    aid = pending[0]
+                elif not pending:
+                    return "现在没有待审批的命令哦"
+                else:
+                    return ("待审批的命令有 %d 条，请带 id 说，比如：允许 %s"
+                            % (len(pending), pending[0]))
+            return self._approve_shell(aid)
         return None
+
+    def _approve_shell(self, aid):
+        """主人批准一条待执行命令：worker 里跑，结果经 _chat_queue 回屏。
+
+        只豁免白名单，不豁免 denylist（harness.run_approved_command 里再查一次）。
+        """
+        from pet import harness as pet_harness
+        ok, payload = pet_harness.take_approval(aid)
+        if not ok:
+            return payload
+        cmd = str(payload.get("command") or "")
+
+        def worker():
+            result = pet_harness.run_approved_command(self, cmd)
+            self._chat_queue.append((result, False, None, None, None))
+
+        try:
+            threading.Thread(target=worker, name="shell-approve",
+                             daemon=True).start()
+        except Exception:
+            return "执行线程没起来，这条审批作废了"
+        return "好，执行：%s" % cmd[:60]
 
     def _balance_skill(self):
         key = self.cfg.get("ds_api_key", "")

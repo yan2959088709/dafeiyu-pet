@@ -69,6 +69,7 @@ from pet.drag import DragState                                     # noqa: E402
 from pet import font_ui                                            # noqa: E402
 from pet import overlay                                            # noqa: E402
 from pet import stickers                                            # noqa: E402
+from pet import avatars                                             # noqa: E402
 from pet.chat import ChatMixin                                      # noqa: E402
 from pet.motion import MotionMixin, TICK, MARGIN                    # noqa: E402
 from pet.gadget import GadgetMixin                                  # noqa: E402
@@ -336,7 +337,8 @@ class TokenStatsWindow(QWidget):
 # 限宽用「气泡格 auto + 尾部 spacer 格固定」实现：短消息气泡随内容收窄，
 # 长消息在 spacer 处换行，Qt 富文本不支持 max-width，这是等效替代。
 CHAT_CSS = """
-body{background:#f5f7fc;font-family:'Microsoft YaHei';font-size:14px;}
+body{background:#f5f7fc;font-family:'Microsoft YaHei';font-size:14px;
+line-height:1.45;}
 table{margin-bottom:2px;}
 td{vertical-align:top;}
 .av{font-size:15px;font-weight:bold;color:#ffffff;text-align:center;}
@@ -345,11 +347,22 @@ CHAT_AVATAR_W = 40       # 头像格宽（36px 图 + 4px 间距）
 CHAT_TAIL_W = 8          # 尖角格宽
 CHAT_BUBBLE_MAX = 236    # 气泡最大宽度（344 版心 − 头像 − 尖角 − 余量）
 CHAT_DIV_GAP = 300       # 时间分隔阈值（秒）：间隔超过它才插一行
+CHAT_INPUT_MIN_H = 40    # 输入框单行高度（56 会多出半行空白）
+CHAT_INPUT_MAX_H = 132   # 输入框展开上限（再长就出滚动条）
 _TAIL_DIR = os.path.join(SPRITE_DIR, "dsh-pet", "chat")
 
 
 def _file_url(path):
     return "file:///" + str(path).replace("\\", "/")
+
+
+def _avatar_img(kind):
+    """当前头像的 <img>；返回 None 时调用方回退文字占位。"""
+    path = avatars.effective(kind)
+    if not path or not os.path.exists(path):
+        return None
+    return ('<img src="%s" width="36" height="36">'
+            % _file_url(path))
 
 
 def chat_time_divider(ts):
@@ -372,31 +385,33 @@ def chat_bubble_html(text, who):
     也不支持 CSS 边框三角技巧，两者都实测渲染不出来。
     """
     if who == "user":
+        user_av = _avatar_img("user") or (
+            '<div class="av" style="background:#8fa3c8;border-radius:8px;'
+            'height:36px;line-height:36px;">主</div>')
         return ('<table cellspacing="0" cellpadding="0" align="right"><tr>'
                 '<td width="%d"></td>'
                 '<td><div style="background:#5b8cff;'
                 'border-radius:12px;border-top-right-radius:3px;'
-                'padding:8px 11px;color:#ffffff;">%s</div></td>'
+                'padding:9px 12px;color:#ffffff;">%s</div></td>'
                 '<td width="%d" style="padding-top:11px;">'
                 '<img src="%s" width="8" height="11"></td>'
-                '<td width="%d" style="padding-left:8px;">'
-                '<div class="av" style="background:#8fa3c8;border-radius:8px;'
-                'height:36px;line-height:36px;">主</div></td>'
+                '<td width="%d" style="padding-left:8px;">%s</td>'
                 '</tr></table>'
                 % (344 - CHAT_AVATAR_W - CHAT_TAIL_W - CHAT_BUBBLE_MAX, text,
                    CHAT_TAIL_W, _file_url(os.path.join(_TAIL_DIR, "tail_right.png")),
-                   CHAT_AVATAR_W))
+                   CHAT_AVATAR_W, user_av))
+    pet_av = _avatar_img("pet") or (
+        '<img src="%s" width="36" height="36">' % _file_url(LOGO_PATH))
     return ('<table cellspacing="0" cellpadding="0"><tr>'
-            '<td width="%d" style="padding-right:8px;">'
-            '<img src="%s" width="36" height="36"></td>'
+            '<td width="%d" style="padding-right:8px;">%s</td>'
             '<td width="%d" style="padding-top:11px;">'
             '<img src="%s" width="8" height="11"></td>'
             '<td><div style="background:#ffffff;border:1px solid #e6eaf2;'
             'border-radius:12px;border-top-left-radius:3px;'
-            'padding:8px 11px;color:#2a3140;">%s</div></td>'
+            'padding:9px 12px;color:#2a3140;">%s</div></td>'
             '<td width="%d"></td>'
             '</tr></table>'
-            % (CHAT_AVATAR_W, _file_url(LOGO_PATH), CHAT_TAIL_W,
+            % (CHAT_AVATAR_W, pet_av, CHAT_TAIL_W,
                _file_url(os.path.join(_TAIL_DIR, "tail_left.png")), text,
                344 - CHAT_AVATAR_W - CHAT_TAIL_W - CHAT_BUBBLE_MAX))
 
@@ -411,8 +426,9 @@ class ChatPanel(QDialog):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(360, 480)
         self._drag_pos = None
-        if os.path.exists(LOGO_PATH):
-            self.setWindowIcon(QIcon(LOGO_PATH))
+        icon_path = avatars.effective("pet")
+        if icon_path and os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         container = QFrame(self)
         container.setGeometry(0, 0, 360, 480)
@@ -434,11 +450,12 @@ class ChatPanel(QDialog):
         hl.setContentsMargins(16, 8, 8, 8)
         hl.setSpacing(4)
         self.logo = QLabel()
-        logo_pix = QIcon(LOGO_PATH).pixmap(24, 24) if os.path.exists(LOGO_PATH) else QPixmap()
-        if not logo_pix.isNull():
-            self.logo.setPixmap(logo_pix)
         self.logo.setFixedSize(24, 24)
         self.logo.setStyleSheet("background:transparent;border:none;")
+        self.logo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.logo.setToolTip("修改头像")
+        self.logo.mousePressEvent = lambda _e: self._open_avatar_dialog()
+        self._refresh_header_avatar()
         hl.addWidget(self.logo)
         # 名称 + 在线状态（QQ 式双行抬头）
         title_box = QWidget()
@@ -510,7 +527,14 @@ class ChatPanel(QDialog):
         self.view.setStyleSheet(
             "QTextBrowser{background:#f5f7fc;border:none;padding:8px;"
             "font-family:'Microsoft YaHei';font-size:14px;"
-            "selection-background-color:#c9d8ff;}")
+            "selection-background-color:#c9d8ff;}"
+            "QScrollBar:vertical{background:transparent;width:8px;margin:2px;}"
+            "QScrollBar::handle:vertical{background:#cfd8e8;border-radius:3px;"
+            "min-height:24px;}"
+            "QScrollBar::handle:vertical:hover{background:#aebcd6;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical"
+            "{background:transparent;}")
         pcl.addWidget(self.view, 1)
         self.earlier_btn = QPushButton("加载更早")
         self.earlier_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -524,6 +548,16 @@ class ChatPanel(QDialog):
         # 流式（打字机）状态：_msg_blocks 维护全部消息块；_stream_block_idx 指向当前流式消息块
         self._msg_blocks = []
         self._stream_block_idx = None
+        # 整页 setHtml 是 O(历史长度)，流式增量按 40ms 合并一次，避免长对话打字卡顿
+        self._stream_pending = None
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setSingleShot(True)
+        self._stream_timer.setInterval(40)
+        self._stream_timer.timeout.connect(self._flush_stream)
+        # setHtml 会把滚动条清零，这里记住用户上翻后的位置；_stick_bottom 是
+        # 「整页重载」期间的锚定意图（clear_view 打开，本轮回调结束后关闭）
+        self._scroll_keep = None
+        self._stick_bottom = False
 
         # ---- 正在输入 ----
         self.typing = QLabel("正在输入…")
@@ -585,6 +619,12 @@ class ChatPanel(QDialog):
         self.shot_btn.setStyleSheet(_tool_css)
         self.shot_btn.clicked.connect(self._grab_screen)
         tools.addWidget(self.shot_btn)
+        self.avatar_btn = QPushButton("头像")
+        self.avatar_btn.setToolTip("修改 AI / 我的头像")
+        self.avatar_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.avatar_btn.setStyleSheet(_tool_css)
+        self.avatar_btn.clicked.connect(self._open_avatar_dialog)
+        tools.addWidget(self.avatar_btn)
         tools.addStretch(1)
         self.send_btn = QPushButton("发送")
         self.send_btn.setFixedSize(58, 28)
@@ -600,14 +640,25 @@ class ChatPanel(QDialog):
 
         # 多行输入框：回车发送、Shift+回车换行（见 _EnterCatcher）
         self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("跟她说点什么…（试试：记住我喜欢咖啡）")
-        self.input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.input.setPlaceholderText("跟她说点什么…（Enter 发送）")
+        self.input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.input.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.input.setFixedHeight(56)
+        self.input.setFixedHeight(CHAT_INPUT_MIN_H)
         self.input.setStyleSheet(
             "QPlainTextEdit{background:#f2f4f9;border:none;border-radius:12px;"
             "padding:6px 10px;font-size:14px;color:#26303e;}"
-            "QPlainTextEdit:focus{border:1px solid #b7c9ff;}")
+            "QPlainTextEdit:focus{border:1px solid #b7c9ff;}"
+            "QScrollBar:vertical{background:transparent;width:8px;margin:2px;}"
+            "QScrollBar::handle:vertical{background:#cfd8e8;border-radius:3px;"
+            "min-height:20px;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical"
+            "{height:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical"
+            "{background:transparent;}")
+        self.input.textChanged.connect(self._adjust_input_height)
+        # 换行位置依赖视口宽度（面板是固定尺寸，但滚动条出现/消失会改变宽度）
+        self.input.verticalScrollBar().rangeChanged.connect(
+            lambda *_: self._adjust_input_height())
         self._enter_catcher = _EnterCatcher(self._on_submit)
         self.input.installEventFilter(self._enter_catcher)
         self._paste_catcher = _PasteCatcher(self._attach_from_blob)
@@ -881,20 +932,47 @@ class ChatPanel(QDialog):
         紧接着 setValue(maximum()) 会停在一屏之前——紧循环灌消息（重载/沙箱驱动）
         时整个视图都停在旧位置。所以置底挪到事件循环里跑，且只在原本就贴底时
         才跟下去（用户上翻看历史时不被新消息拽走，与 QQ 一致）。
+
+        setHtml 还会把滚动条清零，所以非贴底时必须恢复原值，否则用户上翻历史
+        后一有新消息（自己发送/AI 回复）就跳回最早的消息。
         """
-        at_bottom = self._scroll_at_bottom()
+        if self._stick_bottom:
+            at_bottom = True
+            self._scroll_keep = None
+        elif self._scroll_keep is not None:
+            # 同一轮回调里已经 setHtml 过一次、值已被清零：沿用用户原位置
+            at_bottom = False
+        else:
+            at_bottom = self._scroll_at_bottom()
+            if not at_bottom:
+                self._scroll_keep = self.view.verticalScrollBar().value()
+        body = "".join(self._msg_blocks) if self._msg_blocks else (
+            '<div style="margin-top:110px;text-align:center;color:#aab3c6;'
+            'font-size:13px;">还没有聊天记录<br>跟她说点什么吧～</div>')
         self.view.setHtml("<html><head><style>%s</style></head><body>%s</body></html>"
-                          % (CHAT_CSS, "".join(self._msg_blocks)))
+                          % (CHAT_CSS, body))
         if at_bottom:
             QTimer.singleShot(0, self._scroll_to_bottom)
+        else:
+            QTimer.singleShot(0, self._restore_scroll)
 
     def _scroll_at_bottom(self):
         sb = self.view.verticalScrollBar()
         return sb.value() >= sb.maximum() - 4
 
     def _scroll_to_bottom(self):
+        self._scroll_keep = None
         sb = self.view.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _restore_scroll(self):
+        """setHtml 后把视口放回用户原来读到的位置。"""
+        keep = self._scroll_keep
+        self._scroll_keep = None
+        if keep is None:
+            return
+        sb = self.view.verticalScrollBar()
+        sb.setValue(min(int(keep), sb.maximum()))
 
     def _bubble_content(self, text, sticker, image):
         """气泡内容：转义文本 + 表情/图片缩略图（都嵌在气泡内部，QQ 式）。
@@ -937,15 +1015,31 @@ class ChatPanel(QDialog):
 
     def stream_begin(self):
         """开始一条流式 AI 回复：先占一个空消息块，后续增量原地更新"""
+        self._stream_timer.stop()
+        self._stream_pending = None
         self._stream_block_idx = len(self._msg_blocks)
         self._msg_blocks.append("")
         self._render_view()
 
     def stream_delta(self, text):
-        """追加流式增量文本，原地更新当前 AI 消息块（打字机效果）"""
+        """追加流式增量文本，原地更新当前 AI 消息块（打字机效果）。
+
+        可见时按 40ms 合并重绘；不可见（后台/测试）直接落块，保持同步语义。
+        """
         if self._stream_block_idx is None or not self._msg_blocks:
             return
-        safe = html.escape(str(text)).replace("\n", "<br>")
+        self._stream_pending = text
+        if not self.isVisible():
+            self._flush_stream()
+        elif not self._stream_timer.isActive():
+            self._stream_timer.start()
+
+    def _flush_stream(self):
+        if self._stream_pending is None or self._stream_block_idx is None \
+                or not self._msg_blocks:
+            return
+        safe = html.escape(str(self._stream_pending)).replace("\n", "<br>")
+        self._stream_pending = None
         self._msg_blocks[self._stream_block_idx] = chat_bubble_html(safe, "pet")
         self._render_view()
 
@@ -953,19 +1047,33 @@ class ChatPanel(QDialog):
         """流式回复收尾：把当前流式块重写为干净文本（去掉 <sticker:…> 标记）+ 表情图。"""
         if self._stream_block_idx is None or not self._msg_blocks:
             return
+        self._stream_timer.stop()
+        self._stream_pending = None
         self._msg_blocks[self._stream_block_idx] = chat_bubble_html(
             self._bubble_content(text, sticker, None), "pet")
         self._render_view()
 
     def stream_end(self):
         """流式回复结束：清空流指针，保留最后显示内容"""
+        self._stream_timer.stop()
+        self._stream_pending = None
         self._stream_block_idx = None
 
     def clear_view(self):
+        self._stream_timer.stop()
+        self._stream_pending = None
         self._msg_blocks = []
         self._stream_block_idx = None
         self._last_div_ts = None
+        # 整页重载（打开面板/切会话/加载更早）要停在最新消息；链式 append 都在
+        # 本轮回调内完成，标志位延后到事件循环里再关。
+        self._stick_bottom = True
+        self._scroll_keep = None
+        QTimer.singleShot(0, self._release_stick_bottom)
         self._render_view()
+
+    def _release_stick_bottom(self):
+        self._stick_bottom = False
 
     def set_busy(self, busy):
         self.typing.setVisible(bool(busy))
@@ -1152,6 +1260,59 @@ class ChatPanel(QDialog):
         if self.parent():
             self.parent()._clear_memory_confirm()
 
+    # ---- 头像 ----
+    def _refresh_header_avatar(self):
+        """头部小图标跟随 AI 头像；没设自定义就是项目 logo。"""
+        path = avatars.effective("pet")
+        if path and os.path.exists(path):
+            pix = QIcon(path).pixmap(24, 24)
+            if not pix.isNull():
+                self.logo.setPixmap(pix)
+            self.setWindowIcon(QIcon(path))
+        else:
+            self.logo.clear()
+            self.setWindowIcon(QIcon(LOGO_PATH))
+
+    def _open_avatar_dialog(self):
+        from pet.avatar_ui import AvatarDialog
+        AvatarDialog(self).exec()
+
+    def _on_avatar_changed(self):
+        """头像变更即时生效：旧消息块里烧的是旧路径，整页按历史重绘一次。"""
+        self._refresh_header_avatar()
+        p = self.parent()
+        if self._stream_block_idx is None and p is not None and \
+                hasattr(p, "_reload_panel"):
+            p._reload_panel(reset=False)
+        else:
+            self._render_view()
+
+    def _adjust_input_height(self):
+        """输入框随行数自动增高（56→132），超过上限转为滚动。
+
+        QPlainTextEdit 的 document().size() 不可用于算高度（实测只回行块数），
+        逐个 block 累加 blockBoundingRect 才能把自动换行也算进去。
+        """
+        doc = self.input.document()
+        layout = doc.documentLayout()
+        total = 0.0
+        block = doc.begin()
+        while block.isValid():
+            total += layout.blockBoundingRect(block).height()
+            if total >= CHAT_INPUT_MAX_H:
+                break
+            block = block.next()
+        need = int(total) + 16
+        height = max(CHAT_INPUT_MIN_H, min(CHAT_INPUT_MAX_H, need))
+        if self.input.height() != height:
+            self.input.setFixedHeight(height)
+        # Qt 在恰好容下时也会留一格滚动余量（光标行），未到上限就别显示滚动条
+        policy = (Qt.ScrollBarPolicy.ScrollBarAsNeeded
+                  if need > CHAT_INPUT_MAX_H
+                  else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        if self.input.verticalScrollBarPolicy() != policy:
+            self.input.setVerticalScrollBarPolicy(policy)
+
     def popup_at(self, x, y):
         px = int(x - self.width() / 2)
         py = int(y - self.height() - 10)
@@ -1162,6 +1323,7 @@ class ChatPanel(QDialog):
         self.show()
         self.raise_()
         self._set_view(True)   # 打开面板默认进入聊天视图
+        self._adjust_input_height()
         self.input.setFocus()
 
     # ---- 拖动头部移动 ----
@@ -1293,6 +1455,8 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         self.bubble_prio = 0            # 气泡优先级：0=普通 1=重要(AI回复/系统告警)
         self.last_speak_tick = 0
         self.last_system_check = 0
+        self.last_battery_check = 0        # 电量关心轮询时钟
+        self._battery_alerted = False      # 本轮放电已提醒过（插电后复位）
         self.t = 0
         self.jump_t = 0
         self.dragging = False
@@ -1638,6 +1802,17 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         self._tick_movement()
         self.update()
 
+    def _drain_stream_queue(self):
+        """把 _stream_queue 里的增量吃进 _stream_accum（整体换出，防丢刚追加的那条）。"""
+        items, self._stream_queue = self._stream_queue, []
+        for piece in items:
+            if self._stream_accum is None:
+                self._stream_accum = ""
+                self.chat_panel.stream_begin()
+            self._stream_accum += piece
+            # 打字机期间不显示 <sticker:…> 明文，收尾时会统一渲染表情缩略图
+            self.chat_panel.stream_delta(stickers.strip_marks(self._stream_accum))
+
     def _tick_consume_queues(self):
         """后台线程 → 主线程的全部投递：气泡消息 / 流式增量 / 聊天回复。
 
@@ -1649,17 +1824,17 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             for text in queued:
                 self.say(text)
 
-        if self._stream_queue:
-            items, self._stream_queue = self._stream_queue, []
-            for piece in items:
-                if self._stream_accum is None:
-                    self._stream_accum = ""
-                    self.chat_panel.stream_begin()
-                self._stream_accum += piece
-                # 打字机期间不显示 <sticker:…> 明文，收尾时会统一渲染表情缩略图
-                self.chat_panel.stream_delta(stickers.strip_marks(self._stream_accum))
+        self._drain_stream_queue()
 
         if self._chat_queue:
+            # 流式尾巴没吃干净就不能收尾：worker 先把全部增量入 _stream_queue、
+            # 最后才入 _chat_queue，所以看到 _chat_queue 有货时增量必然已发完——
+            # 但主线程可能还没消费完（竞态：上一拍只 swap 到前半段，后半段
+            # 和 _chat_queue 条目在这一拍才可见）。此时若照旧 finalize，会用
+            # 半句收尾，剩余几段下一拍当成新流重渲染——用户看到的就是
+            # 「同一条回复又发一遍」。先把残余增量吃干再收尾。
+            if self._stream_queue:
+                self._drain_stream_queue()
             items, self._chat_queue = self._chat_queue, []
             for item in items:
                 text = item[0]
@@ -1706,6 +1881,21 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         if self._token_stats_dirty and not self.ds_busy \
                 and self.token_window.isVisible():
             self._refresh_token_stats()
+
+        # 电量主动关心：未插电跌破阈值时提醒一次，插电/回升后复位
+        # （器灵的基本动作——主人电脑快没电了，她得知道）
+        if now_ms - self.last_battery_check > 60000:
+            self.last_battery_check = now_ms
+            try:
+                from pet import sysmon as _sysmon
+                if _sysmon.battery_low():
+                    if not self._battery_alerted:
+                        self._battery_alerted = True
+                        self.say("主人，电脑电量不足了，记得充电哦", prio=1)
+                else:
+                    self._battery_alerted = False
+            except Exception:
+                pass
 
         # 余额数字滚动动画推进（700ms ease-out，tick 驱动重绘）
         if self._roll_on:

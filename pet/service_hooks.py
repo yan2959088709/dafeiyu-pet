@@ -351,6 +351,14 @@ class ServiceHooksMixin:
         # 落盘的是 DPAPI 密文，内存必须解回明文：漏了这步，后续请求会带着
         # "dpapi:..." 当 Key 用，且任何一次保存都会把密文再加密一层写坏
         credentials.load_secrets(self.cfg)
+        # 心跳配置整体换新 dict 后，引擎与身体段快照必须同步，否则热重载
+        # 只改了磁盘：调度器改的间隔/开关在运行中看不到效果。
+        apply_hb = getattr(self, "_apply_heartbeat_cfg", None)
+        if callable(apply_hb):
+            try:
+                apply_hb(self.cfg.get("heartbeat") or {})
+            except Exception:
+                pass
         font_ui.apply_to_window(self)
         if hasattr(self, "set_tray_enabled"):
             self.set_tray_enabled(bool(self.cfg.get("trayEnabled", True)))

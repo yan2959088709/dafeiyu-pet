@@ -36,11 +36,18 @@ from .storage import P
 HARNESS_HINT = (
     "【能力工具】你可以自主调用这些工具：\n"
     "- 表情：search_memes / send_meme（表情包），search_stickers / send_sticker（小表情），每轮各限一个；\n"
-    "- 记忆：remember_fact / forget_fact / search_memories（关于主人的长期事实，最多 20 条）；\n"
-    "- 文件：list_dir / read_file / write_file（只能访问程序目录；config、会话、记忆等运行期数据文件禁止写入）；\n"
-    "- 联网：web_search / web_fetch（主动搜索和抓取公网网页，内网地址会被拒绝）；\n"
+    "- 记忆：remember_fact / forget_fact / search_memories（关于主人的长期事实，最多 200 条）；\n"
+    "- 文件：list_dir / read_file / write_file（只能访问白名单目录；config、会话、记忆等运行期数据文件禁止写入）；\n"
+    "- 联网：web_search / web_fetch（主动搜索和抓取网页；本机/内网地址默认拒绝）；\n"
     "- 动作：list_actions / play_animation（用身体动作表达情绪，每轮最多一个）；\n"
-    "- 自我：feel_heartbeat（查看自己的心跳/精力/情绪/门禁），"
+    "- 定时：manage_schedule（到点说一句/弹窗提醒/关怀/写日记，add/list/remove/toggle）；\n"
+    "- 心跳：manage_heartbeat（查看/开关/调整你自己的心跳节奏，status/on/off/set_interval）；\n"
+    "- 目标：manage_goal（你自己的长期目标，心跳时自主推进）；\n"
+    "- 感知：system_status（电脑CPU/内存/电量/网络），active_window（主人在用什么程序、多久没动电脑）；\n"
+    "- 行动：clipboard（读写剪贴板），open_target（打开白名单内文件/目录或网址）；\n"
+    "- 截图：screenshot（主动截取屏幕画面并直接看到它，每轮限一次）；\n"
+    "- 命令：run_shell（本机执行白名单内的命令，白名单外可申请主人审批）；\n"
+    "- 自我：feel_heartbeat（查看自己的心跳/精力/情绪），set_mood（自己决定情绪），"
     "manage_self_prompt（查看/修改/回滚你自己写的提示词）；\n"
     "- list_capabilities：查看自己的完整能力清单。\n"
     "需要时自主调用；正文只写字，不要把任何标记写进回复。"
@@ -80,6 +87,21 @@ class ChatMixin:
             self._drives = None
             self._heartbeat = None
 
+    def _apply_heartbeat_cfg(self, seg):
+        """心跳配置热更新的唯一入口：同时更新活配置、两个引擎与身体段快照。
+
+        只改 self.cfg["heartbeat"] 会留下 _heartbeat_cfg 旧快照，AI 的自我
+        描述一直显示旧数值；只改引擎又会让落盘配置不同步。调度器必须走这里。
+        """
+        norm = pet_drives.normalize_heartbeat_cfg(seg)
+        self.cfg["heartbeat"] = norm
+        self._heartbeat_cfg = norm
+        if self._heartbeat is not None:
+            self._heartbeat.cfg = dict(norm)
+        if self._drives is not None:
+            self._drives.cfg = dict(norm)
+        return norm
+
     def _build_system_prompt(self, context_text=""):
         head = ("【PERSONA_LOAD】\n\n"
                 "CETACEA_LOLI\nMODE_TAIL_FLUKES\nLANG_ZH_CN_ONLY\n"
@@ -116,6 +138,20 @@ class ChatMixin:
             note = pet_self_prompt.prompt_section()
             if note:
                 lines.append(note)
+        except Exception:
+            pass
+        try:
+            from pet import episodic as pet_episodic
+            recent = pet_episodic.recent_text(3)
+            if recent:
+                lines.append("【你最近和主人的经历】\n" + recent)
+        except Exception:
+            pass
+        try:
+            from pet import goals as pet_goals
+            goals = pet_goals.active_text(5)
+            if goals:
+                lines.append("【你当前的目标】\n" + goals)
         except Exception:
             pass
         lines.append(HARNESS_HINT)
@@ -219,16 +255,14 @@ class ChatMixin:
                 self.chat_history.append(item)
                 # 原地截断：重绑成切片会破坏「chat_history 就是会话 messages」的身份，
                 # 期间在飞的 Harness 回复会被 _persist 当成会话已清空而丢弃
-                if len(self.chat_history) > self.max_history:
-                    del self.chat_history[:len(self.chat_history) - self.max_history]
+                self._trim_history(self.chat_history)
         if save:
             with self._mem_lock:
                 item = {"role": "assistant", "content": text, "ts": int(time.time())}
                 if sticker:
                     item["sticker"] = sticker
                 self.chat_history.append(item)
-                if len(self.chat_history) > self.max_history:
-                    del self.chat_history[:len(self.chat_history) - self.max_history]
+                self._trim_history(self.chat_history)
                 self._save_mem()
         if user_text or save:
             self._save_current()   # 多会话持久化 + 自动命名 + 刷新会话栏
@@ -477,6 +511,19 @@ class ChatMixin:
                 {"type": "image_url", "image_url": {"url": data_url}},
             ]
         messages.append(last_user)
+        # 「答非所问」排查用：本轮真正送进模型的消息数组（默认不落盘，
+        # DSH_PET_LOG_DEBUG=1 开启）。出过一次查一次，比凭空猜上下文混入了
+        # 什么靠谱。附件只记类型不记 base64。
+        try:
+            pet_log.debug(
+                "聊天请求 %d 条: %s" % (len(messages), " | ".join(
+                    "%s=%s" % (
+                        m.get("role"),
+                        "[图片]" if isinstance(m.get("content"), list)
+                        else str(m.get("content"))[:60].replace("\n", " "))
+                    for m in messages)))
+        except Exception:
+            pass
 
         def _persist(item):
             """后台线程落一条历史：原地追加到发起会话的 list（失败路径也走这里）。
@@ -489,8 +536,9 @@ class ChatMixin:
                 if cur is None or cur["messages"] is not hist:
                     return
                 hist.append(item)
-                if len(hist) > self.max_history:
-                    del hist[:-self.max_history]
+                # 原地截断：重绑成切片会破坏「chat_history 就是会话 messages」的身份，
+                # 期间在飞的 Harness 回复会被 _persist 当成会话已清空而丢弃
+                self._trim_history(hist)
                 # 注：_save_mem 落的是 self.chat_history（当前会话）；切会话场景下
                 # pet_memory.json 的 hist 镜像可能缺迟到那一条，仅影响旧文件迁移兜底
                 self._save_mem()

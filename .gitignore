@@ -38,6 +38,8 @@ dsh-home/
 dsh-workspace/
 *.corrupt
 attachments/
+avatars/
+diary/
 memes/
 
 # 历史备份
@@ -53,3 +55,9 @@ stickers/
 # 日志
 *.log
 logs.txt
+episodes.jsonl
+goals.json
+memory_archive.jsonl
+life_state.json
+pet-watchdog*.bat
+quit.flag

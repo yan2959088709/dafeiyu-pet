@@ -14,8 +14,9 @@ import uuid
 from pet.storage import P
 
 FILE = "schedule.json"
-KINDS = ("say", "care", "reminder")
-KIND_CN = {"say": "说一句", "care": "关怀", "reminder": "提醒"}
+KINDS = ("say", "care", "reminder", "diary")
+KIND_CN = {"say": "说一句", "care": "关怀", "reminder": "提醒", "diary": "日记"}
+MAX_ENTRIES = 30
 WEEK_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 MAX_CONTENT = 800
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")

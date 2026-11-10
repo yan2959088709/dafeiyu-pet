@@ -30,13 +30,9 @@ DRIVES_FILE = "pet_drives.json"
 # 门禁数值的合法区间（钳后值）：越界不是抛异常而是记 warn 取边界——
 # 手改 config 改出负静默窗/零冷却时，最坏结果也只是「规则失效」，不能崩
 GATE_LIMITS = {
-    "min_silent": (30.0, None),
-    "min_interval": (60.0, None),
-    "urgency_threshold": (0.0, 1.0),
-    # 每日消费/连发同样必须有上限：1e9 会让这两道闸门彻底失效（越界值本应
-    # fail-closed，只有它们是 fail-open）
-    "max_per_24h": (1.0, 200.0),
-    "max_consecutive": (1.0, 10.0),
+    # 心跳间隔：两次「醒来评估要不要开口」之间的最短时间。它现在是唯一
+    # 的节奏控制（其余发言门禁已移除，说不说由 AI 自己决定）。
+    "interval_secs": (30.0, 86400.0),
     "tired_threshold": (0.0, 100.0),
 }
 
@@ -45,16 +41,6 @@ MISS_ONSET_SEC = 1800.0          # 亲密度「想念」起点：沉默满 30 �
 MISS_FULL_SEC = 7200.0           # 亲密度「想念」拉满：再沉默 2 小时到顶
 SILENCE_FULL_SEC = 3600.0        # 沉默度拉满：1 小时没说话即满分
 DAY_SEC = 86400.0
-
-DEFAULT_MOOD_KEYWORDS = {
-    "开心": "happy",
-    "高兴": "happy",
-    "累": "tired",
-    "难过": "sad",
-    "生气": "angry",
-    "焦虑": "anxious",
-    "无聊": "bored",
-}
 
 DEFAULT_TIME_BONUS = {
     7: 0.8, 8: 0.8, 9: 0.3, 10: 0.3, 11: 0.3, 12: 0.5, 13: 0.5,
@@ -66,25 +52,21 @@ DEFAULT_TIME_BONUS = {
 # 手改 config 改出非法值时不抛异常，由 normalize + 算术处的兜底接管。
 DEFAULT_HEARTBEAT = {
     "enabled": True,
-    "min_silent": 600,
-    "min_interval": 1800,
-    "urgency_threshold": 0.35,
-    "max_per_24h": 15,
-    "max_consecutive": 2,
-    # 学习模式：由心跳引擎按真实作息读 sleep_window；数据不足时回退 23-06，
-    # 行为连续。默认值就定在这里（单一事实来源），config 侧不再 import 时改写
-    "quiet_window": "auto",
+    # 自主心跳（2026-11-10）：不再有睡眠窗/沉默/冷却/日配额/连发等发言门禁，
+    # 只保留「每隔多少秒醒来一次」的节奏；每次醒来由 AI 自己决定开口或静默。
+    # 30 秒是界面轮询粒度，再小也不会更快。
+    "interval_secs": 300,
     # 代谢 v1（TASK-018）：一句话 1 精力，安静 5 分钟后每 5 分钟恢复 3，
-    # 3 小时回满；低于 15 时心跳不再主动开口（not_tired 门禁），
-    # 让「累」成为可解释、可恢复的状态，而不是永远卡在 1/100。
+    # 3 小时回满；精力只是身体感受，不再由代码禁止开口。
     "msg_energy_cost": 1,
     "energy_recovery_per_300s": 3.0,
     "energy_full_secs": 10800,
-    "tired_threshold": 15,
-    "mood_decay_secs": 14400,
+    # 只用于提示词里的「累」描述和用户内容调度的 care 门槛，不拦截心跳
+    "tired_threshold": 5,
+    # 亲密度仍是关系状态（用户互动累积、沉默缓慢衰减）
     "affinity_gain": 0.2,
     "affinity_decay_per_hour": 0.5,
-    "mood_keywords": DEFAULT_MOOD_KEYWORDS,
+    # 仅作为 feel_heartbeat 里「想说话的冲动」参考值，不再影响是否开口
     "time_bonus": DEFAULT_TIME_BONUS,
     "proactive_hint": True,
 }
@@ -92,10 +74,14 @@ DEFAULT_HEARTBEAT = {
 MOOD_CN = {"calm": "平静", "happy": "开心", "tired": "疲惫", "sad": "难过",
            "angry": "生气", "anxious": "焦虑", "bored": "无聊"}
 
-_NUM_KEYS = ("min_silent", "min_interval", "urgency_threshold", "max_per_24h",
-             "max_consecutive", "msg_energy_cost", "energy_recovery_per_300s",
-             "energy_full_secs", "mood_decay_secs", "affinity_gain",
-             "affinity_decay_per_hour", "tired_threshold")
+_NUM_KEYS = ("interval_secs", "msg_energy_cost", "energy_recovery_per_300s",
+             "energy_full_secs", "affinity_gain", "affinity_decay_per_hour",
+             "tired_threshold")
+
+# 旧版门禁键：读取时丢弃，避免界面上残留「调了也没用」的配置。
+_LEGACY_KEYS = ("min_silent", "min_interval", "urgency_threshold",
+                "max_per_24h", "max_consecutive", "quiet_window",
+                "mood_keywords", "mood_decay_secs")
 
 
 def _clamp(val, lo=0.0, hi=1.0):
@@ -113,9 +99,9 @@ def cfg_num(cfg, key):
     try:
         val = float((cfg or {}).get(key))
     except (TypeError, ValueError):
-        return float(DEFAULT_HEARTBEAT[key])
+        return float(DEFAULT_HEARTBEAT.get(key, 0.0))
     if val != val:
-        return float(DEFAULT_HEARTBEAT[key])
+        return float(DEFAULT_HEARTBEAT.get(key, 0.0))
     return val
 
 
@@ -168,6 +154,10 @@ def normalize_heartbeat_cfg(cfg):
         if clamped != val:
             pet_log.warn("心跳配置 %s=%s 越界，已钳为 %s" % (key, val, clamped))
             out[key] = clamped
+    # 旧版发言门禁/自动情绪键已整体废弃：读旧配置不报错，归一结果里直接丢弃，
+    # 避免界面与提示词里残留「调了也没用」的数值。
+    for key in _LEGACY_KEYS:
+        out.pop(key, None)
     # TASK-018 代谢迁移：旧默认三元组（2 精力/句、2/300s 恢复、4h 满血）
     # 与用户主动选择不可区分，按「未个性化」升级到新默认；显式改过任一项
     # 或已带 tired_threshold 的配置原样保留，不覆盖用户选择。
@@ -187,30 +177,6 @@ def normalize_heartbeat_cfg(cfg):
         except (TypeError, ValueError):
             continue
     out["time_bonus"] = bonus or dict(DEFAULT_TIME_BONUS)
-    kw = out.get("mood_keywords")
-    out["mood_keywords"] = dict(kw) if isinstance(kw, dict) and kw \
-        else dict(DEFAULT_MOOD_KEYWORDS)
-    window = out.get("quiet_window")
-    if window == "auto":
-        out["quiet_window"] = "auto"
-    elif isinstance(window, list) and window == [23, 6]:
-        # [23,6] 与用户主动选择不可区分（TASK-010 硬编码默认）：按「未个性化」
-        # 归一为 auto，学习窗数据不足时仍回退 23-06，行为连续，有数据后学真实作息
-        out["quiet_window"] = "auto"
-    elif not (isinstance(window, (list, tuple)) and len(window) == 2):
-        out["quiet_window"] = [23, 6]
-    else:
-        try:
-            pair = [int(window[0]), int(window[1])]
-        except (TypeError, ValueError):
-            pair = None
-        # start==end = 空窗：decide 的 pair 分支 start<=hour<end 永假，安静窗
-        # 永久敞开（G7 fail-open）。与 config.validate 拒绝 start==end 对齐，
-        # 按畸形值归一到 [23,6]（非 auto：用户显式写了这对相同小时）
-        if not pair or pair[0] == pair[1]:
-            out["quiet_window"] = [23, 6]
-        else:
-            out["quiet_window"] = pair
     return out
 
 
@@ -226,8 +192,7 @@ def state_segments(st):
     """驱动状态 → 提示词用的三段中文描述（情绪/精力/亲密度）。"""
     mood = str(getattr(st, "mood", "") or "calm")
     return {
-        "mood": "情绪%s（强度%.0f%%）" % (MOOD_CN.get(mood, mood),
-                                        _clamp(st.mood_intensity) * 100),
+        "mood": "情绪%s" % MOOD_CN.get(mood, mood),
         "energy": "精力%.0f/100" % _clamp(st.energy, 0.0, 100.0),
         "affinity": "亲密度%.0f/100" % _clamp(st.affinity, 0.0, 100.0),
     }
@@ -237,6 +202,8 @@ def state_segments(st):
 class DrivesState:
     mood: str = "calm"
     mood_intensity: float = 1.0
+    # 情绪归属标记：""=旧版自动情绪（一次性迁移回平静），"ai"=由 AI 自己设定
+    mood_owner: str = ""
     energy: float = 80.0
     affinity: float = 0.0
     last_user_message_time: float = 0.0
@@ -274,6 +241,11 @@ class DrivesEngine:
                     continue
         st.mood = str(st.mood or "calm")
         st.mood_intensity = _clamp(st.mood_intensity)
+        # 旧版情绪来自关键词自动打标：首次加载归零，之后只认 AI 的 set_mood
+        if str(st.mood_owner or "") != "ai":
+            st.mood = "calm"
+            st.mood_intensity = 1.0
+            st.mood_owner = "ai"
         st.energy = _clamp(st.energy, 0.0, 100.0)
         st.affinity = _clamp(st.affinity, 0.0, 100.0)
         # 时间戳双端钳：前拨时钟（year 3000）落盘的未来值会在回拨后让
@@ -302,7 +274,8 @@ class DrivesEngine:
         - 过了活跃期按「结算游标 → now」的增量结算：游标早于互动基准（互动
           后首次结算）时从基准算起，全量 elapsed 一次结清；之后每拍只结新过
           的时间。游标是 last_decay_time，只前进、绝不当衰减基准。
-        - 情绪重置与满血直充看距上次互动的全量 elapsed（纯函数，天然不叠加）。
+        - 满血直充看距上次互动的全量 elapsed（纯函数，天然不叠加）。
+        情绪不参与自动衰减：它只由 AI 通过 set_mood 自己决定，代码不替她改。
         时钟回拨时 elapsed 钳为 0：不恢复、不衰减，也不会把状态写坏。
         游标只前进（max）：回拨那一拍即使进了结算分支，也不把已结算过的
         时段后退——否则时钟恢复后同一段 gap 被二次结算（精力/亲密度凭空
@@ -324,23 +297,20 @@ class DrivesEngine:
                 st.affinity = max(0.0, st.affinity - gap / 3600.0
                                   * cfg_num(self.cfg, "affinity_decay_per_hour"))
                 st.last_decay_time = max(float(st.last_decay_time or 0.0), now)
-            if elapsed >= cfg_num(self.cfg, "mood_decay_secs") and st.mood != "calm":
-                st.mood = "calm"
-                st.mood_intensity = 1.0
             return st
 
     # ------------------------------------------------------------ 事件
     def apply_user_message(self, now, text=""):
-        """主人开口：亲密度小涨、刷新互动基准、休息时钟从头起算、按关键词粗标情绪。"""
+        """主人开口：亲密度小涨、刷新互动基准、休息时钟从头起算。
+
+        情绪不按关键词自动打标——她自己的心情由她自己（set_mood 工具）决定。
+        """
         with self._lock:
             st = self.st
             st.affinity = min(100.0, st.affinity
                               + cfg_num(self.cfg, "affinity_gain"))
             st.last_user_message_time = float(now)
             st.last_decay_time = float(now)
-            mood = self._match_mood(text)
-            if mood:
-                st.mood = mood
 
     def apply_ai_reply(self, now):
         """说一句话耗一份精力（上屏出口的唯一计费点：主动/被动两条路都经它，下限 0）。"""
@@ -349,16 +319,21 @@ class DrivesEngine:
             st.energy = max(0.0, st.energy
                             - cfg_num(self.cfg, "msg_energy_cost"))
 
-    def _match_mood(self, text):
-        """关键词子串匹配取最后一个命中：后说的情绪覆盖先说的。"""
-        body = str(text or "")
-        if not body:
-            return ""
-        hit = ""
-        for kw, mood in (self.cfg.get("mood_keywords") or {}).items():
-            if kw and kw in body:
-                hit = mood
-        return hit
+    def set_mood(self, mood):
+        """AI 自主设定情绪（中英文都收）；非法值抛 ValueError 由工具层转文案。"""
+        raw = str(mood or "").strip()
+        key = raw.lower()
+        if key not in MOOD_CN:
+            key = {v: k for k, v in MOOD_CN.items()}.get(raw, key)
+        if key not in MOOD_CN:
+            raise ValueError("情绪只能是：%s" % "、".join(
+                "%s(%s)" % (k, v) for k, v in MOOD_CN.items()))
+        with self._lock:
+            self.st.mood = key
+            self.st.mood_intensity = 1.0
+            self.st.mood_owner = "ai"
+            self.save()
+            return self.st.mood
 
     # ------------------------------------------------------------ 派生
     def urgency(self, st, now):

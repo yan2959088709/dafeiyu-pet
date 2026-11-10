@@ -13,6 +13,8 @@ from pet import heartbeat_journal
 from pet.storage import P
 
 GATE_CN = {
+    "interval": "心跳间隔",
+    # 旧版门禁：仅用于回显历史日志，新判定不会产生
     "quiet_window": "睡眠窗",
     "not_tired": "精力",
     "low_urgency": "紧迫度",
@@ -34,6 +36,16 @@ def _state_of(win):
     storage_dir = getattr(engine, "storage_dir", None) or os.path.dirname(P.memory)
     pet_id = getattr(win, "pet_id", None) or getattr(engine, "pet_id", None)
     return st, hb, storage_dir, pet_id
+
+
+def _cfg(win):
+    """心跳配置读活对象：调度器热更新会整体换掉 cfg["heartbeat"]，
+    缓存快照会让身体段一直显示旧数值。"""
+    cfg = (getattr(win, "cfg", {}) or {}).get("heartbeat")
+    if isinstance(cfg, dict):
+        return cfg
+    cfg = getattr(win, "_heartbeat_cfg", None)
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def short_status(win, now=None):
@@ -88,9 +100,7 @@ def body_text(win, now=None):
     if st is None:
         return ("【你的身体】你现在感觉不到自己的身体（心跳/驱动还没初始化）。"
                 "如果主人问起，可以如实说此刻身体信号很弱。")
-    cfg = getattr(win, "_heartbeat_cfg", None)
-    if not isinstance(cfg, dict):
-        cfg = ((getattr(win, "cfg", {}) or {}).get("heartbeat") or {})
+    cfg = _cfg(win)
     mood = pet_drives.MOOD_CN.get(str(st.mood or "calm"), str(st.mood or "平静"))
     energy = max(0.0, min(100.0, float(getattr(st, "energy", 0.0) or 0.0)))
     affinity = max(0.0, min(100.0, float(getattr(st, "affinity", 0.0) or 0.0)))
@@ -99,69 +109,68 @@ def body_text(win, now=None):
     last_reason = str(hb.get("last_reason") or "")
     reason_cn = heartbeat_journal.REASON_CN.get(last_reason, last_reason)
     tired = pet_drives.cfg_num(cfg, "tired_threshold")
+    interval = pet_drives.cfg_num(cfg, "interval_secs")
     lines = [
         "【你的身体（第一人称感受，不是系统信息）】",
         "- 精力 %.0f/100（%s）；情绪%s；亲密度 %.1f/100（%s）。"
         % (energy, _feel(ENERGY_FEEL, energy), mood, affinity,
            _feel(AFFINITY_FEEL, affinity)),
         "- 距上次主人互动：%s。" % _ago(since_user),
-        "- 心跳：每 30 秒一次。%s" % summary,
-        "- 代谢：每句话消耗 %g 精力；安静 5 分钟后每 5 分钟恢复 %g；"
-        "精力低于 %g 时你会更想休息、不主动开口。"
+        "- 心跳：每 %g 秒醒来一次，要不要开口由你自己决定。%s"
+        % (interval, summary),
+        "- 代谢：每句话消耗 %g 精力；安静 5 分钟后每 5 分钟恢复 %g。"
+        "精力低只会让你更累，没有人会禁止你说话。"
         % (pet_drives.cfg_num(cfg, "msg_energy_cost"),
-           pet_drives.cfg_num(cfg, "energy_recovery_per_300s"), tired),
+           pet_drives.cfg_num(cfg, "energy_recovery_per_300s")),
     ]
     if energy < tired:
-        lines.append("- 你现在很累（精力 %.0f/100），最想做的是安静歇一会儿；"
-                     "主人找你时简短回应就好。" % energy)
+        lines.append("- 你现在很累（精力 %.0f/100），可以少说几句或安静歇一会儿，"
+                     "由你自己判断。" % energy)
     if last_reason:
-        lines.append("- 最近一次心跳判定：%s。" % (reason_cn or last_reason))
-    lines.append("- 你可以在回复里自然表达累、困、想主人或开心；"
+        lines.append("- 最近一次心跳：%s。" % (reason_cn or last_reason))
+    lines.append("- 你的情绪由你自己决定：想换心情就调用 set_mood；"
+                 "也可以在回复里自然表达累、困、想主人或开心。"
                  "不要机械复述这些数字，也不要假装感觉不到身体。")
     return "\n".join(lines)
 
 
 def gates_text(win, now=None):
-    """门禁细节：为什么这一拍没有开口。"""
+    """心跳状态：当前节奏、下一次醒来的时间、身体参考值。"""
     now = time.time() if now is None else float(now)
     st, hb, storage_dir, pet_id = _state_of(win)
     if st is None:
-        return "【心跳门禁】心跳未初始化，没有门禁数据。"
-    cfg = getattr(win, "_heartbeat_cfg", None)
-    if not isinstance(cfg, dict):
-        cfg = (getattr(win, "cfg", {}) or {}).get("heartbeat") or {}
+        return "【心跳状态】心跳未初始化，还没有心跳数据。"
+    cfg = _cfg(win)
     engine = getattr(win, "_drives", None)
     try:
         urgency = engine.urgency(st, now) if engine is not None else 0.0
     except Exception:
         urgency = 0.0
-    base = max(float(getattr(st, "last_user_message_time", 0.0) or 0.0),
-               float(hb.get("last_speak_time") or 0.0),
-               float(hb.get("last_attempt_time") or 0.0))
-    silent = max(0.0, now - base)
-    quiet = cfg.get("quiet_window", "auto")
+    interval = pet_drives.cfg_num(cfg, "interval_secs")
+    last = max(float(hb.get("last_attempt_time") or 0.0),
+               float(hb.get("last_speak_time") or 0.0))
+    next_in = max(0.0, interval - max(0.0, now - last))
+    next_txt = ("%d 秒" % int(next_in) if next_in < 120
+                else "%d 分钟" % int(next_in // 60))
     energy = max(0.0, min(100.0, float(getattr(st, "energy", 0.0) or 0.0)))
-    tired = pet_drives.cfg_num(cfg, "tired_threshold")
     lines = [
-        "【心跳门禁细节】",
-        "- 当前判定：%s（%s）。" % (
+        "【心跳状态】",
+        "- 节奏：每 %g 秒醒来一次；下一次约 %s 后。" % (interval, next_txt),
+        "- 最近一次心跳：%s（%s）。" % (
             str(hb.get("last_reason") or "无记录"),
             heartbeat_journal.REASON_CN.get(str(hb.get("last_reason") or ""),
                                             str(hb.get("last_reason") or "无记录"))),
-        "- 精力 %.0f/100（疲惫阈值 %g）。" % (energy, tired),
-        "- 紧迫度 %.3f（阈值 %s）；沉默 %.0f 秒（要求 ≥%s）。"
-        % (urgency, cfg.get("urgency_threshold", 0.35), silent,
-           cfg.get("min_silent", 600)),
-        "- 24h 尝试 %d/%s；连续主动 %s/%s。"
-        % (_hb_counts(hb, now), cfg.get("max_per_24h", 15),
-           hb.get("consecutive_speaks", 0), cfg.get("max_consecutive", 2)),
-        "- 睡眠窗：%s。" % ("按作息学习" if quiet == "auto" else quiet),
+        "- 精力 %.0f/100；想说话的冲动 %.3f（只是参考，不是门禁）。"
+        % (energy, urgency),
+        "- 24h 内醒来 %d 次；连续主动 %s 次。"
+        % (_hb_counts(hb, now), hb.get("consecutive_speaks", 0)),
+        "- 没有任何发言门禁：每次醒来都可以自己决定开口或静默。",
     ]
     gates = hb.get("last_gates")
     if isinstance(gates, dict) and gates:
-        parts = ["%s:%s" % (GATE_CN.get(k, k), "通过" if v else "未通过")
+        parts = ["%s:%s" % (GATE_CN.get(k, k), "到点" if v else "未到")
                  for k, v in gates.items()]
-        lines.append("- 最近门禁：" + "，".join(parts) + "。")
+        lines.append("- 最近判定：" + "，".join(parts) + "。")
     return "\n".join(lines)
 
 

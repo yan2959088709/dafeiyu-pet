@@ -18,6 +18,9 @@ MAX_AGE = 7 * 86400
 _LOCK = threading.Lock()
 
 REASON_CN = {
+    "interval": "还没到心跳间隔",
+    "ok": "到心跳时间了",
+    # 旧版本门禁原因：仅用于回显历史日志，新判定不会再产生
     "quiet_window": "睡眠窗内",
     "not_tired": "太累了",
     "low_urgency": "还没那么想说话",
@@ -25,9 +28,8 @@ REASON_CN = {
     "cooldown": "冷却中",
     "24h_limit": "今日主动次数已用完",
     "max_consecutive": "连续主动太多了",
-    "ok": "门禁通过",
 }
-OUTCOME_CN = {"speak": "说出口", "silent": "忍住了", "skip": "被门禁拦下",
+OUTCOME_CN = {"speak": "说出口", "silent": "忍住了", "skip": "还没醒",
               "error": "尝试失败"}
 
 

@@ -40,6 +40,8 @@ class RuntimePaths:
         self.log = os.path.join(app_dir, "logs.txt")
         self.voice_cache = os.path.join(app_dir, "voice-cache")
         self.attachments = os.path.join(app_dir, "attachments")
+        self.avatars = os.path.join(app_dir, "avatars")
+        self.diary = os.path.join(app_dir, "diary")
         self.api_state = os.path.join(app_dir, "api-runtime.json")
         self.memory = os.path.join(app_dir, "pet_memory.json")
         self.ledger = os.path.join(app_dir, "usage_ledger.json")

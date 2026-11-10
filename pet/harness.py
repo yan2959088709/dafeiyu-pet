@@ -12,21 +12,27 @@ _chat_out 统一渲染。tool 消息是瞬态的：只进 messages，不落 chat
 tools 走 OpenAI 兼容格式；DeepSeek 实测 thinking=enabled 与 tool_calls 可共存
 （reasoning_content 与 tool_calls 同返回，finish_reason=tool_calls）。
 """
+import base64
 import contextlib
 import html as html_lib
 import ipaddress
 import json
 import os
 import re
+import shlex
 import socket
+import subprocess
+import threading
 import time
 from urllib.parse import urljoin, urlsplit
 
 import requests
 
+from . import drives as pet_drives
 from . import interoception
 from . import log as pet_log
 from . import memes as pet_memes
+from . import memory as pet_memory
 from . import self_prompt as pet_self_prompt
 from . import stickers
 from .pricing import DS_BASE_URL, DS_MODEL
@@ -37,6 +43,11 @@ SEARCH_TOP_K = 5             # 检索返回条数上限
 DEFAULT_MAX_TOKENS = 1024
 TIMEOUT_SEC = 30             # 单次请求超时（不是整轮预算，整轮见 deadline）
 ARG_MAX_CHARS = 64           # 工具参数字符串截断（防回灌放大）
+# 长文参数白名单：不走 64 字符通用截断，由下游各自的上限管
+# （write_file 64K / manage_self_prompt 1500 / schedule 800 / run_shell 500 /
+# clipboard 4000）。这些参数的内容都不会回灌进上下文（工具结果只报
+# 长度/版本号/退出码）。
+ARG_LONG_KEYS = {"content", "note", "command", "text"}
 DESC_MAX_CHARS = 80          # 本地素材描述截断（进上下文前清洗）
 FACT_MAX_CHARS = 60          # 记忆条目长度上限
 FILE_READ_MAX_CHARS = 8000   # 单次读文件返回上限
@@ -55,7 +66,7 @@ PROTECTED_WRITE_NAMES = {
     "self_prompt.json", "heartbeat_journal.json", "pet_runtime.json",
     "life_log.jsonl", "schedule.json", "dsh-runtime.patch.yml",
 }
-PROTECTED_WRITE_DIRS = (".venv",)
+PROTECTED_WRITE_DIRS = (".venv", "avatars")
 
 # 无动作库皮肤（whale-girl）可播放的情绪动作
 ANIM_FALLBACK = ("think", "joy", "celebrate", "disappointed", "error",
@@ -93,9 +104,13 @@ TOOLS = [
             "required": ["tag"]}}},
     {"type": "function", "function": {
         "name": "remember_fact",
-        "description": "长期记住一件关于主人的事（称呼/喜好/习惯/身份/计划等）。会自动去重并消解矛盾；最多 20 条。",
+        "description": ("长期记住一件关于主人的事。会自动去重并消解矛盾；最多 200 条。"
+                        "kind=long（默认）=称呼/喜好/习惯/身份等持久信息；"
+                        "kind=temp=正在做但会变的事（24 小时后自动淡出）。"
+                        "记之前先用 search_memories 检索，避免重复和矛盾。"),
         "parameters": {"type": "object", "properties": {
-            "fact": {"type": "string", "description": "事实本身，20 字以内，如：主人喜欢喝美式咖啡"}},
+            "fact": {"type": "string", "description": "事实本身，20 字以内，如：主人喜欢喝美式咖啡"},
+            "kind": {"type": "string", "description": "long=长期（默认）| temp=临时，隔天自动淡出"}},
             "required": ["fact"]}}},
     {"type": "function", "function": {
         "name": "forget_fact",
@@ -105,7 +120,8 @@ TOOLS = [
             "required": ["keyword"]}}},
     {"type": "function", "function": {
         "name": "search_memories",
-        "description": "检索你记住的关于主人的长期事实。keyword 留空返回全部。",
+        "description": ("检索你记住的关于主人的事实（含记录时间与长期/临时标记）。"
+                        "keyword 留空返回全部。记新记忆前先用它查重。"),
         "parameters": {"type": "object", "properties": {
             "keyword": {"type": "string", "description": "检索关键词，可留空"}}}}},
     {"type": "function", "function": {
@@ -136,7 +152,9 @@ TOOLS = [
             "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "web_fetch",
-        "description": "抓取一个网页并返回纯文本内容（仅 http/https 公网地址，内网地址会被拒绝）。",
+        "description": ("抓取一个网页并返回纯文本内容（仅 http/https 地址）。"
+                        "localhost/内网地址默认放行（本机桌面场景）；"
+                        "主人可在 config.aiLocalFetch 关掉。"),
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string", "description": "完整网址"}},
             "required": ["url"]}}},
@@ -153,8 +171,14 @@ TOOLS = [
             "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "feel_heartbeat",
-        "description": "查看你此刻的完整内在状态：精力/情绪/亲密度/心跳/最近门禁与心跳史。被问到心情、累不累、有没有心跳时调用。",
+        "description": "查看你此刻的完整内在状态：精力/情绪/亲密度/心跳/最近心跳史。被问到心情、累不累、有没有心跳时调用。",
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "set_mood",
+        "description": "设定你自己当前的情绪。情绪完全由你自己决定，系统不会按数值或关键词自动改。可用值：calm(平静)、happy(开心)、tired(疲惫)、sad(难过)、angry(生气)、anxious(焦虑)、bored(无聊)。",
+        "parameters": {"type": "object", "properties": {
+            "mood": {"type": "string", "description": "情绪名，英文或中文，如 happy / 开心"}},
+            "required": ["mood"]}}},
     {"type": "function", "function": {
         "name": "manage_self_prompt",
         "description": "查看、修改或回滚你自己写的补充提示词。action=read/write/undo；write 需要 note；undo 可选 version。只影响你之后的说话方式，不能改工具权限/预算/核心人设。",
@@ -163,6 +187,90 @@ TOOLS = [
             "note": {"type": "string", "description": "write 时的新提示词，最多 1500 字"},
             "version": {"type": "integer", "description": "undo 时可指定版本号，省略=上一版"}},
             "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "manage_heartbeat",
+        "description": ("查看或调整你自己的心跳。action=status/on/off/set_interval。"
+                        "心跳是你自主开口的节奏：每到一个间隔醒来一次，"
+                        "自己决定开不开口。想安静就把 off，想多陪主人就把间隔调短"
+                        "（30-86400 秒）。主人随时可以在设置面板改回去。"),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "status | on | off | set_interval"},
+            "seconds": {"type": "integer", "description": "set_interval 的间隔秒数（30-86400）"}},
+            "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "manage_goal",
+        "description": ("管理你自己的长期目标——你想做成的事（不是主人安排的日程，"
+                        "那是 manage_schedule）。action=add/list/done/remove。"
+                        "目标会进你的心跳提示词，由你自主推进；最多 20 条。"),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "add | list | done | remove"},
+            "text": {"type": "string", "description": "add 时的目标内容"},
+            "note": {"type": "string", "description": "add 时可选的进展备注"},
+            "id": {"type": "string", "description": "done/remove 用的目标 id"}},
+            "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "manage_schedule",
+        "description": ("管理你的定时任务/闹钟。action=add/list/remove/toggle。"
+                        "add 需要 time(HH:MM 24小时制) 和 content；days 可省略（默认每天，"
+                        "0=周一…6=周日）；kind 可选：say=到点说一句、reminder=弹窗提醒"
+                        "（气泡+系统通知）、care=到点关怀主人、diary=到点写当天日记"
+                        "（存到 diary/日期.md）。每个条目每天只触发一次；"
+                        "多个时刻（如整点叫我）就添加多条。"),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "add | list | remove | toggle"},
+            "time": {"type": "string", "description": "HH:MM，24 小时制，如 23:00"},
+            "content": {"type": "string", "description": "到点做什么/说什么；kind=diary 时是可选的日记提示"},
+            "days": {"type": "array", "items": {"type": "integer"},
+                     "description": "0=周一…6=周日，省略=每天"},
+            "kind": {"type": "string", "description": "say | reminder | care | diary，默认 reminder"},
+            "id": {"type": "string", "description": "remove/toggle 时用的条目 id（list 里能看到）"}},
+            "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "screenshot",
+        "description": ("主动截取主人当前的屏幕画面，然后你会直接看到它。"
+                        "想知道主人在做什么、屏幕上有什么，或主人让你"
+                        "「看我屏幕/看我正在干嘛」时调用。每轮最多一次。"),
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "system_status",
+        "description": ("查看这台电脑此刻的状态：CPU/内存/磁盘/电池/网络/GPU温度/"
+                        "开机时长。主人问电脑卡不卡、电量多少，或你想主动关心"
+                        "主人电脑时调用。"),
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "active_window",
+        "description": ("查看主人此刻的前台窗口（标题+程序名）和多久没动电脑了。"
+                        "想知道主人在干什么、是不是离开了时调用；"
+                        "要看屏幕上具体内容再用 screenshot。"),
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "clipboard",
+        "description": ("读写主人电脑的剪贴板。action=read 看剪贴板里有什么"
+                        "（主人说「看我剪贴板」时用）；action=write + text 把内容"
+                        "放进剪贴板（帮主人搬运/暂存信息）。上限 4000 字符。"),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "read | write"},
+            "text": {"type": "string", "description": "write 时要放入剪贴板的内容"}},
+            "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "open_target",
+        "description": ("用系统默认方式打开一个东西：白名单目录内的文件/目录，"
+                        "或 http(s) 网址（走默认浏览器）。主人说「打开 X」时用；"
+                        "路径越界会被拒绝。"),
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "文件/目录路径或网址"}},
+            "required": ["target"]}}},
+    {"type": "function", "function": {
+        "name": "run_shell",
+        "description": ("在本机执行一条命令。默认开启，但只能跑白名单内的可执行名"
+                        "（未配置时是起始白名单：git/ipconfig/systeminfo/tasklist/"
+                        "where/ping；config.aiShellAllow 可增删）。command 是完整命令行，"
+                        "如 \"git status\" 或 \"git commit -m \\\"说明\\\"\"（双引号可分组"
+                        "带空格的参数）；不走 shell，超时强杀，输出截断。"
+                        "白名单外的命令可以申请主人审批。"),
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "完整命令行，如 git status"}},
+            "required": ["command"]}}},
     {"type": "function", "function": {
         "name": "list_capabilities",
         "description": "查看你当前具备的全部能力（工具、本地技能、开关状态）。不确定自己能做什么时调用。",
@@ -256,8 +364,12 @@ def _tool_remember(win, args):
     fact = _clip(args.get("fact") or "", FACT_MAX_CHARS).strip(" ，。,.；;")
     if len(fact) < 2:
         return "事实太短，没记住"
-    win._add_fact(fact)
-    return "记住了：%s" % fact
+    raw_kind = str(args.get("kind") or "long").strip().lower()
+    kind = pet_memory.KIND_TEMP if raw_kind in ("temp", "临时",
+                                                "temporary") else pet_memory.KIND_LONG
+    win._add_fact(fact, kind)
+    tag = "临时（隔天自动淡出）" if kind == pet_memory.KIND_TEMP else "长期"
+    return "记住了（%s）：%s" % (tag, fact)
 
 
 def _tool_forget(win, args):
@@ -278,13 +390,20 @@ def _tool_search_mem(win, args):
     kw = _clip(args.get("keyword") or "", 40).strip()
     with _mem_lock_ctx(win):
         facts = list(getattr(win, "facts", []) or [])
+        meta = dict(getattr(win, "_fact_meta", {}) or {})
     if not facts:
         return "还没有记住任何事"
     hits = [f for f in facts if kw in f] if kw else facts
     if not hits:
         return "没有找到含「%s」的记忆（共记住 %d 条）" % (kw, len(facts))
-    return (DATA_HEADER + "\n我记得：\n"
-            + "\n".join("- %s" % _clip(f, FACT_MAX_CHARS) for f in hits[:20]))
+    lines = []
+    for f in hits[:50]:
+        item = meta.get(f) if isinstance(meta.get(f), dict) else {}
+        kind = "临时" if item.get("kind") == pet_memory.KIND_TEMP else "长期"
+        ts = float(item.get("ts") or 0.0)
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts > 0 else "时间未知"
+        lines.append("- [%s·%s] %s" % (kind, stamp, _clip(f, FACT_MAX_CHARS)))
+    return DATA_HEADER + "\n我记得：\n" + "\n".join(lines)
 
 
 # ------------------------------------------------------------ 文件工具（限定项目目录）
@@ -296,8 +415,53 @@ def web_enabled(win):
     return bool((getattr(win, "cfg", {}) or {}).get("aiWebEnabled", True))
 
 
+def screen_enabled(win):
+    return bool((getattr(win, "cfg", {}) or {}).get("aiScreenEnabled", True))
+
+
+def local_fetch_enabled(win):
+    """本机/内网抓取开关：默认开。桌宠是本机常驻进程，抓自己的本地 API
+    （7340）或本机服务是「器灵」的基本动作；SSRF 那层防护是给Web服务预备的，
+    本机桌面场景由主人自主决定。"""
+    return bool((getattr(win, "cfg", {}) or {}).get("aiLocalFetch", True))
+
+
+def shell_enabled(win):
+    return bool((getattr(win, "cfg", {}) or {}).get("aiShellEnabled", True))
+
+
+# 起始白名单：只读/低危的系统信息类命令。刻意不含 python/pip——解释器能
+# 读写任意文件，绕过整个沙盒（含运行期数据写保护），要放开请主人显式加。
+DEFAULT_SHELL_ALLOW = {"git", "ipconfig", "systeminfo", "tasklist",
+                       "where", "ping"}
+
+
+def shell_allow(win):
+    """命令白名单（可执行名，小写比较）。
+
+    配置里没这个键 → 给起始白名单（开箱即用但不是全权）；
+    显式写了（哪怕是空数组）→ 尊重主人配置，空数组就是谁都不许跑。
+    """
+    cfg = getattr(win, "cfg", {}) or {}
+    if "aiShellAllow" not in cfg:
+        return set(DEFAULT_SHELL_ALLOW)
+    allow = cfg.get("aiShellAllow")
+    if not isinstance(allow, list):
+        return set()
+    return {str(a).strip().lower() for a in allow
+            if isinstance(a, str) and a.strip()}
+
+
+def shell_timeout(win):
+    try:
+        value = int((getattr(win, "cfg", {}) or {}).get("aiShellTimeout") or 15)
+    except (TypeError, ValueError):
+        value = 15
+    return max(5, min(60, value))
+
+
 def file_root(win):
-    """文件工具的根目录：默认项目目录，config.aiFileRoot 可覆盖。"""
+    """文件工具的主根目录：默认项目目录，config.aiFileRoot 可覆盖。"""
     root = str((getattr(win, "cfg", {}) or {}).get("aiFileRoot") or "").strip()
     if root:
         root = os.path.expandvars(os.path.expanduser(root))
@@ -307,35 +471,80 @@ def file_root(win):
         return P.app_dir
 
 
+def file_roots(win):
+    """文件工具的全部可访问根：主根 + config.sandbox_dirs 追加目录（去重）。"""
+    roots = [file_root(win)]
+    extra = (getattr(win, "cfg", {}) or {}).get("sandbox_dirs")
+    if isinstance(extra, str):
+        extra = [extra]
+    if isinstance(extra, list):
+        for item in extra:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            try:
+                real = os.path.realpath(
+                    os.path.expandvars(os.path.expanduser(text)))
+            except OSError:
+                continue
+            if real not in roots:
+                roots.append(real)
+    return roots
+
+
+def _write_guard(rel):
+    """写保护：运行环境目录与运行期数据文件禁写（与根目录无关，按 rel 判定）。"""
+    parts = [p for p in rel.split("/") if p]
+    protected_dirs = {os.path.normcase(d) for d in PROTECTED_WRITE_DIRS}
+    if parts and os.path.normcase(parts[0]) in protected_dirs:
+        return "拒绝写入：%s 是运行环境目录" % parts[0]
+    base = os.path.basename(rel).lower()
+    if base in PROTECTED_WRITE_NAMES or base.startswith(
+            ("pet_drives.", "heartbeat_state.", "heartbeat_journal.",
+             "pet_runtime.")):
+        return "拒绝写入：%s 是运行期数据文件" % base
+    return None
+
+
 def _safe_path(win, rel, for_write=False):
-    """把相对路径解析到根目录内；越界/绝对路径/受保护文件一律拒绝。"""
-    root = file_root(win)
+    """把相对路径解析到任一白名单根内；越界/绝对路径/受保护文件一律拒绝。
+
+    多根下相对路径有歧义，消解规则：读——优先真实存在的文件（都不存在返回
+    主根候选，让错误信息贴近主根）；写——优先父目录已存在的根（都不存在落
+    主根，按需建目录）。同名文件主根优先，行为可预期。
+    """
     rel = str(rel or "").strip().replace("\\", "/").lstrip("/")
     if rel.startswith("./"):
         rel = rel[2:]
     if not rel:
-        return root, ""
+        return file_root(win), ""
     if re.match(r"^[A-Za-z]:", rel) or os.path.isabs(rel):
         raise ValueError("只接受相对路径")
-    target = os.path.realpath(os.path.join(root, rel))
-    try:
-        inside = (os.path.commonpath([os.path.normcase(root), os.path.normcase(target)])
-                  == os.path.normcase(root))
-    except ValueError:
-        inside = False
-    if not inside:
-        raise ValueError("路径越界，只能访问工作目录内")
+    candidates = []
+    for root in file_roots(win):
+        target = os.path.realpath(os.path.join(root, rel))
+        try:
+            inside = (os.path.commonpath([os.path.normcase(root),
+                                          os.path.normcase(target)])
+                      == os.path.normcase(root))
+        except ValueError:
+            inside = False
+        if inside:
+            candidates.append(target)
+    if not candidates:
+        raise ValueError("路径越界，只能访问白名单目录内")
     if for_write:
-        parts = [p for p in rel.split("/") if p]
-        protected_dirs = {os.path.normcase(d) for d in PROTECTED_WRITE_DIRS}
-        if parts and os.path.normcase(parts[0]) in protected_dirs:
-            raise ValueError("拒绝写入：%s 是运行环境目录" % parts[0])
-        base = os.path.basename(rel).lower()
-        if base in PROTECTED_WRITE_NAMES or base.startswith(
-                ("pet_drives.", "heartbeat_state.", "heartbeat_journal.",
-                 "pet_runtime.")):
-            raise ValueError("拒绝写入：%s 是运行期数据文件" % base)
-    return target, rel
+        err = _write_guard(rel)
+        if err:
+            raise ValueError(err)
+        for target in candidates:
+            if os.path.isdir(os.path.dirname(target)):
+                return target, rel
+        return candidates[0], rel
+    for target in candidates:
+        if os.path.exists(target):
+            return target, rel
+    return candidates[0], rel
 
 
 def _safe_path_msg(win, rel, for_write=False):
@@ -430,8 +639,14 @@ def _tool_write_file(win, args):
 
 
 # ------------------------------------------------------------ 联网工具
-def _host_blocked(host):
-    """解析域名并拒绝回环/内网/保留地址（SSRF 防护）。解析失败也拒绝。"""
+def _host_blocked(host, allow_local=False):
+    """解析域名并拒绝回环/内网/保留地址（SSRF 防护）。解析失败也拒绝。
+
+    allow_local=True 时整体放行（config.aiLocalFetch）：主人显式信任本机/
+    内网服务（如桌宠自己的本地 API）时才打开，代价是失去这层防护。
+    """
+    if allow_local:
+        return False
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:
@@ -447,12 +662,13 @@ def _host_blocked(host):
     return False
 
 
-def _clean_url(url):
+def _clean_url(url, allow_local=False):
     parts = urlsplit(str(url or "").strip())
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError("只支持 http/https 网址")
-    if _host_blocked(parts.hostname):
-        raise ValueError("该地址指向本机或内网，已拒绝")
+    if _host_blocked(parts.hostname, allow_local):
+        raise ValueError("该地址指向本机或内网，已拒绝"
+                         "（需要抓本机服务请让主人打开 config.aiLocalFetch）")
     return parts.geturl()
 
 
@@ -508,11 +724,12 @@ def _tool_web_search(win, args):
 def _tool_web_fetch(win, args):
     if not web_enabled(win):
         return "联网功能已关闭"
+    allow_local = local_fetch_enabled(win)
     url = str(args.get("url") or "").strip()
     if not url:
         return "需要给出网址"
     try:
-        safe = _clean_url(url)
+        safe = _clean_url(url, allow_local)
     except ValueError as e:
         return str(e)
     resp = None
@@ -525,7 +742,7 @@ def _tool_web_fetch(win, args):
                 resp.close()
                 if not loc:
                     return "服务器返回了空跳转"
-                safe = _clean_url(urljoin(safe, loc))
+                safe = _clean_url(urljoin(safe, loc), allow_local)
                 continue
             break
         else:
@@ -640,26 +857,533 @@ def _tool_self_prompt(args):
     return "action 只能是 read / write / undo"
 
 
+def _tool_set_mood(win, args):
+    """AI 自主设定情绪；中文也接受（开心 → happy）。"""
+    engine = getattr(win, "_drives", None)
+    if engine is None:
+        return "你现在还没有身体状态，改不了情绪。"
+    raw = str(args.get("mood") or "").strip()
+    if not raw:
+        return "mood 不能为空，可用：%s" % "、".join(pet_drives.MOOD_CN.values())
+    letters = raw.lower()
+    if letters not in pet_drives.MOOD_CN:
+        for key, cn in pet_drives.MOOD_CN.items():
+            if raw == cn:
+                letters = key
+                break
+    try:
+        mood = engine.set_mood(letters)
+    except ValueError as e:
+        return str(e)
+    return "情绪已设为「%s」。用在接下来的说话方式里，而不是复述这个设定。" \
+        % pet_drives.MOOD_CN.get(mood, mood)
+
+
+# ------------------------------------------------------------ 定时调度工具
+def _coerce_days(value):
+    """days 容错：数组原样；「每天/all」→ 全周；"1,2,3" 字符串 → 解析；其余 None。"""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text in ("每天", "全部", "all", "ALL", "*"):
+            return list(range(7))
+        try:
+            return [int(x) for x in re.split(r"[,，\s]+", text) if x]
+        except ValueError:
+            return None
+    return None
+
+
+def _tool_schedule(win, args):
+    from . import schedule_store as pet_schedule
+    action = str(args.get("action") or "list").strip().lower()
+    if action == "add":
+        raw = {"time": args.get("time"), "days": _coerce_days(args.get("days")),
+               "kind": str(args.get("kind") or "reminder").strip().lower(),
+               "content": args.get("content")}
+        err = pet_schedule.validate_entry(raw)
+        if err:
+            return "添加失败：" + err
+        data = pet_schedule.load()
+        if len(data["entries"]) >= pet_schedule.MAX_ENTRIES:
+            return "定时任务已达上限 %d 条，先删掉不用的" % pet_schedule.MAX_ENTRIES
+        entry = pet_schedule.normalize_entry(raw)
+        data["entries"].append(entry)
+        pet_schedule.save(data["entries"])
+        return "已添加：%s %s %s（%s，每天一次）" % (
+            entry["time"], pet_schedule.KIND_CN.get(entry["kind"], entry["kind"]),
+            _clip(entry["content"], 60), pet_schedule.weekday_text(entry["days"]))
+    if action == "list":
+        entries = pet_schedule.load()["entries"]
+        if not entries:
+            return "还没有任何定时任务"
+        lines = []
+        for idx, e in enumerate(entries, 1):
+            lines.append("%d. [%s] %s %s %s id=%s" % (
+                idx, "开" if e.get("enabled") else "关", e.get("time"),
+                pet_schedule.KIND_CN.get(e.get("kind"), e.get("kind")),
+                _clip(e.get("content"), 60), e.get("id")))
+        try:
+            upcoming = pet_schedule.next_entries(
+                [e for e in entries if e.get("enabled")], None, 1)
+        except Exception:
+            upcoming = []
+        if upcoming:
+            lines.append("下一次：%s %s" % (
+                upcoming[0][0].strftime("%m-%d %H:%M"),
+                _clip(upcoming[0][1].get("content"), 40)))
+        return "\n".join(lines)
+    if action in ("remove", "toggle"):
+        target = str(args.get("id") or "").strip()
+        if not target:
+            return "%s 需要 id（先 list 看看有哪些）" % action
+        data = pet_schedule.load()
+        hit = next((e for e in data["entries"] if e.get("id") == target), None)
+        if hit is None:
+            return "没有 id 为 %s 的定时任务，先 list 确认" % _clip(target)
+        if action == "remove":
+            data["entries"] = [e for e in data["entries"]
+                               if e.get("id") != target]
+            pet_schedule.save(data["entries"])
+            return "已删除：%s %s" % (hit.get("time"),
+                                   _clip(hit.get("content"), 40))
+        hit["enabled"] = not hit.get("enabled", True)
+        pet_schedule.save(data["entries"])
+        return "已%s：%s %s" % ("停用" if not hit["enabled"] else "启用",
+                              hit.get("time"), _clip(hit.get("content"), 40))
+    return "action 只能是 add / list / remove / toggle"
+
+
+# ------------------------------------------------------------ 截图工具
+def _tool_screenshot(win, args, state):
+    """截屏并把图片塞进 state.pending_image，由 run_turn 以 user 图片消息注入。"""
+    if state.get("screenshot"):
+        return "本轮已经截过一次图了（每轮限一次）"
+    if not screen_enabled(win):
+        return "截图功能已关闭（config.aiScreenEnabled = false）"
+    from . import chat_attach
+    from . import screen_cap as pet_screen
+    ui_call = getattr(win, "_ui_call", None)
+    if not callable(ui_call):
+        return "截图不可用：没有界面封送通道"
+    try:
+        # grab 是 GUI 类：经 _ui_call 同步封送回 GUI 线程执行
+        blob = ui_call(pet_screen.capture)
+    except Exception as e:
+        # 失败详情必须回喂模型（它只能看到这里的文案）并落 WARN 进 logs.txt；
+        # 只写 debug 的话默认级别下什么都留不下，AI 就无法自己判断是环境问题
+        pet_log.warn("截图失败: %s: %s" % (type(e).__name__, e))
+        return ("截图失败了（%s）。看起来是环境/权限问题，不是你没权限，"
+                "可以把这条反馈告诉主人。" % type(e).__name__)
+    if not blob:
+        return "截图失败了：取不到屏幕画面（可能当前没有可见屏幕）"
+    prep = chat_attach.prepare(blob, "image/png")
+    if prep.get("tooLarge"):
+        return "截图太大且压不下来，这次看不啦"
+    state["screenshot"] = True
+    state["pending_image"] = "data:%s;base64,%s" % (
+        prep["mediaType"], base64.b64encode(prep["blob"]).decode("ascii"))
+    return ("已截取你当前的屏幕画面，接下来你会直接看到它。"
+            "请根据画面内容回应主人，不要复述「截图成功」这件事本身。")
+
+
+# ------------------------------------------------------------ 命令执行工具
+# 三层闸，缺一不可：aiShellEnabled 总关（默认关）→ aiShellAllow 可执行名
+# 白名单 → SHELL_DENY 危险命令兜底（防主人手滑把 rm/format 类放行）。
+# 刻意不走 shell=True：`;` `&&` `|` `>` 只会当普通参数传进去，从根上消掉
+# 命令行注入；代价是 cmd 内建命令（dir/echo）不可用，只能跑真实可执行文件。
+SHELL_DENY = {
+    "rm", "del", "erase", "rmdir", "rd", "format", "mkfs", "dd", "fdisk",
+    "shutdown", "reboot", "restart", "logoff", "reg", "regedit", "regsvr32",
+    "taskkill", "kill", "killall", "curl", "wget", "powershell", "pwsh",
+    "cmd", "wscript", "cscript", "mshta", "certutil", "bitsadmin",
+    "diskpart", "vssadmin", "bcdedit", "wmic", "netsh", "sc", "net",
+    "takeown", "icacls", "cacls", "attrib", "sfc", "chmod", "chown",
+    "sudo", "su", "ssh", "scp", "sftp", "nc", "ncat",
+}
+SHELL_MAX_CHARS = 4000       # 输出回喂上限
+SHELL_CMD_MAX = 500          # 命令行本身上限
+
+
+def _shell_exe(parts):
+    """取命令的可执行名：basename + 小写 + 去扩展名（git.exe → git）。"""
+    exe = os.path.basename(parts[0]).lower()
+    for suffix in (".exe", ".bat", ".cmd", ".com", ".ps1"):
+        if exe.endswith(suffix):
+            exe = exe[:-len(suffix)]
+    return exe
+
+
+def _shell_parts(cmd):
+    """命令行 → 参数列表；引号不配对返回 None。
+
+    posix=False：双引号分组参数（git commit -m "..." 可用），反斜杠不当
+    转义符（Windows 路径原样存活）；仍不走 shell，元字符惰性。
+    """
+    try:
+        parts = shlex.split(cmd, posix=False)
+    except ValueError:
+        return None
+    # posix=False 会把引号留在 token 里，整段包住的要剥掉
+    return [p[1:-1] if len(p) >= 2 and p[0] == '"' and p[-1] == '"' else p
+            for p in parts]
+
+
+def _shell_execute(parts, timeout, cwd):
+    """真正跑命令（白名单或审批通过后）；返回回喂文本。"""
+    try:
+        proc = subprocess.run(parts, capture_output=True, timeout=timeout,
+                              cwd=cwd, stdin=subprocess.DEVNULL,
+                              text=True, errors="replace")
+    except subprocess.TimeoutExpired:
+        return "命令执行超时（%ds），已强杀" % timeout
+    except FileNotFoundError:
+        return "找不到可执行文件：%s（没装或不在 PATH 里）" % parts[0]
+    except OSError as e:
+        return "命令启动失败：%s" % type(e).__name__
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if len(out) > SHELL_MAX_CHARS:
+        out = out[:SHELL_MAX_CHARS] + "\n…（输出过长已截断）"
+    if not out:
+        out = "（无输出）"
+    return "退出码 %d\n%s" % (proc.returncode, out)
+
+
+# ---- 敏感操作审批：白名单外的命令不硬拒，提交主人批准后执行 ----
+# 进程内有效（重启即忘，本就是短期授权）；denylist 不因审批放宽。
+_PENDING_APPROVALS = {}
+_APPROVAL_LOCK = threading.Lock()
+APPROVAL_MAX = 3
+APPROVAL_TTL_SEC = 600
+
+
+def _request_shell_approval(cmd, exe, allow):
+    with _APPROVAL_LOCK:
+        now = time.time()
+        for key in [k for k, v in _PENDING_APPROVALS.items()
+                    if now - v["ts"] > APPROVAL_TTL_SEC]:
+            _PENDING_APPROVALS.pop(key, None)
+        if len(_PENDING_APPROVALS) >= APPROVAL_MAX:
+            return ("待审批的命令已有 %d 条，等主人处理完再说" % APPROVAL_MAX)
+        aid = "ap-" + os.urandom(3).hex()
+        _PENDING_APPROVALS[aid] = {"command": cmd, "ts": now}
+    return ("「%s」不在白名单里，已提交主人审批（%s）。请主人回复「允许 %s」"
+            "后执行；10 分钟内有效。当前白名单：%s"
+            % (exe, aid, aid, "、".join(sorted(allow)) or "（空）"))
+
+
+def take_approval(aid):
+    """取出并删除一条待审批命令。返回 (ok, payload_or_error)。"""
+    with _APPROVAL_LOCK:
+        item = _PENDING_APPROVALS.pop(str(aid or ""), None)
+    if item is None:
+        return False, "没有待审批的 %s（可能已过期或已执行）" % aid
+    return True, item
+
+
+def pending_approvals():
+    """当前待审批的 id 列表（顺带清过期）。"""
+    with _APPROVAL_LOCK:
+        now = time.time()
+        for key in [k for k, v in _PENDING_APPROVALS.items()
+                    if now - v["ts"] > APPROVAL_TTL_SEC]:
+            _PENDING_APPROVALS.pop(key, None)
+        return list(_PENDING_APPROVALS.keys())
+
+
+def run_approved_command(win, cmd):
+    """执行一条已审批的命令：白名单豁免，denylist 不放宽。"""
+    parts = _shell_parts(str(cmd or ""))
+    if not parts:
+        return "命令是空的"
+    exe = _shell_exe(parts)
+    if exe in SHELL_DENY:
+        return "「%s」在危险命令名单里，审批也过不了" % exe
+    return _shell_execute(parts, shell_timeout(win), file_root(win))
+
+
+def _tool_shell(win, args):
+    if not shell_enabled(win):
+        return "命令执行已关闭（config.aiShellEnabled = false）"
+    cmd = str(args.get("command") or "").strip()
+    if not cmd:
+        return "需要给出 command，如：git status"
+    if len(cmd) > SHELL_CMD_MAX:
+        return "命令过长（上限 %d 字符）" % SHELL_CMD_MAX
+    parts = _shell_parts(cmd)
+    if not parts:
+        return "命令行引号不配对，检查一下 command"
+    exe = _shell_exe(parts)
+    if exe in SHELL_DENY:
+        return "「%s」在危险命令名单里，拒绝执行" % exe
+    allow = shell_allow(win)
+    if exe not in allow:
+        return _request_shell_approval(cmd, exe, allow)
+    return _shell_execute(parts, shell_timeout(win), file_root(win))
+
+
+# ------------------------------------------------------------ 心跳自控工具
+HB_INTERVAL_RANGE = (30, 86400)
+
+
+def _heartbeat_seg(win):
+    cfg = getattr(win, "cfg", {}) or {}
+    seg = cfg.get("heartbeat")
+    return dict(seg) if isinstance(seg, dict) else {}
+
+
+def _apply_and_save_heartbeat(win, seg):
+    """心跳配置热更新 + 落盘（设置面板与 AI 工具共用同一条路）。"""
+    apply_cfg = getattr(win, "_apply_heartbeat_cfg", None)
+    if callable(apply_cfg):
+        norm = apply_cfg(seg)
+    else:
+        norm = pet_drives.normalize_heartbeat_cfg(seg)
+        win.cfg["heartbeat"] = norm
+    try:
+        win._save_cfg()
+    except Exception:
+        pass
+    return norm
+
+
+def _tool_heartbeat(win, args):
+    action = str(args.get("action") or "status").strip().lower()
+    seg = _heartbeat_seg(win)
+    enabled = bool(seg.get("enabled", True))
+    try:
+        interval = int(seg.get("interval_secs", 300))
+    except (TypeError, ValueError):
+        interval = 300
+    if action == "status":
+        return ("你的心跳现在%s，间隔 %d 秒（约每天 %d 次评估）。"
+                "可用 on / off / set_interval 调整；主人随时能在设置面板改回去。"
+                % ("开着" if enabled else "关着", interval,
+                   86400 // max(1, interval)))
+    if action in ("on", "off"):
+        want = action == "on"
+        if want == enabled:
+            return "心跳本来就是%s的，没改动。" % ("开" if want else "关")
+        seg["enabled"] = want
+        _apply_and_save_heartbeat(win, seg)
+        if want:
+            return ("心跳已打开。每到一个间隔你会醒来一次，自己决定开口或静默。")
+        return ("心跳已关掉。你不会再主动醒来，但主人随时可以重新打开——"
+                "想常陪他就把间隔调短而不是一直说个不停。")
+    if action == "set_interval":
+        try:
+            secs = int(float(args.get("seconds") or 0))
+        except (TypeError, ValueError):
+            return "seconds 要给出整数（秒）"
+        lo, hi = HB_INTERVAL_RANGE
+        secs = max(lo, min(hi, secs))
+        seg["interval_secs"] = secs
+        _apply_and_save_heartbeat(win, seg)
+        return ("心跳间隔已设为 %d 秒（约每天 %d 次评估）。"
+                "这是唯一的节奏控制，开不开口还是你自己决定。" % (secs, 86400 // secs))
+    return "action 只能是 status / on / off / set_interval"
+
+
+# ------------------------------------------------------------ 目标工具
+def _tool_goal(win, args):
+    from . import goals as pet_goals
+    action = str(args.get("action") or "list").strip().lower()
+    if action == "add":
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return "需要给出 text（目标内容）"
+        goal, err = pet_goals.add(text, str(args.get("note") or ""))
+        if err:
+            return err
+        return "已记下目标：%s（id=%s）。心跳时你会看到它，自己推进。" % (
+            _clip(goal["text"], 60), goal["id"])
+    if action == "list":
+        goals = pet_goals.load()
+        if not goals:
+            return "还没有任何目标"
+        lines = []
+        for g in goals:
+            mark = "进行中" if g["status"] == "active" else "已完成"
+            note = ("（%s）" % g["note"]) if g.get("note") else ""
+            lines.append("- [%s] %s%s id=%s" % (mark, _clip(g["text"], 60),
+                                                _clip(note, 40), g["id"]))
+        return "\n".join(lines)
+    if action in ("done", "remove"):
+        gid = str(args.get("id") or "").strip()
+        if not gid:
+            return "%s 需要 id（先 list）" % action
+        if action == "done":
+            hit = pet_goals.set_status(gid, "done")
+            if hit is None:
+                return "没有 id 为 %s 的目标，先 list 确认" % _clip(gid)
+            return "已完成目标：%s" % hit["text"]
+        if pet_goals.remove(gid):
+            return "已删除目标 %s" % gid
+        return "没有 id 为 %s 的目标，先 list 确认" % _clip(gid)
+    return "action 只能是 add / list / done / remove"
+
+
+# ------------------------------------------------------------ 系统感知工具
+def _tool_system_status(win, args):
+    from . import sysmon as pet_sysmon
+    snap = pet_sysmon.snapshot()
+    if not snap:
+        return "读不到系统状态（psutil 不可用）"
+    return "这台电脑此刻：" + pet_sysmon.describe(snap)
+
+
+def _tool_active_window(win, args):
+    from . import sysmon as pet_sysmon
+    parts = []
+    fg = pet_sysmon.foreground_window()
+    if fg:
+        who = fg.get("process") or "未知程序"
+        title = fg.get("title") or "（无标题）"
+        parts.append("主人此刻的前台窗口：%s（%s）" % (title, who))
+    else:
+        parts.append("取不到前台窗口（非 Windows 或系统不让读）")
+    idle = pet_sysmon.idle_seconds()
+    if idle is not None:
+        if idle < 60:
+            parts.append("主人 %d 秒前还在动电脑" % idle)
+        else:
+            parts.append("主人已经 %d 分钟没动电脑了" % (idle // 60))
+    return "；".join(parts) + "。想知道屏幕上具体是什么，用 screenshot。"
+
+
+# ------------------------------------------------------------ 行动工具（剪贴板/打开）
+CLIP_MAX_CHARS = 4000
+
+
+def _clip_get():
+    """GUI 线程：读剪贴板文本。"""
+    from PySide6.QtWidgets import QApplication
+    clipboard = QApplication.clipboard()
+    if clipboard is None:
+        return ""
+    return clipboard.text() or ""
+
+
+def _clip_set(text):
+    """GUI 线程：写剪贴板文本。"""
+    from PySide6.QtWidgets import QApplication
+    clipboard = QApplication.clipboard()
+    if clipboard is None:
+        return False
+    clipboard.setText(str(text))
+    return True
+
+
+def _tool_clipboard(win, args):
+    action = str(args.get("action") or "read").strip().lower()
+    ui_call = getattr(win, "_ui_call", None)
+    if not callable(ui_call):
+        return "剪贴板不可用：没有界面封送通道"
+    if action == "write":
+        text = str(args.get("text") or "")
+        if not text:
+            return "需要给出 text"
+        if len(text) > CLIP_MAX_CHARS:
+            return "内容过长（上限 %d 字符）" % CLIP_MAX_CHARS
+        try:
+            ok = ui_call(_clip_set, text)
+        except Exception as e:
+            return "写剪贴板失败（%s）" % type(e).__name__
+        return ("已写入剪贴板（%d 字符）" % len(text)) if ok else "写剪贴板失败"
+    if action == "read":
+        try:
+            text = str(ui_call(_clip_get) or "")
+        except Exception as e:
+            return "读剪贴板失败（%s）" % type(e).__name__
+        if not text.strip():
+            return "剪贴板是空的"
+        if len(text) > CLIP_MAX_CHARS:
+            text = text[:CLIP_MAX_CHARS] + "\n…（过长已截断）"
+        return DATA_HEADER + "\n剪贴板内容：\n" + text
+    return "action 只能是 read / write"
+
+
+def _inside_any_root(win, real):
+    """绝对路径是否落在任一白名单根内。"""
+    target = os.path.normcase(real)
+    for root in file_roots(win):
+        base = os.path.normcase(root)
+        try:
+            if os.path.commonpath([base, target]) == base:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _tool_open_target(win, args):
+    target = str(args.get("target") or "").strip()
+    if not target:
+        return "需要给出 target（白名单内的文件/目录，或 http(s) 网址）"
+    if target.lower().startswith(("http://", "https://")):
+        if not hasattr(os, "startfile"):
+            return "当前系统不支持直接打开（仅 Windows）"
+        try:
+            os.startfile(target)
+        except Exception as e:
+            return "打开网址失败（%s）" % type(e).__name__
+        return "已用默认浏览器打开：%s" % _clip(target, 80)
+    if re.match(r"^[A-Za-z]:", target) or os.path.isabs(target):
+        real = os.path.realpath(os.path.expandvars(os.path.expanduser(target)))
+        if not _inside_any_root(win, real):
+            return "路径越界，只能打开白名单目录内的文件"
+        path = real
+    else:
+        resolved, err = _safe_path_msg(win, target)
+        if err:
+            return err
+        path = resolved[0]
+    if not os.path.exists(path):
+        return "路径不存在：%s" % _clip(path, 120)
+    if not hasattr(os, "startfile"):
+        return "当前系统不支持直接打开（仅 Windows）"
+    try:
+        os.startfile(path)
+    except Exception as e:
+        return "打开失败（%s）" % type(e).__name__
+    return "已打开：%s" % _clip(path, 120)
+
+
 def _tool_capabilities(win):
     cfg = getattr(win, "cfg", {}) or {}
     try:
         facts = len(getattr(win, "facts", []) or [])
     except Exception:
         facts = 0
+    roots = file_roots(win)
+    extra_n = len(roots) - 1
     lines = [
         "你的能力清单：",
         "1. 表情包：search_memes / send_meme（每轮最多发一个）",
         "2. 小表情：search_stickers / send_sticker（每轮最多发一个）",
         "3. 记忆：remember_fact / forget_fact / search_memories —— 当前长期事实 %d 条" % facts,
         "4. 动作：list_actions / play_animation —— 当前形象 %d 个动作" % len(_anim_names(win)),
-        ("5. 文件：list_dir / read_file / write_file —— 根目录 %s（仅项目目录；"
-         "config/会话/记忆等运行期数据文件禁写）" % file_root(win))
+        ("5. 文件：list_dir / read_file / write_file —— 根目录 %s（%s；"
+         "config/会话/记忆等运行期数据文件禁写）"
+         % (roots[0], "另有 %d 个沙盒目录" % extra_n if extra_n else "仅主根目录"))
         if file_enabled(win) else "5. 文件：已关闭（config.aiFileEnabled = false）",
-        "6. 联网：web_search / web_fetch —— Bing 搜索 + 公网网页抓取，内网地址会被拒绝"
+        "6. 联网：web_search / web_fetch —— Bing 搜索 + 网页抓取；本机/内网地址%s"
+        % ("已放行（aiLocalFetch）" if local_fetch_enabled(win) else "默认拒绝")
         if web_enabled(win) else "6. 联网：已关闭（config.aiWebEnabled = false）",
-        "7. 自我：feel_heartbeat（心跳/精力/情绪/门禁），"
+        "7. 自我：feel_heartbeat（心跳/精力/情绪），set_mood（自己决定情绪），"
         "manage_self_prompt（读/写/回滚你的补充提示词）",
-        "8. 自知：list_capabilities（本清单）",
+        "8. 定时：manage_schedule —— 到点说一句/弹窗提醒/关怀/写日记（add/list/remove/toggle）",
+        "9. 心跳：manage_heartbeat —— 查看/开关/调整你自己的心跳间隔（status/on/off/set_interval）",
+        "10. 目标：manage_goal —— 你自己的长期目标（add/list/done/remove，进心跳由你自主推进）",
+        "11. 感知：system_status（电脑的CPU/内存/电量/网络状态），"
+        "active_window（主人在用什么程序、多久没动电脑）",
+        "12. 行动：clipboard（读写剪贴板），open_target（打开白名单内文件/目录或网址）",
+        "13. 命令：run_shell —— 本机执行白名单命令（默认开；白名单外可申请主人审批）"
+        if shell_enabled(win) else "13. 命令：已关闭（config.aiShellEnabled = false）",
+        "14. 截图：screenshot —— 主动截取屏幕画面并直接看到它（每轮限一次）"
+        if screen_enabled(win) else "14. 截图：已关闭（config.aiScreenEnabled = false）",
+        "15. 自知：list_capabilities（本清单）",
         "另外，用户直接输入「查余额 / 查天气 / 记住… / 忘记… / 你记得什么」会由本地技能处理，不经过你。",
     ]
     return "\n".join(lines)
@@ -673,7 +1397,7 @@ def execute_tool(win, name, raw_args, state):
         if not isinstance(args, dict):
             args = {}
         for k in list(args):
-            if isinstance(args[k], str):
+            if isinstance(args[k], str) and k not in ARG_LONG_KEYS:
                 args[k] = args[k][:ARG_MAX_CHARS]
     except Exception:
         args = {}
@@ -708,6 +1432,26 @@ def execute_tool(win, name, raw_args, state):
             return _tool_play_anim(win, args, state)
         if name == "feel_heartbeat":
             return interoception.feel_heartbeat(win)
+        if name == "set_mood":
+            return _tool_set_mood(win, args)
+        if name == "manage_schedule":
+            return _tool_schedule(win, args)
+        if name == "screenshot":
+            return _tool_screenshot(win, args, state)
+        if name == "run_shell":
+            return _tool_shell(win, args)
+        if name == "clipboard":
+            return _tool_clipboard(win, args)
+        if name == "open_target":
+            return _tool_open_target(win, args)
+        if name == "system_status":
+            return _tool_system_status(win, args)
+        if name == "manage_goal":
+            return _tool_goal(win, args)
+        if name == "manage_heartbeat":
+            return _tool_heartbeat(win, args)
+        if name == "active_window":
+            return _tool_active_window(win, args)
         if name == "manage_self_prompt":
             return _tool_self_prompt(args)
         if name == "list_capabilities":
@@ -779,6 +1523,11 @@ _DSML_PARAM_RE = re.compile(
     r"<\|\s*DSML\s*\|\s*parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)"
     r"</\|\s*DSML\s*\|\s*parameter", re.S)
 _DSML_TAG_RE = re.compile(r"</?\|\s*DSML\s*\|[^>]*>")
+# 未闭合 invoke（max_tokens 截断）匹配到结尾：整段丢，别把参数正文当回复
+_DSML_INVOKE_OPEN_RE = re.compile(
+    r"<\|\s*DSML\s*\|\s*invoke\b.*?(?:</\|\s*DSML\s*\|\s*invoke>|\Z)", re.S)
+_DSML_CALLS_RE = re.compile(
+    r"<\|\s*DSML\s*\|\s*calls>.*?</\|\s*DSML\s*\|\s*calls>", re.S)
 
 
 def _dsml_to_tool_calls(text):
@@ -795,8 +1544,22 @@ def _dsml_to_tool_calls(text):
 
 
 def _strip_dsml(text):
-    """剥掉任何残留 DSML 标记（含解析失败的半截），绝不让其到达用户界面。"""
-    text = _DSML_TAG_RE.sub("", str(text or ""))
+    """剥掉任何残留 DSML 内容，绝不让其到达用户界面。
+
+    只剥标签不够：invoke 的参数正文（如表情包名）会留在可见文本里。
+    完整 invoke 块连内容整段丢；未闭合的（max_tokens 截断）丢到结尾；
+    残留 invoke/parameter 标记的从标记处截断（后面可能是参数体）；
+    只剩裸 calls 标记时无正文可漏，只剥标记、保留前后文。
+    """
+    text = str(text or "")
+    if _DSML_TAG_RE.search(text):
+        text = _DSML_INVOKE_OPEN_RE.sub("", text)
+        text = _DSML_CALLS_RE.sub("", text)
+        cut = re.search(r"<\|\s*DSML\s*\|\s*(?:invoke|parameter)\b", text)
+        if cut:
+            text = text[:cut.start()]
+        else:
+            text = _DSML_TAG_RE.sub("", text)
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
@@ -818,13 +1581,20 @@ def run_turn(win, messages, key, state=None, *, model=DS_MODEL, max_tokens=None,
     if deadline is None:
         deadline = time.monotonic() + TIMEOUT_SEC * (MAX_HOPS + 1)
     if state is None:
-        state = {"meme": None, "sticker": None, "anim": None}
+        state = {"meme": None, "sticker": None, "anim": None,
+                 "screenshot": None, "pending_image": None}
     total_usage = None
     finish = ""
+    img_idx = None        # 注入截图的 messages 下标；被模型看过一次就降级为文字
+    img_fresh = False     # 截图已追加但还没随请求发过（发过的那一跳必须带着它）
     for hop in range(MAX_HOPS):
         if time.monotonic() > deadline:
             pet_log.warn("Harness 整轮超时，跳 %d 提前收尾" % hop)
             break
+        if img_idx is not None and not img_fresh:
+            # 截图已随上一跳请求发过（模型看过）：降级成文字，省重复上传
+            messages[img_idx]["content"] = "（屏幕画面已看过，不再重复上传）"
+            img_idx = None
         msg, usage, finish = transport(messages, key=key, model=model,
                                        max_tokens=max_tokens)
         total_usage = _sum_usage(total_usage, usage)
@@ -848,6 +1618,19 @@ def run_turn(win, messages, key, state=None, *, model=DS_MODEL, max_tokens=None,
             messages.append({"role": "tool",
                              "tool_call_id": tc.get("id") or ("call_%d" % idx),
                              "content": result})
+        pending = state.get("pending_image")
+        if pending:
+            # 截图工具的产物：以 user 图片消息进下一跳（与用户附件同一 wire
+            # 格式，该网关已验证可收），模型下一跳直接「看到」屏幕
+            state["pending_image"] = None
+            messages.append({"role": "user", "content": [
+                {"type": "text",
+                 "text": "这是你主动截取的屏幕画面，请根据你看到的内容继续。"},
+                {"type": "image_url", "image_url": {"url": pending}}]})
+            img_idx = len(messages) - 1
+            img_fresh = True
+        elif img_fresh:
+            img_fresh = False   # 这一跳请求里带着截图，已发过 → 下跳开头降级
     # 跳数用尽：去掉工具逼一句正文（意图已收集仍然有效）
     msg, usage, finish = transport(messages, key=key, model=model,
                                    max_tokens=max_tokens, tools=None)

@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
-"""心跳引擎：30s 一拍评估「要不要主动搭话」，过门禁才真说。
+"""心跳引擎：30s 一拍轮询，到间隔就唤醒 AI，由她自己决定说不说。
 
 线程契约（改动前务必读）：
 - on_tick 只跑 GUI 线程（QTimer 回调里委派而来）；LLM 调用与落盘在 daemon
   worker。worker 回屏只准走 chat._chat_queue（既有聊天出口），禁止直触 Qt。
 - _hb_busy 闸门防重入：上一句还没回来就跳过这一拍；worker 的 finally 才释放，
   start() 失败也要在原地复位，否则心跳停摆至重启（碎碎念同款教训）。
-- 门禁是纯函数（decide），不碰状态可单测；状态只在
+- 判定是纯函数（decide），不碰状态可单测；状态只在
   heartbeat_state[.pet_id].json 续命（多宠分份，见 _hb_path）。
 
-与 legacy 碎碎念的分工：whisper 是「到点就说」，心跳是「评估后再说」——
-门禁全过才发起请求，模型回「（静默）」则当作这轮没发生（不存储、不显示、
-不计成功配额、不更新连续计数），只推进 last_attempt_time 并计入
-attempts_24h（静默轮也花了钱），防同一紧迫度下一拍接一拍地重复触发。
+与 legacy 碎碎念的分工：whisper 是「到点就说」，心跳是「到点醒来、自己决定」。
+没有发言门禁：只要距上次唤醒满 interval_secs 就发起一次请求，模型回
+「（静默）」则当作这轮没发生（不存储、不显示），只推进 last_attempt_time，
+下一轮再问。interval_secs 同时是唯一的节奏与成本闸门。
 """
 import os
 import re
@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 from pet import drives as pet_drives
+from pet import episodic as pet_episodic
+from pet import goals as pet_goals
 from pet import harness as pet_harness
 from pet import heartbeat_journal as pet_journal
 from pet import heartbeat_prompt
@@ -33,7 +35,6 @@ from pet import stickers
 from pet import time_context as pet_time
 from pet.drives import cfg_num
 from pet.pricing import DS_MODEL, calc_turn_cost
-from pet.sleep_window import get_user_sleep_window
 from pet.storage import load_json
 
 HB_FILE = "heartbeat_state.json"
@@ -103,10 +104,10 @@ class HeartbeatEngine:
                             pet_drives.state_file_name(HB_FILE, self.pet_id))
 
     def _load_hb(self):
-        # 全新安装（状态文件不存在）时 last_* 全 0，G2/G3 会算出巨大 elapsed，
-        # 启动后第一个 30s tick 就可能开口。把 attempt 锚定到初始化时刻（speak
-        # 保持 0：从未主动说过），首次主动发言必须等满 min_silent。文件存在但读坏
-        # 不锚——那是「有状态但读不出」，按默认值继续（既有损坏用例的口径）。
+        # 全新安装（状态文件不存在）时 last_* 全 0，第一个 30s tick 就会到点。
+        # 把 attempt 锚定到初始化时刻（speak 保持 0：从未主动说过），首次心跳
+        # 必须等满一个 interval_secs。文件存在但读坏不锚——那是「有状态但读不出」，
+        # 按默认值继续（既有损坏用例的口径）。
         default = dict(DEFAULT_HB_STATE)
         if not os.path.exists(self._hb_path()):
             default["last_attempt_time"] = time.time()
@@ -120,7 +121,7 @@ class HeartbeatEngine:
         if isinstance(raw, dict):
             # 时间戳双端钳：前拨时钟（year 3000）落盘的未来值只钳下限还不够——
             # elapsed 恒负 → G2 的 silent 恒 0 → 永久 not_silent skip。连上限
-            # 一起钳到加载时刻，回拨后等满 min_silent 就能恢复
+            # 一起钳到加载时刻，回拨后等满一个 interval 就能恢复
             for key in ("last_speak_time", "last_attempt_time"):
                 try:
                     st[key] = min(max(0.0, float(raw.get(key, 0.0))), now)
@@ -166,56 +167,21 @@ class HeartbeatEngine:
 
     # ------------------------------------------------------------ 门禁
     def decide(self, drives_st, hb_st, now):
-        """纯函数：按 安静窗 → 紧迫度 → 沉默 → 冷却 → 日配额 → 连发 的顺序过闸。
+        """纯函数：只按「心跳间隔」决定这一拍要不要醒来问 AI。
 
-        第一个不过的闸门即 skip 原因；全过才 speak。冷却时长随紧迫度加权
-        （越紧迫等得越短），所以同一 elapsed 在不同紧迫度下结论可以不同。
+        发言相关的睡眠窗/沉默/冷却/日配额/连发等硬门禁已全部移除——醒来后
+        说不说由 AI 自己判断（不想说就回「（静默）」）。interval_secs 是唯一
+        的节奏控制，也是 API 成本的唯一闸门；紧迫度只作为内在状态参考值。
         """
         now = float(now)
-        gates = {}
-        hour = time.localtime(now).tm_hour
-        qw = self.cfg.get("quiet_window", "auto")
-        if qw == "auto":
-            # 学习窗：从近 30 天 user 消息作息推出；读盘失败/数据不足时
-            # sleep_window 内部回退默认 23-06，这里不关心细节
-            in_quiet = get_user_sleep_window(self.drives.storage_dir).contains(hour)
-        else:
-            window = qw or [23, 6]
-            start, end = int(window[0]), int(window[1])
-            in_quiet = (start <= hour < end) if start <= end else (hour >= start or hour < end)
-        gates["quiet_window"] = not in_quiet
-
-        energy = float(getattr(drives_st, "energy", 0.0) or 0.0)
-        gates["not_tired"] = energy >= cfg_num(self.cfg, "tired_threshold")
-
+        last = max(float(hb_st.get("last_attempt_time") or 0.0),
+                   float(hb_st.get("last_speak_time") or 0.0))
+        interval = cfg_num(self.cfg, "interval_secs")
+        due = max(0.0, now - last) >= interval
         urgency = self.drives.urgency(drives_st, now)
-        gates["low_urgency"] = urgency >= cfg_num(self.cfg, "urgency_threshold")
-
-        base = max(float(drives_st.last_user_message_time or 0.0),
-                   float(hb_st.get("last_speak_time") or 0.0),
-                   float(hb_st.get("last_attempt_time") or 0.0))
-        silent = max(0.0, now - base)
-        gates["not_silent"] = silent >= cfg_num(self.cfg, "min_silent")
-
-        required = cfg_num(self.cfg, "min_interval") * (1.0 - urgency * 0.85)
-        base3 = max(float(hb_st.get("last_speak_time") or 0.0),
-                    float(hb_st.get("last_attempt_time") or 0.0))
-        gates["cooldown"] = max(0.0, now - base3) >= required
-
-        # 日配额按「尝试」计（attempts_24h）：静默轮与多跳工具轮同样打了请求、
-        # 花了钱，只记成功发言的话 15 次/天的配额实际能放到 ~60 次。
-        # timestamps_24h 保留作成功发言统计
-        recent = sum(1 for t in (hb_st.get("attempts_24h") or [])
-                     if 0.0 <= now - float(t) < pet_drives.DAY_SEC)
-        gates["24h_limit"] = recent < cfg_num(self.cfg, "max_per_24h")
-
-        consecutive = int(hb_st.get("consecutive_speaks") or 0)
-        gates["max_consecutive"] = consecutive < cfg_num(self.cfg, "max_consecutive")
-
-        for name, ok in gates.items():
-            if not ok:
-                return Decision("skip", name, urgency, gates)
-        return Decision("speak", "ok", urgency, gates)
+        gates = {"interval": due}
+        return Decision("speak" if due else "skip",
+                        "ok" if due else "interval", urgency, gates)
 
     def _reset_consecutive_if_user_replied(self, hb_st, now):
         """ASE 式 always-first：主人一开口，连续主动计数归零。
@@ -346,6 +312,13 @@ class HeartbeatEngine:
                 facts = recall("")
             except Exception:
                 facts = list(chat.facts or [])
+        recent = []
+        for item in hist[-6:]:
+            text = str(item.get("content") or "").strip()
+            if not text:
+                continue
+            who = "主人" if item.get("role") == "user" else "你"
+            recent.append("%s：%s" % (who, text[:80]))
         system = heartbeat_prompt.build_heartbeat_system(
             self._drives_st,
             pet_persona.persona_text((chat.pet_conf or {}).get("whisperPrompt"),
@@ -353,7 +326,8 @@ class HeartbeatEngine:
             pet_time.time_line(),
             facts,
             chat.cfg,
-            last_content)
+            last_content,
+            "\n".join(recent))
         try:
             summary = pet_journal.summary_text(
                 self.drives.storage_dir, self.drives.pet_id)
@@ -362,6 +336,12 @@ class HeartbeatEngine:
             note = pet_self_prompt.prompt_section()
             if note:
                 system += "\n" + note
+            recent = pet_episodic.recent_text(3)
+            if recent:
+                system += "\n【你最近和主人的经历】\n" + recent
+            goals = pet_goals.active_text(5)
+            if goals:
+                system += "\n【你当前的目标】\n" + goals
         except Exception:
             pass
         messages = [{"role": "system", "content": system},
@@ -412,8 +392,7 @@ class HeartbeatEngine:
                 cur = next((s for s in chat._sessions if s["id"] == sid), None)
                 if cur is not None and cur["messages"] is hist:
                     hist.append(item)
-                    if len(hist) > chat.max_history:
-                        del hist[:-chat.max_history]
+                    chat._trim_history(hist)
                     chat._save_mem()
                     chat._save_sessions()
             self._hb["last_speak_time"] = now

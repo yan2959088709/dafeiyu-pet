@@ -168,6 +168,18 @@ DEFAULT_CFG = {
     "animationWeights": {"idle": 10, "turn": 5, "move": 5},
     "heartbeat": DEFAULT_HEARTBEAT,
     "runtime": runtime_manager.DEFAULT_RUNTIME,
+    # ---- AI 能力开关（缺省值必须与 harness 的 * _enabled 默认值一致；
+    # 登记进 DEFAULT_CFG 才能被 save_config 落盘——否则设置页改了重启还原）
+    "aiFileEnabled": True,
+    "aiWebEnabled": True,
+    "aiScreenEnabled": True,
+    "aiShellEnabled": True,
+    # 起始白名单与 harness.DEFAULT_SHELL_ALLOW 一致（smoke 有断言钉住）；
+    # 刻意不含 python/pip——解释器可绕过全部沙盒
+    "aiShellAllow": ["git", "ipconfig", "systeminfo", "tasklist", "where", "ping"],
+    "aiShellTimeout": 15,
+    "aiLocalFetch": True,
+    "sandbox_dirs": [],
 }
 
 # 整段替换的对象键：缺子键 = 整段非法，告警后回退默认（与上游合并器一致）
@@ -311,23 +323,6 @@ def validate_pet_id(pid):
     return pid
 
 
-def quiet_window_ok(window):
-    """安静窗合法形态："auto"（从作息学习）或 [起始小时, 结束小时]。
-
-    二元整数、0-23、start != end（相等 = 空窗，等于关掉这门禁）。
-    """
-    if window == "auto":
-        return True
-    if not isinstance(window, list) or len(window) != 2:
-        return False
-    for hour in window:
-        if isinstance(hour, bool) or not isinstance(hour, int):
-            return False
-        if not (0 <= hour <= 23):
-            return False
-    return window[0] != window[1]
-
-
 def validate(cfg):
     """逐项校验并就地纠正可回落的字段；返回告警列表。"""
     warns = []
@@ -366,12 +361,6 @@ def validate(cfg):
         if enabled is not None and not isinstance(enabled, bool):
             warn_once("heartbeat", "enabled 必须是布尔值，已按关闭处理")
             cfg["heartbeat"]["enabled"] = False
-        # 安静窗：非法值归一为 "auto"（学习模式数据不足时回退 23-06，
-        # fail-closed 方向——不会把门禁整个关掉）
-        if not quiet_window_ok(cfg["heartbeat"].get("quiet_window")):
-            bad("heartbeat.quiet_window",
-                "安静窗必须是 auto 或 [起始小时, 结束小时]（0-23 且不相等），已改为 auto")
-            cfg["heartbeat"]["quiet_window"] = "auto"
 
     # 执行内核段：整段非法回退默认；单键非法按 fail-closed 方向纠正。
     # 默认关闭，用户显式打开才可能产生外部进程与 token 成本。
@@ -417,14 +406,47 @@ def validate(cfg):
             or not (128 <= tokens <= 4096):
         bad("aiMaxTokens", "单次输出上限必须是 128-4096 的整数", 1024)
 
-    # AI 工具开关（文件/联网）：缺失=默认开启（不写盘不告警），写了非布尔才纠正。
+    # AI 工具开关（文件/联网/截图）：缺失=默认开启（不写盘不告警），写了非布尔才纠正。
     # 写权限由 harness 的路径沙箱兜底（根目录/运行期数据文件），这里只校验类型。
-    for key, label in (("aiFileEnabled", "文件工具"), ("aiWebEnabled", "联网工具")):
+    for key, label in (("aiFileEnabled", "文件工具"), ("aiWebEnabled", "联网工具"),
+                       ("aiScreenEnabled", "截图工具")):
         val = cfg.get(key)
         if val is not None and not isinstance(val, bool):
             bad(key, "%s开关必须是布尔值，已按开启处理" % label, True)
+    # 本机抓取单独纠正：非法值按开启回落（默认开，见 harness.local_fetch_enabled）
+    local_fetch = cfg.get("aiLocalFetch")
+    if local_fetch is not None and not isinstance(local_fetch, bool):
+        bad("aiLocalFetch", "本机抓取开关必须是布尔值，已按开启处理", True)
     if cfg.get("aiFileRoot") is not None and not isinstance(cfg.get("aiFileRoot"), str):
         bad("aiFileRoot", "文件工具根目录必须是字符串，已按项目目录处理", "")
+
+    # 文件沙盒追加目录：字符串或字符串数组；单个字符串 tolerated 成数组
+    dirs = cfg.get("sandbox_dirs")
+    if dirs is not None:
+        if isinstance(dirs, str) and dirs.strip():
+            cfg["sandbox_dirs"] = [dirs.strip()]
+        elif isinstance(dirs, list):
+            cfg["sandbox_dirs"] = [str(d).strip() for d in dirs
+                                   if isinstance(d, str) and d.strip()]
+        else:
+            bad("sandbox_dirs", "沙盒目录必须是字符串或字符串数组，已按空处理", [])
+
+    # 命令执行（run_shell）：默认开，但白名单才是真闸门；白名单=可执行名数组；
+    # 超时 5-60s。没配 aiShellAllow 时 harness 给起始白名单（系统信息类命令）
+    shell_on = cfg.get("aiShellEnabled")
+    if shell_on is not None and not isinstance(shell_on, bool):
+        bad("aiShellEnabled", "命令执行开关必须是布尔值，已按开启处理", True)
+    allow = cfg.get("aiShellAllow")
+    if allow is not None:
+        if isinstance(allow, list):
+            cfg["aiShellAllow"] = [str(a).strip() for a in allow
+                                   if isinstance(a, str) and a.strip()]
+        else:
+            bad("aiShellAllow", "命令白名单必须是字符串数组，已按空处理", [])
+    shell_to = cfg.get("aiShellTimeout")
+    if isinstance(shell_to, bool) or not isinstance(shell_to, int) \
+            or not (5 <= shell_to <= 60):
+        bad("aiShellTimeout", "命令超时必须是 5-60 的整数", 15)
 
     pets = cfg.get("pets")
     if not isinstance(pets, list) or not pets:

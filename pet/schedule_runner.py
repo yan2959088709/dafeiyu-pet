@@ -3,16 +3,25 @@
 
 与心跳的分工：心跳是「她想不想说」，调度是「用户要她做」。调度不参与
 安睡窗与冷却，但 care 仍受精力门禁约束（太累时记录跳过，不硬撑）。
-线程：tick 在 GUI 线程；care 生成走 daemon worker，回屏经 _chat_queue。
+线程：tick 在 GUI 线程；care/diary 生成走 daemon worker，回屏经
+_chat_queue / say 气泡；diary 写完才 mark_fired。
 """
 import datetime
+import os
+import re
 import threading
 import time
 
+from pet import diary as pet_diary
 from pet import drives as pet_drives
+from pet import harness as pet_harness
+from pet import heartbeat as pet_heartbeat
 from pet import life_log
 from pet import log as pet_log
+from pet import persona as pet_persona
 from pet import schedule_store
+from pet import time_context as pet_time
+from pet.pricing import DS_MODEL, calc_turn_cost
 
 # care 太累时的兜底句：不调模型、零 token
 TIRED_LINES = ("我有点累了，先记下这件事，等会儿再好好关心你。",
@@ -28,6 +37,7 @@ class ScheduleRunner:
         self._last = 0.0
         self._last_hint = 0.0
         self._busy = False
+        self._diary_busy = False
         self._lock = threading.Lock()
 
     def on_tick(self, now=None):
@@ -70,6 +80,11 @@ class ScheduleRunner:
     # ------------------------------------------------------------ 触发
     def _fire(self, entry, now):
         kind = entry.get("kind")
+        if kind == "diary":
+            # 日记的 mark/log 全在 worker 里收尾：这里提前 return，
+            # 否则尾部 mark_fired 会在日记写完前就划掉今天的触发（失败不重试）
+            self._start_diary(entry, now)
+            return
         content = str(entry.get("content") or "").strip()
         result = "ok"
         try:
@@ -89,6 +104,75 @@ class ScheduleRunner:
             pet_log.warn("调度条目 %s 执行失败: %s" % (entry.get("id"), e))
         schedule_store.mark_fired(entry.get("id"), result, now)
         self._log(entry, result, now)
+
+    # ------------------------------------------------------------ 日记
+    def _start_diary(self, entry, now):
+        """日记生成 worker（daemon 线程）：写完才 mark_fired，失败留痕不重试抢跑。"""
+        if self._diary_busy:
+            return
+        self._diary_busy = True
+
+        def worker():
+            try:
+                self._diary_worker(entry, now)
+            except Exception as e:
+                pet_log.warn("日记生成失败: %s" % e)
+                schedule_store.mark_fired(entry.get("id"),
+                                          "失败:%s" % type(e).__name__, now)
+            finally:
+                self._diary_busy = False
+
+        try:
+            threading.Thread(target=worker, name="schedule-diary",
+                             daemon=True).start()
+        except Exception:
+            self._diary_busy = False
+
+    def _diary_worker(self, entry, now):
+        win = self.win
+        key = (getattr(win, "cfg", {}) or {}).get("ds_api_key", "")
+        if not key:
+            schedule_store.mark_fired(entry.get("id"), "失败:无Key", now)
+            return
+        hint = str(entry.get("content") or "").strip()
+        system = pet_persona.persona_text(
+            (getattr(win, "pet_conf", {}) or {}).get("whisperPrompt"),
+            (getattr(win, "cfg", {}) or {}).get("whisperPrompt"), "")
+        if system:
+            system += "\n"
+        system += (pet_time.time_line() or "") + "\n" + pet_diary.SYSTEM_EXTRA
+        if hint:
+            system += "\n【主人对这篇日记的叮嘱】" + hint[:200]
+        today = pet_diary.today_conversation(getattr(win, "chat_history", None))
+        if today:
+            system += "\n【今天的对话】\n" + today
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": pet_diary.INSTRUCTION}]
+        state = {"meme": None, "sticker": None, "anim": None}
+        reply, usage, _state = pet_harness.run_turn(win, messages, key,
+                                                    state=state)
+        if usage:
+            try:
+                win._last_turn_cost = calc_turn_cost(DS_MODEL, usage) or 0.0
+                win._last_turn_tokens = (int(usage.get("prompt_tokens") or 0)
+                                         + int(usage.get("completion_tokens") or 0))
+                win._token_stats_dirty = True
+                win._record_tokens(win._last_turn_tokens)
+            except Exception:
+                pass
+        reply = re.sub(r"<sticker:[^>]+>", "", str(reply or "")).strip()
+        if not reply or pet_heartbeat.is_silence_reply(reply):
+            schedule_store.mark_fired(entry.get("id"), "空白", now)
+            self._log(entry, "空白", now)
+            return
+        path = pet_diary.append_entry(reply, now)
+        if not path:
+            schedule_store.mark_fired(entry.get("id"), "空白", now)
+            self._log(entry, "空白", now)
+            return
+        self._say("今天的日记写好了（%s）" % os.path.basename(path))
+        schedule_store.mark_fired(entry.get("id"), "ok", now)
+        self._log(entry, "ok（%s）" % os.path.basename(path), now)
 
     def _say(self, text, notify=False):
         fn = getattr(self.win, "say", None)
@@ -183,8 +267,7 @@ class ScheduleRunner:
                     return
                 hist.append({"role": "assistant", "content": hint,
                              "ts": int(now), "schedule_hint": True})
-                if len(hist) > self.win.max_history:
-                    del hist[:-self.win.max_history]
+                self.win._trim_history(hist)
                 self.win._save_mem()
                 self.win._save_sessions()
         except Exception:

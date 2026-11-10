@@ -13,10 +13,10 @@ import os
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
-                               QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QMessageBox, QPlainTextEdit,
-                               QPushButton, QSpinBox, QTabWidget, QVBoxLayout,
-                               QWidget)
+                               QDoubleSpinBox, QFormLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QMessageBox, QPlainTextEdit, QPushButton,
+                               QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from pet import ai_provider as pet_ai
 from pet import apiserver as pet_api
@@ -104,6 +104,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._tab_global(), "全局")
         self.tabs.addTab(self._tab_voice(), "语音")
         self.tabs.addTab(self._tab_model(), "模型")
+        self.tabs.addTab(self._tab_autonomy(), "自主与AI")
         self.tabs.addTab(self._tab_runtime(), "执行内核")
         self.tabs.addTab(self._tab_look(), "外观物理")
         self.tabs.addTab(self._tab_pets(), "宠物")
@@ -140,6 +141,68 @@ class SettingsDialog(QDialog):
         form.addRow("对话记忆轮数", self.spin_rounds)
         form.addRow("配图候选上限", self.spin_img_limit)
         form.addRow("记忆召回条数", self.spin_recall_k)
+        return page
+
+    # ---------------------------------------------------------- 自主与AI
+    def _tab_autonomy(self):
+        """心跳开关/间隔 + AI 工具开关 + 命令白名单。
+
+        这些键以前只能手改 config.json——而它们是「电子生命能不能自己动」
+        的总闸，理应和通知/音效一样摆在设置页面上。
+        """
+        page = QWidget()
+        root = QVBoxLayout(page)
+
+        hb = QGroupBox("心跳（自主开口）")
+        hb_form = QFormLayout(hb)
+        seg = self.cfg.get("heartbeat") or {}
+        self.cb_hb = _check("启用心跳：她自己决定什么时候开口",
+                            seg.get("enabled", True))
+        self.spin_hb_interval = _spin(30, 86400, seg.get("interval_secs", 300), 30)
+        hb_form.addRow(self.cb_hb)
+        hb_form.addRow("心跳间隔（秒）", self.spin_hb_interval)
+        hb_form.addRow(QLabel(
+            "唯一的节奏控制：每到一个间隔她醒来一次，由她自己决定开口或静默，"
+            "没有其它发言门禁。300 秒约等于每天 288 次评估。保存后立即生效。"))
+        root.addWidget(hb)
+
+        tools = QGroupBox("AI 工具开关")
+        tool_form = QFormLayout(tools)
+        self.cb_ai_file = _check("文件工具（读写白名单目录）",
+                                 self.cfg.get("aiFileEnabled", True))
+        self.cb_ai_web = _check("联网工具（搜索/抓取网页）",
+                                self.cfg.get("aiWebEnabled", True))
+        self.cb_ai_screen = _check("截图工具（看见你的屏幕）",
+                                   self.cfg.get("aiScreenEnabled", True))
+        self.cb_ai_shell = _check("命令执行（白名单内命令）",
+                                  self.cfg.get("aiShellEnabled", True))
+        self.cb_ai_local = _check("本机抓取（允许 localhost/内网）",
+                                  self.cfg.get("aiLocalFetch", True))
+        for cb in (self.cb_ai_file, self.cb_ai_web, self.cb_ai_screen,
+                   self.cb_ai_shell, self.cb_ai_local):
+            tool_form.addRow(cb)
+        root.addWidget(tools)
+
+        shell = QGroupBox("命令执行白名单")
+        shell_form = QFormLayout(shell)
+        allow = self.cfg.get("aiShellAllow")
+        if not isinstance(allow, list) or not allow:
+            # 没配过就展示起始白名单（让用户看见当前实际生效的）
+            try:
+                from pet import harness as _harness
+                allow = sorted(_harness.DEFAULT_SHELL_ALLOW)
+            except Exception:
+                allow = []
+        self.edit_shell_allow = QLineEdit("、".join(str(a) for a in allow))
+        self.spin_shell_timeout = _spin(5, 60, self.cfg.get("aiShellTimeout", 15))
+        shell_form.addRow("可执行名（顿号分隔，留空=起始白名单）",
+                          self.edit_shell_allow)
+        shell_form.addRow("超时（秒）", self.spin_shell_timeout)
+        shell_form.addRow(QLabel(
+            "白名单外的命令她会提交给你审批（回复「允许 ap-xxxx」执行）。"
+            "python 能读写任意文件、绕过沙盒，加它之前想清楚。"))
+        root.addWidget(shell)
+        root.addStretch(1)
         return page
 
     # ---------------------------------------------------------- 语音
@@ -463,6 +526,28 @@ class SettingsDialog(QDialog):
         cfg["chatMemoryRounds"] = int(self.spin_rounds.value())
         cfg["chatImageLimit"] = int(self.spin_img_limit.value())
         cfg["memoryRecallK"] = int(self.spin_recall_k.value())
+        # 自主与AI：心跳段只改 enabled/interval，其余代谢键原样保留
+        seg = dict(cfg.get("heartbeat") or {})
+        seg["enabled"] = self.cb_hb.isChecked()
+        seg["interval_secs"] = int(self.spin_hb_interval.value())
+        cfg["heartbeat"] = seg
+        cfg["aiFileEnabled"] = self.cb_ai_file.isChecked()
+        cfg["aiWebEnabled"] = self.cb_ai_web.isChecked()
+        cfg["aiScreenEnabled"] = self.cb_ai_screen.isChecked()
+        cfg["aiShellEnabled"] = self.cb_ai_shell.isChecked()
+        cfg["aiLocalFetch"] = self.cb_ai_local.isChecked()
+        allow_text = self.edit_shell_allow.text().replace(
+            "，", "、").replace(",", "、").replace(" ", "、")
+        allow_list = [a.strip() for a in allow_text.split("、") if a.strip()]
+        if not allow_list:
+            # 留空=起始白名单（与 harness.shell_allow 的口径一致）
+            try:
+                from pet import harness as _harness
+                allow_list = sorted(_harness.DEFAULT_SHELL_ALLOW)
+            except Exception:
+                allow_list = []
+        cfg["aiShellAllow"] = allow_list
+        cfg["aiShellTimeout"] = int(self.spin_shell_timeout.value())
         cfg["voiceEnabled"] = self.cb_voice.isChecked()
         cfg["voiceName"] = self.combo_voice.currentData() or tts.DEFAULT_VOICE
         cfg["whisperModel"] = {"provider": self.edit_whisper_provider.text().strip(),
@@ -550,6 +635,14 @@ class SettingsDialog(QDialog):
         wins = mgr.windows() if mgr is not None else [self.owner]
         for win in wins:
             font_ui.apply_to_window(win)
+            # 心跳热更新：活配置/引擎/身体段快照三处同步（与内容调度页同一条路），
+            # 否则保存后 AI 的自我描述还停在旧间隔上
+            apply_hb = getattr(win, "_apply_heartbeat_cfg", None)
+            if callable(apply_hb):
+                try:
+                    apply_hb(self.cfg.get("heartbeat") or {})
+                except Exception:
+                    pass
         self._sync_api()
         if hasattr(self.owner, "say"):
             self.owner.say("设置已保存")

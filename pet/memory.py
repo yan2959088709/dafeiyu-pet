@@ -14,12 +14,26 @@ from . import memory_recall
 from .pricing import DS_BASE_URL, DS_MODEL
 from .storage import P, load_json
 
+# 长期事实存储上限。提示词注入走 memory_recall 的 top-K 召回（默认 8 条），
+# 存储放大不推高每轮 token；改这个数字要同步 harness 里 remember_fact 的
+# 描述与 chat.py HARNESS_HINT 的文案（smoke 有断言钉住三者一致）。
+MAX_FACTS = 200
+# 临时事实（「正在做更新」这类当下状态）的存活期：隔天自动淡出，
+# 不占长期记忆的坑，也不会过时了还压在提示词里
+TEMP_TTL_SEC = 24 * 3600
+KIND_LONG = "long"
+KIND_TEMP = "temp"
+
 
 def _num(value, default=0.0):
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _kind_of(value):
+    return KIND_TEMP if str(value or "") == KIND_TEMP else KIND_LONG
 
 
 def parse_facts(data):
@@ -35,18 +49,20 @@ def parse_facts(data):
             if text:
                 norm.append(text)
                 raw_meta.setdefault(
-                    text, {k: item.get(k) for k in ("ts", "last_access", "hits")})
+                    text, {k: item.get(k) for k in ("ts", "last_access", "hits",
+                                                    "kind")})
         else:
             text = str(item).strip()
             if text:
                 norm.append(text)
-    norm = norm[:20]
+    norm = norm[:MAX_FACTS]
     meta = {}
     for text in norm:
         item = raw_meta.get(text) if isinstance(raw_meta.get(text), dict) else {}
         meta[text] = {"ts": _num(item.get("ts"), 0.0),
                       "last_access": _num(item.get("last_access"), 0.0),
-                      "hits": int(_num(item.get("hits"), 0))}
+                      "hits": int(_num(item.get("hits"), 0)),
+                      "kind": _kind_of(item.get("kind"))}
     return norm, meta
 
 
@@ -65,6 +81,11 @@ class MemoryMixin:
                   if isinstance(m, dict) and m.get("role") in ("user", "assistant")
                   and m.get("content")]
         self._load_sessions(legacy)
+        try:
+            # 启动时淡出隔天的临时状态（chat_history 此时已就绪，_save_mem 可用）
+            self._expire_temp_facts()
+        except Exception:
+            pass
 
     def _save_mem(self):
         try:
@@ -73,6 +94,24 @@ class MemoryMixin:
                 json.dump({"facts": self.facts, "fact_meta": meta,
                            "hist": self.chat_history[-40:]},
                           f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _trim_history(self, hist):
+        """历史超长截断：丢掉的旧轮次沉进情节记忆，不再硬丢弃。
+
+        被动聊天每轮只发 12 条、历史上限 40 条，超出的轮次原来是直接 del——
+        AI 的体验就是「越聊越失忆」。沉淀成 episodes.jsonl 后，心跳/日记/
+        聊天提示词按需注入最近的几条，经历才不断片。
+        """
+        overflow = len(hist) - self.max_history
+        if overflow <= 0:
+            return
+        dropped = hist[:overflow]
+        del hist[:overflow]
+        try:
+            from . import episodic
+            episodic.archive(dropped)
         except Exception:
             pass
 
@@ -90,6 +129,7 @@ class MemoryMixin:
                 "ts": _num(item.get("ts"), 0.0),
                 "last_access": _num(item.get("last_access"), 0.0),
                 "hits": int(_num(item.get("hits"), 0)),
+                "kind": _kind_of(item.get("kind")),
             }
         self._fact_meta = out
         return out
@@ -103,6 +143,28 @@ class MemoryMixin:
         except Exception:
             return ""
 
+    def _expire_temp_facts(self):
+        """临时事实隔天淡出：超 TTL 的临时条目直接丢，长期条目不动。"""
+        meta = getattr(self, "_fact_meta", None)
+        meta = meta if isinstance(meta, dict) else {}
+        now = time.time()
+        dropped = []
+        for f in list(self.facts):
+            item = meta.get(f)
+            if not isinstance(item, dict) or item.get("kind") != KIND_TEMP:
+                continue
+            ts = _num(item.get("ts"), 0.0)
+            if ts > 0 and now - ts > TEMP_TTL_SEC:
+                dropped.append(f)
+        if not dropped:
+            return False
+        with self._mem_lock:
+            self.facts = [f for f in self.facts if f not in dropped]
+            for f in dropped:
+                meta.pop(f, None)
+            self._save_mem()
+        return True
+
     def _recall_facts(self, context_text="", k=None):
         """按当前语境召回 top-K facts，并回写命中元数据。"""
         if not self.facts:
@@ -113,6 +175,9 @@ class MemoryMixin:
         except (TypeError, ValueError):
             k = memory_recall.DEFAULT_K
         k = max(1, min(memory_recall.MAX_K, k))
+        self._expire_temp_facts()
+        if not self.facts:
+            return []
         recent = self._recent_context_text()
         ctx = (str(context_text or "") + "\n" + recent).strip()
         now = time.time()
@@ -126,15 +191,25 @@ class MemoryMixin:
             picked = memory_recall.score_facts(items, ctx, now, k=k)
             for fact in picked:
                 item = self._fact_meta.setdefault(
-                    fact.text, {"ts": 0.0, "last_access": 0.0, "hits": 0})
+                    fact.text, {"ts": 0.0, "last_access": 0.0, "hits": 0,
+                                "kind": KIND_LONG})
                 item["hits"] = int(item.get("hits") or 0) + 1
                 item["last_access"] = now
             if picked:
                 self._save_mem()
-            return [fact.text for fact in picked]
+            # 临时条目带标记进提示词：AI 分得清「长期喜好」和「当下状态」
+            return [fact.text + ("（临时）"
+                                 if meta.get(fact.text, {}).get("kind") == KIND_TEMP
+                                 else "")
+                    for fact in picked]
 
     def _fact_extract(self, key, user_msg, reply):
-        """从对话中静默提取关于主人的长期事实（失败忽略）"""
+        """从对话中静默提取关于主人的事实（失败忽略）
+
+        长期=称呼/喜好/习惯/身份这类持久的；临时=正在做但会变的事（隔天自动
+        淡出）。以前不分类，「正在做更新」这类当下状态会混进长期表，过时了还
+        压在提示词里——AI 自己点名的污染源就是这条路径。
+        """
         try:
             r = requests.post(
                 f"{DS_BASE_URL}/chat/completions",
@@ -144,8 +219,10 @@ class MemoryMixin:
                     "model": DS_MODEL,
                     "messages": [
                         {"role": "system",
-                         "content": ("从对话里提取一条关于主人的长期有用事实"
-                                     "（称呼/喜好/习惯/身份/正在做的事）。"
+                         "content": ("从对话里提取一条关于主人的事实。"
+                                     "长期=称呼/喜好/习惯/身份等持久信息；"
+                                     "临时=正在做但会变的事。"
+                                     "格式：长期：事实 或 临时：事实；"
                                      "没有就只输出NONE。只输出事实本身，20字以内。")},
                         {"role": "user", "content": f"主人说：{user_msg}\n你回答：{reply}"}
                     ],
@@ -155,18 +232,34 @@ class MemoryMixin:
             if r.status_code == 200:
                 out = r.json()["choices"][0]["message"]["content"].strip()
                 out = out.strip("\"'“”『』 ").strip()
-                if out and out.upper() != "NONE" and 2 <= len(out) <= 30:
-                    self._add_fact(out)
+                if not out or out.upper() == "NONE":
+                    return
+                kind = KIND_LONG
+                for prefix, tag in (("临时", KIND_TEMP), ("长期", KIND_LONG),
+                                    ("TEMP:", KIND_TEMP), ("LONG:", KIND_LONG)):
+                    if out.startswith(prefix):
+                        kind = tag
+                        out = out[len(prefix):].strip(" ：:")
+                        break
+                if out and 2 <= len(out) <= 30:
+                    self._add_fact(out, kind)
         except Exception:
             pass
 
-    def _add_fact(self, fact):
+    def _add_fact(self, fact, kind=KIND_LONG):
         fact = re.sub(r"\s+", " ", str(fact)).strip(" ，。,.；;")
         if not fact:
             return
+        kind = _kind_of(kind)
         with self._mem_lock:
             for f in self.facts:
                 if fact in f or f in fact:
+                    # 重复记录不新增条目，但顺带纠正分类（临时↔长期），
+                    # 否则同一条事实被换成另一种分类时旧分类赶不走
+                    item = getattr(self, "_fact_meta", {}).get(f)
+                    if isinstance(item, dict) and item.get("kind") != kind:
+                        item["kind"] = kind
+                        self._save_mem()
                     return
             # 冲突消解：新事实与旧事实同主题反极性 → 删掉旧事实
             to_del = [f for f in self.facts if self._fact_conflict(fact, f)]
@@ -175,10 +268,11 @@ class MemoryMixin:
                 for old in to_del:
                     getattr(self, "_fact_meta", {}).pop(old, None)
             self.facts.append(fact)
-            if len(self.facts) > 20:
-                self.facts = self.facts[-20:]
+            if len(self.facts) > MAX_FACTS:
+                self.facts = self.facts[-MAX_FACTS:]
             meta = self._sync_fact_meta()
-            meta[fact] = {"ts": time.time(), "last_access": 0.0, "hits": 0}
+            meta[fact] = {"ts": time.time(), "last_access": 0.0, "hits": 0,
+                          "kind": kind}
             self._fact_meta = meta
             self._save_mem()
 
@@ -227,5 +321,5 @@ class MemoryMixin:
                 changed = True
             keep.append(f)
         if changed:
-            self.facts = keep[:20]
+            self.facts = keep[:MAX_FACTS]
             self._save_mem()
