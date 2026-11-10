@@ -252,7 +252,7 @@
 - **Handoff log**:
   > claude [~] 2026-11-10: claimed. git backup tag `backup/pre-runtime-spike-20261110` @ dd202fa。用户批准「理论不如实践」。前置实测：DSH headless 成功（Node 24.22.2；NDJSON 事件 session/status/text/thinking/tool_call/tool_result/final；trivial 单轮 14,179 input tokens；tool 任务两步共 28,624 tokens；完整安装 9.0 GB）；OpenClaw 2026.11.2 MIT，Node>=24.16，npm 包 274.8MB unpacked（安装中）。
   > claude [Blueprint] 2026-11-10: 用户已预批准（「批准并执行」）。DATA FLOW: goal+context → AgentRuntime.run → RuntimeResult(text/usage/events/error/latency) → probe JSON。MODULE: ①pet/agent_runtime.py 新模块（协议+原生适配器+DSH sidecar 适配器）②tools/runtime_probe.py 新探针 ③tools/smoke_check.py 新增用例。INTEGRATION: 零改动 chat/heartbeat；黑盒隔离。TEST: 假 transport/假 runner 单测 + DSH 真实探针 + 全量 smoke。RISK: 外部进程/密钥脱敏/超时；DSH 成本高，仅作重任务 runtime。
-  > claude [x] 2026-11-10: 交付。新增 `pet/agent_runtime.py`（AgentRuntime 协议 / RuntimeResult / NativeHarnessRuntime / DshHeadlessRuntime / CommandRuntime / NDJSON 聚合 / 脱敏）与 `tools/runtime_probe.py`（native/dsh/command 三态探针，Key 只从环境读取）。冒烟 168 → 171，171/171 全绿。实测：DSH 0.2.2-rc.1 headless 真任务成功，事件 session/status/text/thinking/tool_call/tool_result/final 完整；trivial 任务 14,175 tokens / 52.9s；工具任务约 28,624 tokens；DSH 完整安装 9.0GB；OpenClaw 2026.11.2 MIT、npm unpacked 274.8MB，本机 Node 22.20 导致 lifecycle 中止、Node 24 PATH 重试未生效，端到端未验证。ADR: docs/decisions/2026-11-10-agent-runtime-seam.md；报告: docs/spikes/2026-11-10-agent-runtime-probe.md。结论：DSH 可作重任务 sidecar，不可作生命核心；生产接线需预算门禁 + profile 裁剪 + 事件总线映射，登记 TASK-016。
+  > claude [x] 2026-11-10: 交付，commit 06e7422。新增 `pet/agent_runtime.py`（AgentRuntime 协议 / RuntimeResult / NativeHarnessRuntime / DshHeadlessRuntime / CommandRuntime / NDJSON 聚合 / 脱敏）与 `tools/runtime_probe.py`（native/dsh/command 三态探针，Key 只从环境读取）。冒烟 168 → 171，171/171 全绿。实测：DSH 0.2.2-rc.1 headless 真任务成功，事件 session/status/text/thinking/tool_call/tool_result/final 完整；trivial 任务 14,175 tokens / 52.9s；工具任务约 28,624 tokens；DSH 完整安装 9.0GB；OpenClaw 2026.11.2 MIT、npm unpacked 274.8MB，本机 Node 22.20 导致 lifecycle 中止、Node 24 PATH 重试未生效，端到端未验证。ADR: docs/decisions/2026-11-10-agent-runtime-seam.md；报告: docs/spikes/2026-11-10-agent-runtime-probe.md。结论：DSH 可作重任务 sidecar，不可作生命核心；生产接线需预算门禁 + profile 裁剪 + 事件总线映射，登记 TASK-016。
 
 ### TASK-016: DSH runtime 生产接线（预算门禁/事件总线/profile 裁剪/OpenClaw 适配）
 - **Executor**: claude
@@ -266,6 +266,7 @@
   4. OpenClaw CLI/headless 适配（或明确不接的裁决）；既有 smoke 不回归
 - **Handoff log**:
   > claude [ ] 2026-11-10: 自 TASK-015 deferred 登记。注意：DSH 单次基线 ~14k tokens/53s，只能重任务；默认关闭，预算门禁先于一切接线。
+  > claude [Notify] 2026-11-10: dependency TASK-015 resolved (commit 06e7422). You may proceed.
 
 ---
 
