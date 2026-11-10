@@ -5716,7 +5716,9 @@ def _():
     hb = HeartbeatEngine(object(), D.DrivesEngine(d), {}).state
     assert hb == {"last_speak_time": 0.0, "last_attempt_time": 0.0,
                   "timestamps_24h": [], "attempts_24h": [],
-                  "consecutive_speaks": 0, "last_speak_content": ""}, hb
+                  "consecutive_speaks": 0, "last_speak_content": "",
+                  "last_reason": "", "last_urgency": 0.0,
+                  "last_gates": {}}, hb
     # 半合法 JSON：字段类型不对逐项回落，其余照用
     with open(os.path.join(d, "heartbeat_state.json"), "w", encoding="utf-8") as f:
         _json.dump({"last_speak_time": "x", "consecutive_speaks": "y",
@@ -7378,6 +7380,189 @@ def _():
         w.chat_history = old_hist
         with w._mem_lock:
             w._save_mem()
+
+
+@check("heartbeat_journal: append/ring/summary")
+def _():
+    import time as _t
+    from pet import heartbeat_journal as J
+    d = os.path.join(CTX["tmpdir"], "hb_journal")
+    os.makedirs(d, exist_ok=True)
+    now = _t.time()
+    assert "没有心跳记录" in J.summary_text(d, "j1", now)
+    J.append(d, "j1", {"outcome": "skip", "reason": "not_silent",
+                       "urgency": 0.01, "gates": {}}, now=now)
+    J.append(d, "j1", {"outcome": "speak", "reason": "ok", "urgency": 0.5,
+                       "gates": {}, "text": "在呢"}, now=now)
+    J.append(d, "j1", {"outcome": "silent", "reason": "ok",
+                       "urgency": 0.4, "gates": {}}, now=now)
+    s = J.summary(d, "j1", now)
+    assert s["spoken"] == 1 and s["silent"] == 1 and s["blocked"] == 1, s
+    text = J.summary_text(d, "j1", now)
+    assert "说出口 1" in text and "忍住 1" in text and "门禁拦下 1" in text, text
+    for _i in range(205):
+        J.append(d, "j1", {"outcome": "skip", "reason": "cooldown"}, now=now)
+    assert len(J.recent(d, "j1", 1000, now)) == J.MAX_ENTRIES
+    J.append(d, "j1", {"outcome": "skip", "reason": "old"},
+             now=now - 8 * 86400)
+    assert not any(e.get("reason") == "old" for e in J.recent(d, "j1", 1000, now))
+
+
+@check("self_prompt: save/rollback/truncate/inject")
+def _():
+    from pet import self_prompt as S
+    p = os.path.join(CTX["tmpdir"], "self_prompt_unit.json")
+    assert S.load(p)["version"] == 0 and S.prompt_section(p) == ""
+    a = S.save("第一版", p)
+    assert a["version"] == 1 and a["note"] == "第一版"
+    b = S.save("第二版", p)
+    assert b["version"] == 2
+    c = S.rollback(None, p)
+    assert c["note"] == "第一版" and c["version"] == 3, c
+    d = S.rollback(2, p)
+    assert d["note"] == "第二版", d
+    long = S.save("x" * 3000, p)
+    assert len(long["note"]) == S.MAX_CHARS
+    assert "你自己写的提示词" in S.prompt_section(p)
+    assert "v%d" % long["version"] in S.history_text(p)
+
+
+@check("interoception: 身体/门禁/心跳史")
+def _():
+    import time as _t
+    from pet import interoception, heartbeat_journal as J
+    w = CTX["win"]
+    eng, hb = getattr(w, "_drives", None), getattr(w, "_heartbeat", None)
+    assert eng is not None and hb is not None, "窗口应初始化心跳/驱动"
+    old_st = (eng.st.energy, eng.st.mood, eng.st.affinity,
+              eng.st.last_user_message_time)
+    old_hb = dict(hb.state)
+    jp = J.path(eng.storage_dir, eng.pet_id)
+    backup = open(jp, "rb").read() if os.path.exists(jp) else None
+    try:
+        now = _t.time()
+        eng.st.energy = 1.3
+        eng.st.mood = "happy"
+        eng.st.affinity = 9.9
+        eng.st.last_user_message_time = now - 60
+        hb.state.update({"last_reason": "not_silent", "last_urgency": 0.08,
+                         "last_gates": {"quiet_window": True,
+                                        "low_urgency": False},
+                         "attempts_24h": [], "consecutive_speaks": 0})
+        try:
+            os.remove(jp)
+        except OSError:
+            pass
+        J.append(eng.storage_dir, eng.pet_id,
+                 {"outcome": "silent", "reason": "ok", "urgency": 0.4}, now=now)
+        body = interoception.body_text(w, now)
+        assert "精力 1/100" in body and "快没电了" in body, body
+        assert "开心" in body and "亲密度 9.9/100" in body, body
+        assert "主人正在互动" in body, body
+        assert "忍住 1" in body, body
+        gates = interoception.gates_text(w, now)
+        assert "紧迫度" in gates and "沉默" in gates and "睡眠窗" in gates, gates
+        feel = interoception.feel_heartbeat(w, now)
+        assert "【你的身体" in feel and "【心跳门禁细节】" in feel, feel
+    finally:
+        (eng.st.energy, eng.st.mood, eng.st.affinity,
+         eng.st.last_user_message_time) = old_st
+        hb.state.clear()
+        hb.state.update(old_hb)
+        try:
+            os.remove(jp)
+        except OSError:
+            pass
+        if backup is not None:
+            open(jp, "wb").write(backup)
+
+
+@check("harness: feel_heartbeat / manage_self_prompt")
+def _():
+    from pet import harness as H, self_prompt as S
+    w = CTX["win"]
+    p = S.path()
+    backup = open(p, "rb").read() if os.path.exists(p) else None
+    try:
+        out = H.execute_tool(w, "feel_heartbeat", "{}", {})
+        assert "【你的身体" in out or "感觉不到自己的身体" in out, out
+        out = H.execute_tool(w, "manage_self_prompt", '{"action":"read"}', {})
+        assert "自我提示词" in out, out
+        out = H.execute_tool(w, "manage_self_prompt",
+                             '{"action":"write","note":"测试自我提示词"}', {})
+        assert "已把自我提示词更新到" in out, out
+        out = H.execute_tool(w, "manage_self_prompt", '{"action":"undo"}', {})
+        assert "回滚" in out, out
+        caps = H.execute_tool(w, "list_capabilities", "{}", {})
+        assert "feel_heartbeat" in caps and "manage_self_prompt" in caps, caps
+    finally:
+        if backup is not None:
+            open(p, "wb").write(backup)
+        else:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+@check("chat: 提示词含身体状态与自我提示词")
+def _():
+    from pet import self_prompt as S
+    w = CTX["win"]
+    p = S.path()
+    backup = open(p, "rb").read() if os.path.exists(p) else None
+    try:
+        sp = w._build_system_prompt("你好")
+        assert "【你的身体" in sp, sp
+        S.save("这句是自我提示词测试标记")
+        sp = w._build_system_prompt("你好")
+        assert "这句是自我提示词测试标记" in sp, sp
+    finally:
+        if backup is not None:
+            open(p, "wb").write(backup)
+        else:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+@check("heartbeat: skip/silent 写内在日志")
+def _():
+    import time as _t
+    from pet.heartbeat import Decision
+    from pet import heartbeat_journal as J
+    w = CTX["win"]
+    eng = getattr(w, "_heartbeat", None)
+    assert eng is not None
+    jp = J.path(eng.drives.storage_dir, eng.drives.pet_id)
+    backup = open(jp, "rb").read() if os.path.exists(jp) else None
+    old_skip = getattr(eng, "_journal_last_skip", 0.0)
+    try:
+        try:
+            os.remove(jp)
+        except OSError:
+            pass
+        eng._journal_last_skip = 0.0
+        now = _t.time()
+        d = Decision("skip", "not_silent", 0.1, {"quiet_window": True})
+        eng._journal(d, now, outcome="skip")
+        first = J.recent(eng.drives.storage_dir, eng.drives.pet_id, 10, now)
+        assert any(e.get("reason") == "not_silent" for e in first), first
+        eng._journal(d, now + 1, outcome="skip")
+        second = J.recent(eng.drives.storage_dir, eng.drives.pet_id, 10, now + 1)
+        assert len(second) == len(first), (first, second)
+        eng._journal(d, now + 2, outcome="silent", text="")
+        third = J.recent(eng.drives.storage_dir, eng.drives.pet_id, 10, now + 2)
+        assert any(e.get("outcome") == "silent" for e in third), third
+    finally:
+        eng._journal_last_skip = old_skip
+        try:
+            os.remove(jp)
+        except OSError:
+            pass
+        if backup is not None:
+            open(jp, "wb").write(backup)
 
 
 # ---------------------------------------------------------------- 运行器

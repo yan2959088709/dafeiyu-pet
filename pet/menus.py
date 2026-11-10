@@ -228,6 +228,8 @@ class MenuMixin:
         data_menu.addAction("气泡自动关闭秒数…", self._set_bubble_close_dialog)
         data_menu.addAction("🧠 记忆管理", self._show_facts)
         data_menu.addAction("生活日志", self._runtime_show_log)
+        data_menu.addAction("自我提示词…", self._open_self_prompt)
+        data_menu.addAction("内在状态…", self._show_inner_state)
         sess_menu = data_menu.addMenu("会话")
         sess_menu.addAction("新建会话", self._new_session)
         self._sess_list_menu = sess_menu.addMenu("切换会话")

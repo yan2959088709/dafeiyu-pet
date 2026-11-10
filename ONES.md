@@ -272,6 +272,21 @@
   > claude [Blueprint] 2026-11-10（用户「可以开工」预批准）：DATA FLOW: settings.runtime → RuntimeGate.check(estimate=15000) → build DshHeadlessRuntime → worker run(goal) → RuntimeResult(events/usage/text) → normalize usage → _record_tokens + life_log.append → workstatus 外部槽(tool_call/tool_result/final) + _notify_reply → 聊天气泡结果。MODULE: ①pet/runtime_manager.py（DEFAULT_RUNTIME/normalize/usage 翻译/RuntimeGate 24h runs/build_dsh_runtime）②pet/life_log.py（JSONL append/read）③pet/runtime_ui.py（RuntimeMixin：运行对话框/worker/事件映射/日志查看）④pet/config.py runtime 段 + OBJECT_KEYS + validate ⑤pet/settings_ui.py「执行内核」页（开关/路径/预算/次数/超时/运行/查看日志）⑥pet/menus.py 动作菜单入口 ⑦桌宠.py 挂 RuntimeMixin ⑧smoke 新增用例 ⑨ADR TASK-016。INTEGRATION: 零改动 chat/heartbeat；复用 agent_runtime；OpenClaw 做「不接」裁决（Gateway 形态 + Node24 阻塞）。TEST: 配置归一/预算门禁/24h 次数/usage 翻译/日志读写 + 全量 smoke。RISK: worker 不触 Qt（_ui_call/_chat_queue）、Key 只走子进程 env 且日志不落、DSH 首跑建 profile 慢（timeout 300s）、预算预估 15k tokens、DSH patch 工具 ID 随上游变化。
   > claude [x] 2026-11-10: 交付，commit 5609d68。新增 pet/runtime_manager.py / pet/life_log.py / pet/runtime_ui.py；config runtime 段（OBJECT_KEYS+validate）；设置页「执行内核」页；右键「重型任务（DSH）…」与「生活日志」；桌宠挂 RuntimeMixin。生产 patch 实测同一 trivial 任务 **1,938 tokens / 4.1s**（未裁剪 14,175 / 52.9s）；`--dump-config` 确认 persona 替换 + tool-pwsh/bash/jobs 禁用 + tool-web 保留。冒烟 171 → 177，177/177 全绿。OpenClaw 裁决：Gateway 形态 + Node24 PATH 阻塞，本版不接，需要多通道时再评估 sidecar。ADR: docs/decisions/2026-11-10-dsh-runtime-production.md。
 
+### TASK-017: 内在感受与自我提示词（心跳可感知 / 自主修改 Prompt）
+- **Executor**: claude
+- **Status**: [~]
+- **Dependencies**: TASK-010, TASK-013
+- **Contract**: 2026-11-10 用户「从 AI 生命体的角度出发，其应当具备自己状态的完整查看，甚至可以修改自己的 Prompt」
+- **Acceptance**:
+  1. 普通聊天提示词注入第一人称身体状态（精力/情绪/亲密度/距上次互动/心跳史摘要）；被问心跳/累不累时能基于自身状态回答
+  2. `feel_heartbeat` 工具：完整状态 + 最近门禁原因/决策史
+  3. 心跳每次判定/静默/发言写 `heartbeat_journal`（ring buffer + 24h 摘要）；「想说话但忍住」可被记住
+  4. 自我提示词：AI 可经 `manage_self_prompt(write/undo)` 修改补充 Prompt，版本化/历史/回滚；设置页/菜单可人工编辑；不改核心人设与权限
+  5. 冒烟新增用例，既有 181 项不回归
+- **Handoff log**:
+  > claude [~] 2026-11-10: claimed（用户明确批准）。用户观察到普通聊天里 AI 说「没有心跳」——根因：drives/心跳只进主动提示词，普通聊天无身体状态，且静默尝试不落记忆；实机精力 1.3/100。本任务让状态可感知、可查询、可记忆、可自改 Prompt。
+  > claude [Blueprint] 2026-11-10（用户已预批准）：DATA FLOW: drives.st + heartbeat.state + heartbeat_journal + self_prompt → interoception.body_text/feel_heartbeat → chat prompt/harness tool；heartbeat 判定/静默/发言写 journal；manage_self_prompt 写 self_prompt.json（版本化）。MODULE: ①pet/heartbeat_journal.py（ring buffer/摘要）②pet/interoception.py（身体状态/门禁/降级）③pet/self_prompt.py（版本化/回滚）④pet/self_prompt_ui.py（人工编辑/内在状态面板）⑤heartbeat.py（last_reason/last_urgency + 日志）⑥chat.py（内感受+自我提示词注入）⑦harness.py（feel_heartbeat/manage_self_prompt + 能力清单 + 写保护）⑧settings/menus/桌宠.py 挂 UI ⑨smoke ⑩ADR。INTEGRATION: 不改精力结算与权限；self_prompt 只做补充提示词，核心人设/权限不可被它覆盖；journal 属运行期数据，file 工具禁写。TEST: 纯函数 + 提示词注入 + 工具 dispatch + 心跳静默日志 + 全量 smoke。
+
 ---
 
 ## Messages

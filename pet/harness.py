@@ -24,8 +24,10 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 
+from . import interoception
 from . import log as pet_log
 from . import memes as pet_memes
+from . import self_prompt as pet_self_prompt
 from . import stickers
 from .pricing import DS_BASE_URL, DS_MODEL
 from .storage import P
@@ -50,6 +52,8 @@ WEB_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 PROTECTED_WRITE_NAMES = {
     "config.json", "config.jsonc", "pet_sessions.json", "pet_sessions.json.bak",
     "pet_memory.json", "usage_ledger.json", "logs.txt", "api-runtime.json",
+    "self_prompt.json", "heartbeat_journal.json", "pet_runtime.json",
+    "life_log.jsonl", "dsh-runtime.patch.yml",
 }
 PROTECTED_WRITE_DIRS = (".venv",)
 
@@ -147,6 +151,18 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "动作名"}},
             "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "feel_heartbeat",
+        "description": "查看你此刻的完整内在状态：精力/情绪/亲密度/心跳/最近门禁与心跳史。被问到心情、累不累、有没有心跳时调用。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "manage_self_prompt",
+        "description": "查看、修改或回滚你自己写的补充提示词。action=read/write/undo；write 需要 note；undo 可选 version。只影响你之后的说话方式，不能改工具权限/预算/核心人设。",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "read | write | undo"},
+            "note": {"type": "string", "description": "write 时的新提示词，最多 1500 字"},
+            "version": {"type": "integer", "description": "undo 时可指定版本号，省略=上一版"}},
+            "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "list_capabilities",
         "description": "查看你当前具备的全部能力（工具、本地技能、开关状态）。不确定自己能做什么时调用。",
@@ -315,7 +331,9 @@ def _safe_path(win, rel, for_write=False):
         if parts and os.path.normcase(parts[0]) in protected_dirs:
             raise ValueError("拒绝写入：%s 是运行环境目录" % parts[0])
         base = os.path.basename(rel).lower()
-        if base in PROTECTED_WRITE_NAMES:
+        if base in PROTECTED_WRITE_NAMES or base.startswith(
+                ("pet_drives.", "heartbeat_state.", "heartbeat_journal.",
+                 "pet_runtime.")):
             raise ValueError("拒绝写入：%s 是运行期数据文件" % base)
     return target, rel
 
@@ -596,6 +614,32 @@ def _tool_play_anim(win, args, state):
 
 
 # ------------------------------------------------------------ 自我认知
+def _tool_self_prompt(args):
+    action = str(args.get("action") or "").strip().lower()
+    if action == "read":
+        cur = pet_self_prompt.load()
+        note = cur["note"] or "（空）"
+        return ("当前自我提示词 v%d：\n%s\n\n历史版本：\n%s"
+                % (cur["version"], note, pet_self_prompt.history_text()))
+    if action == "write":
+        note = str(args.get("note") or "")
+        if not note.strip():
+            return "note 为空，没有修改"
+        payload = pet_self_prompt.save(note)
+        return ("已把自我提示词更新到 v%d（%d 字）。它会影响你之后的说话方式，"
+                "但改不了工具权限/预算/核心人设。"
+                % (payload["version"], len(payload["note"])))
+    if action == "undo":
+        version = args.get("version")
+        payload = pet_self_prompt.rollback(version)
+        if payload is None:
+            return "没有可回滚的历史版本"
+        if version is None:
+            return "已回滚到上一版内容（新版本 v%d）" % payload["version"]
+        return "已把 v%s 的内容恢复为新版本 v%d" % (version, payload["version"])
+    return "action 只能是 read / write / undo"
+
+
 def _tool_capabilities(win):
     cfg = getattr(win, "cfg", {}) or {}
     try:
@@ -613,7 +657,9 @@ def _tool_capabilities(win):
         if file_enabled(win) else "5. 文件：已关闭（config.aiFileEnabled = false）",
         "6. 联网：web_search / web_fetch —— Bing 搜索 + 公网网页抓取，内网地址会被拒绝"
         if web_enabled(win) else "6. 联网：已关闭（config.aiWebEnabled = false）",
-        "7. 自知：list_capabilities（本清单）",
+        "7. 自我：feel_heartbeat（心跳/精力/情绪/门禁），"
+        "manage_self_prompt（读/写/回滚你的补充提示词）",
+        "8. 自知：list_capabilities（本清单）",
         "另外，用户直接输入「查余额 / 查天气 / 记住… / 忘记… / 你记得什么」会由本地技能处理，不经过你。",
     ]
     return "\n".join(lines)
@@ -660,6 +706,10 @@ def execute_tool(win, name, raw_args, state):
             return _tool_list_actions(win, args)
         if name == "play_animation":
             return _tool_play_anim(win, args, state)
+        if name == "feel_heartbeat":
+            return interoception.feel_heartbeat(win)
+        if name == "manage_self_prompt":
+            return _tool_self_prompt(args)
         if name == "list_capabilities":
             return _tool_capabilities(win)
     except Exception as e:  # noqa: BLE001 - 分类文案回喂，细节只进日志

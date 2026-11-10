@@ -62,6 +62,7 @@ from pet import lunar_table as pet_lunar                           # noqa: E402
 from pet import time_context as pet_time                           # noqa: E402
 from pet.workstatus_ui import WorkStatusMixin                      # noqa: E402
 from pet.runtime_ui import RuntimeMixin                            # noqa: E402
+from pet.self_prompt_ui import SelfPromptMixin                     # noqa: E402
 from pet import geometry as pet_geometry                           # noqa: E402
 from pet.drag import DragState                                     # noqa: E402
 from pet import font_ui                                            # noqa: E402
@@ -1231,7 +1232,7 @@ def _pos_key(pos):
 class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
                 GadgetMixin, BalanceMixin, MenuMixin, FactsPanelMixin, SoundMixin,
                 ServiceHooksMixin, DesktopMixin, PointPickMixin, WorkStatusMixin,
-                RuntimeMixin, QWidget):
+                RuntimeMixin, SelfPromptMixin, QWidget):
     def __init__(self, pet=None, with_tray=True):
         self.pet_conf = pet or {}
         self.pet_id = str(self.pet_conf.get("id") or "main")

@@ -19,6 +19,8 @@ from . import chat_attach
 from . import drives as pet_drives
 from . import harness as pet_harness
 from . import heartbeat as pet_heartbeat
+from . import interoception
+from . import self_prompt as pet_self_prompt
 from . import stickers
 from . import log as pet_log
 from . import memes as pet_memes
@@ -38,6 +40,8 @@ HARNESS_HINT = (
     "- 文件：list_dir / read_file / write_file（只能访问程序目录；config、会话、记忆等运行期数据文件禁止写入）；\n"
     "- 联网：web_search / web_fetch（主动搜索和抓取公网网页，内网地址会被拒绝）；\n"
     "- 动作：list_actions / play_animation（用身体动作表达情绪，每轮最多一个）；\n"
+    "- 自我：feel_heartbeat（查看自己的心跳/精力/情绪/门禁），"
+    "manage_self_prompt（查看/修改/回滚你自己写的提示词）；\n"
     "- list_capabilities：查看自己的完整能力清单。\n"
     "需要时自主调用；正文只写字，不要把任何标记写进回复。"
 )
@@ -104,6 +108,16 @@ class ChatMixin:
         city = self.cfg.get("city")
         if city:
             lines.append(f"主人所在城市：{city}。")
+        try:
+            lines.append(interoception.body_text(self))
+        except Exception:
+            pass
+        try:
+            note = pet_self_prompt.prompt_section()
+            if note:
+                lines.append(note)
+        except Exception:
+            pass
         lines.append(HARNESS_HINT)
         return "\n".join(lines)
 
