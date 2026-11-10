@@ -2,7 +2,7 @@
 
 > 审查报告（2026-11-06，4 代理并行 + 主会话复核）即本轨道契约源。
 > P0 轮范围 = 8 项 P0 + 2 项一行级 P1，已全部交付并提交（commit 76e928c）。
-> 测试入口：`tools/smoke_check.py`（104 → 111（P0 轮）→ 119（Harness 轮，含 8 条 harness 用例）→ 153（心跳轮 TASK-010，含 1 项已知偶发 flaky 见教训 L8）→ 157（睡眠窗轮 TASK-011）→ 162（token 入账轮 TASK-012）全绿）。
+> 测试入口：`tools/smoke_check.py`（104 → 111（P0 轮）→ 119（Harness 轮，含 8 条 harness 用例）→ 153（心跳轮 TASK-010，含 1 项已知偶发 flaky 见教训 L8）→ 157（睡眠窗轮 TASK-011）→ 162（token 入账轮 TASK-012）→ 168（Phase 2 工具轮 TASK-009）全绿）。
 
 ### TASK-001: P0 一键修复组（退出崩溃/切皮肤冻死/首启漂移/置顶抹穿透/APPDATA）
 - **Executor**: claude
@@ -120,7 +120,7 @@
 
 ### TASK-009: Harness Phase 2/3 backlog（自主意识路线图）
 - **Executor**: claude
-- **Status**: [ ]
+- **Status**: [~]
 - **Dependencies**: TASK-008
 - **Contract**: 2026-11-06 深夜设计对话分期
 - **Acceptance**: 逐项修复后勾销
@@ -131,6 +131,7 @@
   >
   > claude [~] 2026-11-09: 拆分——Stage 1（drives 状态机 + 心跳门禁 + 主动说话链路）拆为 TASK-010 实施中；M4 学习睡眠窗口拆为 TASK-011 待办。
   > claude [~] 2026-11-09: Stage 1 已交付（TASK-010 [x]，commit 5e6031b，真机演示在角色）。Phase 3 剩余主菜 = Stage 2 记忆生命周期（相关度检索替代全量 facts / 每日摘要 / 巩固遗忘）；Stage 3 = 反思引擎 + Persona Evolution。Phase 2 工具扩容（remember_fact 收编等）建议与 Stage 2 合并排期。TASK-010 延期项见 TASK-012。
+  > claude [~partial] 2026-11-10: Phase 2 工具扩容交付并推送（commit f4ee1b9；连同 TASK-010~012 共 7 个提交一并推上 origin/master，此前 6 个任务提交均未推送）。工具面 4→15：表情 4（既有）+ 记忆 3（remember_fact/forget_fact/search_memories）+ 文件 3（list_dir/read_file/write_file，路径沙箱限程序目录、config/会话/记忆/账本等运行期数据文件禁写）+ 联网 2（web_search/web_fetch，仅公网 http/https、内网/环回拒绝）+ 动作 2（list_actions/play_animation）+ list_capabilities；MAX_HOPS 3→4；heartbeat 主动轮同享全部工具（_chat_queue 扩展第 5 位 anim）。另附 QQ 风格聊天气泡面板（桌宠.py：头像/尖角 PNG/时间分隔/多行输入，尖角资源 tools/gen_chat_assets.py 生成）。config 增 aiFileEnabled/aiWebEnabled/aiFileRoot。冒烟 162→168 全绿。**未经 /full-auto 门禁链**——文件写沙箱/联网出口/工具返回值注入是新增攻击面，建议补独立门禁后再重度使用（重点：write_file 沙箱逃逸、web_fetch SSRF 变体、工具结果回灌注入）。Phase 2 剩余：query_balance/check_time 未收编（余额仍走 _local_skill，chat.py:174）；流式 transport 未做。
 
 ### TASK-010: Stage 1 心跳引擎 + 驱动状态机（自主循环/内在驱动/主动说话）
 - **Executor**: claude
