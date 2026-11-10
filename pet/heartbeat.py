@@ -289,12 +289,19 @@ class HeartbeatEngine:
         # 被动回复，拿它填「上次你主动说过」就是让提示词说谎（ASE 同款：
         # 发言成功时落 last_speak_content，没有就留空）
         last_content = str(self._hb.get("last_speak_content") or "").strip()[:50]
+        facts = list(chat.facts or [])
+        recall = getattr(chat, "_recall_facts", None)
+        if callable(recall):
+            try:
+                facts = recall("")
+            except Exception:
+                facts = list(chat.facts or [])
         system = heartbeat_prompt.build_heartbeat_system(
             self._drives_st,
             pet_persona.persona_text((chat.pet_conf or {}).get("whisperPrompt"),
                                      chat.cfg.get("whisperPrompt"), ""),
             pet_time.time_line(),
-            list(chat.facts or []),
+            facts,
             chat.cfg,
             last_content)
         messages = [{"role": "system", "content": system},

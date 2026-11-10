@@ -151,6 +151,7 @@ DEFAULT_CFG = {
     "whisperImageEnabled": True,
     "chatImageEnabled": True,
     "chatImageLimit": 10,
+    "memoryRecallK": 8,
     "voiceEnabled": False,
     "voiceName": DEFAULT_VOICE,
     "memes": DEFAULT_MEMES,
@@ -399,6 +400,11 @@ def validate(cfg):
     limit = cfg.get("chatImageLimit")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
         bad("chatImageLimit", "配图上限必须是非负整数", 10)
+
+    recall_k = cfg.get("memoryRecallK")
+    if isinstance(recall_k, bool) or not isinstance(recall_k, int) \
+            or not (1 <= recall_k <= 20):
+        bad("memoryRecallK", "记忆召回条数必须是 1-20 的整数", 8)
 
     # Harness 主聊天输出上限：手改 config / PUT /config 绕过 UI 的 _spin(128,4096)
     # 会直接放大每跳成本（ thinking 开启时按 completion 计费），这里兜底校验

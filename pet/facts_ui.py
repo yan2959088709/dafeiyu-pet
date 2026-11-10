@@ -161,7 +161,11 @@ class FactsPanelMixin:
             self.say("记忆不能是空的哦")
             return
         if new.strip() != self.facts[idx]:
+            old = self.facts[idx]
             self.facts[idx] = new.strip()
+            meta = getattr(self, "_fact_meta", None)
+            if isinstance(meta, dict) and old in meta:
+                meta[new.strip()] = meta.pop(old)
             with self._mem_lock:
                 self._save_mem()
             dlg = getattr(self, "_facts_dlg", None)

@@ -136,8 +136,10 @@ class SettingsDialog(QDialog):
         form.addRow(self.cb_hit)
         self.spin_rounds = _spin(0, 200, self.cfg.get("chatMemoryRounds", 5))
         self.spin_img_limit = _spin(0, 200, self.cfg.get("chatImageLimit", 10))
+        self.spin_recall_k = _spin(1, 20, self.cfg.get("memoryRecallK", 8))
         form.addRow("对话记忆轮数", self.spin_rounds)
         form.addRow("配图候选上限", self.spin_img_limit)
+        form.addRow("记忆召回条数", self.spin_recall_k)
         return page
 
     # ---------------------------------------------------------- 语音
@@ -460,6 +462,7 @@ class SettingsDialog(QDialog):
         cfg["hitPassthrough"] = self.cb_hit.isChecked()
         cfg["chatMemoryRounds"] = int(self.spin_rounds.value())
         cfg["chatImageLimit"] = int(self.spin_img_limit.value())
+        cfg["memoryRecallK"] = int(self.spin_recall_k.value())
         cfg["voiceEnabled"] = self.cb_voice.isChecked()
         cfg["voiceName"] = self.combo_voice.currentData() or tts.DEFAULT_VOICE
         cfg["whisperModel"] = {"provider": self.edit_whisper_provider.text().strip(),

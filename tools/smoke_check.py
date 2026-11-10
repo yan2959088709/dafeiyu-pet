@@ -7289,6 +7289,97 @@ def _():
         pass
 
 
+@check("memory_recall: 相关度/衰减/legacy/空context/K截断")
+def _():
+    import time as _t
+    from pet import memory_recall as M
+    now = _t.time()
+    facts = [M.Fact("喜欢喝奶茶", ts=now), M.Fact("喜欢咖啡", ts=now),
+             M.Fact("在汕头上班", ts=now)]
+    picked = M.score_facts(facts, "今天喝了奶茶", now, k=1)
+    assert picked and picked[0].text == "喜欢喝奶茶", [f.text for f in picked]
+    picked = M.score_facts([M.Fact("喜欢喝奶茶", ts=now - 30 * 86400),
+                            M.Fact("喜欢喝奶茶", ts=now)], "", now, k=1)
+    assert picked[0].ts == now, picked[0]
+    picked = M.score_facts(["a", "b"], "", now, k=5)
+    assert {f.text for f in picked} == {"a", "b"}
+    picked = M.score_facts(["old", "new"], "", now, k=1)
+    assert picked[0].text == "new", picked[0]
+    assert len(M.score_facts(["f%d" % i for i in range(12)], "", now, k=3)) == 3
+    assert M.score_facts([], "x", now) == []
+    # 全不相关 → recency 保底，不返回空
+    assert len(M.score_facts(["喜欢喝奶茶", "在汕头上班"], "今天下雨", now, k=2)) == 2
+
+
+@check("memory: legacy facts 解析零迁移")
+def _():
+    from pet.memory import parse_facts
+    facts, meta = parse_facts({"facts": ["喜欢喝奶茶", "在汕头上班"]})
+    assert facts == ["喜欢喝奶茶", "在汕头上班"]
+    assert set(meta) == set(facts)
+    assert all(v == {"ts": 0.0, "last_access": 0.0, "hits": 0}
+               for v in meta.values()), meta
+    facts, meta = parse_facts({"facts": [{"text": "喜欢猫", "ts": 123, "hits": 4}]})
+    assert facts == ["喜欢猫"] and meta["喜欢猫"]["ts"] == 123
+    assert meta["喜欢猫"]["hits"] == 4
+    assert parse_facts({}) == ([], {})
+
+
+@check("memory: 召回命中回写 hits/last_access 落盘")
+def _():
+    import json
+    from pet.storage import P
+    w = CTX["win"]
+    old_facts = list(getattr(w, "facts", []) or [])
+    old_meta = dict(getattr(w, "_fact_meta", {}) or {})
+    old_k = w.cfg.get("memoryRecallK", 8)
+    old_hist = w.chat_history
+    try:
+        w.facts = ["喜欢喝奶茶", "在汕头上班", "喜欢猫"]
+        w._fact_meta = {}
+        w.cfg["memoryRecallK"] = 2
+        w.chat_history = []
+        picked = w._recall_facts("今天想喝奶茶")
+        assert picked[0] == "喜欢喝奶茶", picked
+        assert len(picked) == 2, picked
+        assert w._fact_meta["喜欢喝奶茶"]["hits"] == 1
+        assert w._fact_meta["喜欢喝奶茶"]["last_access"] > 0
+        data = json.load(open(P.memory, encoding="utf-8"))
+        assert data["fact_meta"]["喜欢喝奶茶"]["hits"] == 1, data.get("fact_meta")
+    finally:
+        w.facts = old_facts
+        w._fact_meta = old_meta
+        w.cfg["memoryRecallK"] = old_k
+        w.chat_history = old_hist
+        with w._mem_lock:
+            w._save_mem()
+
+
+@check("chat: 提示词记忆段按相关度 top-K")
+def _():
+    w = CTX["win"]
+    old_facts = list(getattr(w, "facts", []) or [])
+    old_meta = dict(getattr(w, "_fact_meta", {}) or {})
+    old_k = w.cfg.get("memoryRecallK", 8)
+    old_hist = w.chat_history
+    try:
+        w.facts = ["喜欢喝奶茶", "在汕头上班", "喜欢猫", "害怕打雷"]
+        w._fact_meta = {}
+        w.cfg["memoryRecallK"] = 1
+        w.chat_history = []
+        sp = w._build_system_prompt("今天想喝奶茶")
+        assert "喜欢喝奶茶" in sp, sp
+        assert "在汕头上班" not in sp, sp
+        assert "喜欢猫" not in sp, sp
+    finally:
+        w.facts = old_facts
+        w._fact_meta = old_meta
+        w.cfg["memoryRecallK"] = old_k
+        w.chat_history = old_hist
+        with w._mem_lock:
+            w._save_mem()
+
+
 # ---------------------------------------------------------------- 运行器
 def main():
     ap = argparse.ArgumentParser()

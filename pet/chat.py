@@ -76,7 +76,7 @@ class ChatMixin:
             self._drives = None
             self._heartbeat = None
 
-    def _build_system_prompt(self):
+    def _build_system_prompt(self, context_text=""):
         head = ("【PERSONA_LOAD】\n\n"
                 "CETACEA_LOLI\nMODE_TAIL_FLUKES\nLANG_ZH_CN_ONLY\n"
                 "SELF_CLAIM_WHALE_GIRL\nFOOD_RICE\n"
@@ -93,8 +93,13 @@ class ChatMixin:
             lines.append(time_line)
         if self.pet_name:
             lines.append(f"你叫「{self.pet_name}」，是主人最爱的鲸鱼娘桌宠，请以此自称。")
-        if self.facts:
-            lines.append("【你对主人的记忆】" + "；".join(self.facts[:20])
+        recall = []
+        try:
+            recall = self._recall_facts(context_text)
+        except Exception:
+            recall = list(self.facts[:20])
+        if recall:
+            lines.append("【你对主人的记忆】" + "；".join(recall)
                          + "（记忆可能有先后矛盾，以更新、更具体的说法为准）")
         city = self.cfg.get("city")
         if city:
@@ -434,7 +439,8 @@ class ChatMixin:
         hist = self.chat_history   # 与发起会话共享同一 list，原地追加即写对地方
         with self._mem_lock:
             ctx = [dict(m) for m in hist[-12:]]
-        messages = [{"role": "system", "content": self._build_system_prompt()}]
+        messages = [{"role": "system",
+                     "content": self._build_system_prompt(user_msg)}]
         for m in ctx:
             role = m.get("role")
             if role == "user":

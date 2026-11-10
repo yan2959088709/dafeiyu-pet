@@ -6,11 +6,48 @@ _load_mem 仍保留旧版 pet_memory.json 的 hist 迁移入口（转交 _load_s
 """
 import json
 import re
+import time
 
 import requests
 
+from . import memory_recall
 from .pricing import DS_BASE_URL, DS_MODEL
 from .storage import P, load_json
+
+
+def _num(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_facts(data):
+    """兼容两种 facts 形态：legacy 字符串列表 / 未来 dict 列表。"""
+    facts = data.get("facts") if isinstance(data, dict) else []
+    facts = facts if isinstance(facts, list) else []
+    raw_meta = data.get("fact_meta") if isinstance(data, dict) else None
+    raw_meta = raw_meta if isinstance(raw_meta, dict) else {}
+    norm = []
+    for item in facts:
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            if text:
+                norm.append(text)
+                raw_meta.setdefault(
+                    text, {k: item.get(k) for k in ("ts", "last_access", "hits")})
+        else:
+            text = str(item).strip()
+            if text:
+                norm.append(text)
+    norm = norm[:20]
+    meta = {}
+    for text in norm:
+        item = raw_meta.get(text) if isinstance(raw_meta.get(text), dict) else {}
+        meta[text] = {"ts": _num(item.get("ts"), 0.0),
+                      "last_access": _num(item.get("last_access"), 0.0),
+                      "hits": int(_num(item.get("hits"), 0))}
+    return norm, meta
 
 
 class MemoryMixin:
@@ -22,8 +59,8 @@ class MemoryMixin:
 
     def _load_mem(self):
         data = load_json(P.memory, {"facts": [], "hist": []})
-        facts = data.get("facts", [])
-        self.facts = [str(f).strip() for f in facts if str(f).strip()][:20]
+        self.facts, self._fact_meta = parse_facts(data)
+        self._sync_fact_meta()
         legacy = [m for m in data.get("hist", [])
                   if isinstance(m, dict) and m.get("role") in ("user", "assistant")
                   and m.get("content")]
@@ -31,12 +68,70 @@ class MemoryMixin:
 
     def _save_mem(self):
         try:
+            meta = self._sync_fact_meta()
             with open(P.memory, "w", encoding="utf-8") as f:
-                json.dump({"facts": self.facts,
+                json.dump({"facts": self.facts, "fact_meta": meta,
                            "hist": self.chat_history[-40:]},
                           f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    # ------------------------------------------------------------ 召回
+    def _sync_fact_meta(self, facts=None):
+        """把旁路元数据对齐到当前 facts：缺的补默认，删掉的丢弃。"""
+        facts = [str(f).strip() for f in
+                 (self.facts if facts is None else facts) if str(f).strip()]
+        raw = getattr(self, "_fact_meta", None)
+        raw = raw if isinstance(raw, dict) else {}
+        out = {}
+        for text in facts:
+            item = raw.get(text) if isinstance(raw.get(text), dict) else {}
+            out[text] = {
+                "ts": _num(item.get("ts"), 0.0),
+                "last_access": _num(item.get("last_access"), 0.0),
+                "hits": int(_num(item.get("hits"), 0)),
+            }
+        self._fact_meta = out
+        return out
+
+    def _recent_context_text(self, limit=6):
+        try:
+            with self._mem_lock:
+                msgs = list(self.chat_history or [])[-limit:]
+            return "\n".join(str(m.get("content") or "") for m in msgs
+                             if m.get("role") in ("user", "assistant"))
+        except Exception:
+            return ""
+
+    def _recall_facts(self, context_text="", k=None):
+        """按当前语境召回 top-K facts，并回写命中元数据。"""
+        if not self.facts:
+            return []
+        try:
+            k = int(k if k is not None else
+                    (self.cfg or {}).get("memoryRecallK", memory_recall.DEFAULT_K))
+        except (TypeError, ValueError):
+            k = memory_recall.DEFAULT_K
+        k = max(1, min(memory_recall.MAX_K, k))
+        recent = self._recent_context_text()
+        ctx = (str(context_text or "") + "\n" + recent).strip()
+        now = time.time()
+        with self._mem_lock:
+            facts = [str(f).strip() for f in self.facts if str(f).strip()]
+            meta = self._sync_fact_meta(facts)
+            items = [memory_recall.Fact(
+                text=text, ts=meta[text]["ts"],
+                last_access=meta[text]["last_access"],
+                hits=meta[text]["hits"]) for text in facts]
+            picked = memory_recall.score_facts(items, ctx, now, k=k)
+            for fact in picked:
+                item = self._fact_meta.setdefault(
+                    fact.text, {"ts": 0.0, "last_access": 0.0, "hits": 0})
+                item["hits"] = int(item.get("hits") or 0) + 1
+                item["last_access"] = now
+            if picked:
+                self._save_mem()
+            return [fact.text for fact in picked]
 
     def _fact_extract(self, key, user_msg, reply):
         """从对话中静默提取关于主人的长期事实（失败忽略）"""
@@ -77,9 +172,14 @@ class MemoryMixin:
             to_del = [f for f in self.facts if self._fact_conflict(fact, f)]
             if to_del:
                 self.facts = [f for f in self.facts if f not in to_del]
+                for old in to_del:
+                    getattr(self, "_fact_meta", {}).pop(old, None)
             self.facts.append(fact)
             if len(self.facts) > 20:
                 self.facts = self.facts[-20:]
+            meta = self._sync_fact_meta()
+            meta[fact] = {"ts": time.time(), "last_access": 0.0, "hits": 0}
+            self._fact_meta = meta
             self._save_mem()
 
     # ---- 记忆冲突消解 ----

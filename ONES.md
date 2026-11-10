@@ -215,7 +215,7 @@
 
 ### TASK-013: Stage 2a 记忆相关度召回（替代 facts 全量注入）
 - **Executor**: claude
-- **Status**: [ ]
+- **Status**: [~]
 - **Dependencies**: TASK-010
 - **Contract**: 本块 [Blueprint]（2026-11-09 主会话设计，Stage 2 第一捻）
 - **Acceptance**:
