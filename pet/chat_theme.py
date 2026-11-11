@@ -30,13 +30,34 @@ BUBBLE_PAD_X = 15           # 气泡内文字左右边距（旧 12）
 BUBBLE_PAD_Y = 11           # 气泡内文字上下边距（旧 9）
 BUBBLE_GAP = 10             # 相邻气泡间距（旧 2）
 
-AVATAR_W = 40               # 头像格宽（36px 图 + 4px 间距）
-TAIL_W = 8                  # 尖角格宽
-BUBBLE_MAX = 236            # 气泡最大宽度
+# 气泡宽度按**比例**分配，不再是写死的像素值：旧实现把气泡顶死在 236px，
+# 面板拉宽后气泡占比一路掉到 34%、右侧空一大块；面板拉窄时又挤得一行几个字。
+# 气泡拿 BUBBLE_RATIO 份，剩下的份额给尾部余量格（percent 宽度，Qt 富文本
+# 支持，且短消息仍然收缩贴合）。
+AVATAR_W = 40               # 头像格宽（36px 图 + 4px 间距）——图片固定，不参与比例
+TAIL_W = 8                  # 尖角格宽（8px PNG）——同上
+BUBBLE_RATIO = 0.78         # 气泡目标占版心宽度比例
+BUBBLE_ABS_MAX = 560        # 绝对上限：再宽一行太长难读，多出的份额还给余量格
+BUBBLE_MIN = 120            # 绝对下限
 
 DIVIDER_COLOR = "#9aa5bb"   # 时间分隔行
 
 _TAIL_DIR = os.path.join(P.sprites, "dsh-pet", "chat")
+
+
+def spacer_pct(inner_w):
+    """尾部余量格占版心的百分比。
+
+    余量 = 1 − 气泡比例 − 固定格（头像 40 + 尖角 8）占比。固定格是图片，
+    没法按比例缩放，所以余量比例随宽度变化：窄面板余量小、宽面板余量大，
+    但气泡占比始终趋近 BUBBLE_RATIO。
+    """
+    inner_w = max(BUBBLE_MIN + AVATAR_W + TAIL_W, int(inner_w))
+    ratio = BUBBLE_RATIO
+    if inner_w * ratio > BUBBLE_ABS_MAX:
+        ratio = BUBBLE_ABS_MAX / float(inner_w)
+    pct = (1.0 - ratio) * 100.0 - 100.0 * (AVATAR_W + TAIL_W) / inner_w
+    return max(1, min(70, int(round(pct))))
 
 
 def _file_url(path):
@@ -103,21 +124,20 @@ def bubble_html(text, who, inner_w):
     """一条 QQ 风格气泡：who="pet" 左侧白气泡，"user" 右侧蓝气泡。
 
     inner_w 是消息流版心的可用宽度（面板宽 − 浏览器内边距），面板可缩放后
-    它不再是常量。限宽用「气泡格 auto + 尾部 spacer 格固定」实现：短消息
-    气泡随内容收窄，长消息在 spacer 处换行——Qt 富文本不支持 max-width，
-    这是等效替代。
+    它不再是常量。气泡与余量按百分比分配（见 spacer_pct），所以气泡占比不随
+    面板宽度漂移；短消息仍然收缩贴合——表格不设宽度，余量格用百分比占位。
 
     text 必须是已转义、<br> 已就绪的气泡内容（表情/图片 <img> 由调用方拼入）。
     尖角是 PNG 资源：Qt 富文本既没有尖角字形（微软雅黑无 U+25C0），也不支持
     CSS 边框三角技巧，两者都实测渲染不出来。
     """
-    spacer = max(8, int(inner_w) - AVATAR_W - TAIL_W - BUBBLE_MAX)
+    spacer = spacer_pct(inner_w)
     if who == "user":
         user_av = _avatar_img("user") or (
             '<div class="av" style="background:#8fa3c8;border-radius:8px;'
             'height:36px;line-height:36px;">主</div>')
         return ('<table cellspacing="0" cellpadding="0" align="right"><tr>'
-                '<td width="%d"></td>'
+                '<td width="%d%%"></td>'
                 '<td><div style="background:%s;'
                 'border-radius:%dpx;border-top-right-radius:%dpx;'
                 'padding:%dpx %dpx;color:%s;">%s</div></td>'
@@ -139,7 +159,7 @@ def bubble_html(text, who, inner_w):
             '<td><div style="background:%s;border:1px solid %s;'
             'border-radius:%dpx;border-top-left-radius:%dpx;'
             'padding:%dpx %dpx;color:%s;">%s</div></td>'
-            '<td width="%d"></td>'
+            '<td width="%d%%"></td>'
             '</tr></table>'
             % (AVATAR_W, pet_av, TAIL_W,
                _file_url(os.path.join(_TAIL_DIR, "tail_left.png")),

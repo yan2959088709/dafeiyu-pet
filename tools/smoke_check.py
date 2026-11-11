@@ -3028,6 +3028,22 @@ def _():
     assert T.PET_BUBBLE_BORDER != T.DEFAULT_BG_COLOR, "宠物气泡不能和背景同色"
     assert T.USER_BUBBLE_BG.startswith("#"), "用户气泡用实色，任何背景都读得清"
 
+    # 宽度按比例分配：气泡占比不能随面板宽度漂移（旧实现顶死 236px，
+    # 面板拉宽后气泡只占 34%、右侧空一大块，一行只剩几个字）
+    seen = {}
+    for inner in (302, 362, 402, 502, 682):
+        pct = T.spacer_pct(inner)
+        bubble = inner - T.AVATAR_W - T.TAIL_W - inner * pct / 100.0
+        ratio = bubble / float(inner)
+        seen[inner] = ratio
+        assert ratio >= 0.70, "版心 %d 下气泡只占 %.0f%%，太窄" % (inner, ratio * 100)
+        assert pct >= 1 and pct <= 70, pct
+    assert max(seen.values()) - min(seen.values()) < 0.12, \
+        "气泡占比应基本恒定，实测 %s" % seen
+    assert 'width="%d%%"' % T.spacer_pct(344) in pet_html, \
+        "余量格必须用百分比宽度，不能用写死像素"
+    assert 'width="%d%%"' % T.spacer_pct(344) in user_html
+
     # 背景：默认色 / 非法值回退 / 图片铺满
     assert T.bg_color({}) == T.DEFAULT_BG_COLOR
     assert T.bg_color({"chatBgColor": "red"}) == T.DEFAULT_BG_COLOR
