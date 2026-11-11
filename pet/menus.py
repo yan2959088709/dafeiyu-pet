@@ -544,10 +544,19 @@ class MenuMixin:
 
     def toggle_visible(self):
         if self.isVisible():
+            # 隐藏前先收掉所有二级浮层：owned 窗口虽会跟着隐藏，但无父级的
+            # 浮层（积分弹窗等）会留在屏幕上挡点击，且再显示时对不上位置
+            layers = getattr(self, "_layers", None)
+            if layers is not None:
+                layers.close_all()
             self.hide()
         else:
             self.show()
-            self.raise_()
+            layers = getattr(self, "_layers", None)
+            if layers is not None:
+                layers.restack()
+            else:
+                self.raise_()
 
     def quit_app(self):
         # 主动退出先留标记：看门狗（pet-watchdog.bat）看到 quit.flag 才不

@@ -3,7 +3,8 @@
 
 与上游的对应关系：
 - 置顶看门狗：每 5s 重申一次置顶（上游 1s tick / 5s 重申、默认关；这里默认跟随
-  topmost 配置，只在窗口可见时重申）。
+  topmost 配置，只在窗口可见时重申）。**重申前先问图层保镖**：有二级面板/弹窗
+  开着时不 raise，否则会把无父级的浮层埋到面板底下（详见 pet/layers.py）。
 - 多屏几何：抛掷/定位/改尺寸后把窗口夹回「有交集」的那块屏，等价上游
   clampPointToRegion + displays 事件；屏拓扑变化（插/拔屏、分辨率、主屏切换）
   同样重算，但先做 300ms 去抖（上游 O8 同参数），避免连续事件里反复跳位。
@@ -33,6 +34,8 @@ class DesktopMixin:
     """PetWindow 的桌面集成能力。"""
 
     def _desktop_init(self):
+        from pet.layers import LayerStack
+        self._layers = LayerStack(self)      # 二级面板/弹窗登记处
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self._topmost_tick)
         self._topmost_timer.start(TOPMOST_TICK_MS)
@@ -50,15 +53,25 @@ class DesktopMixin:
         self._bind_screen_signals()
 
     def _topmost_tick(self):
-        """定期 raise：某些全屏程序/桌面重组后置顶会被压下去。"""
+        """定期重申置顶：某些全屏程序/桌面重组后置顶会被压下去。"""
         if not self.cfg.get("topmost", True) or not self.isVisible():
+            return
+        # 二级面板/弹窗开着时一律不许 raise：Windows 上 raise 属主窗口会把
+        # 「属主 + 它全部 owned 窗口」整体提到 Z 序顶，无父级的表情浮层/喂食
+        # 面板就被压到聊天面板底下，看不见也点不到——用户侧就是「页面锁死」。
+        # 这些浮层自己带 stays-on-top，本来也不需要宠物帮忙重申。
+        layers = getattr(self, "_layers", None)
+        if layers is not None and layers.busy():
             return
         now = time.time()
         if now - self._last_topmost_at < TOPMOST_REASSERT_SEC:
             return
         self._last_topmost_at = now
         try:
-            self.raise_()
+            if layers is not None:
+                layers.restack()      # 属主先提、面板后提，顺序不会反
+            else:
+                self.raise_()
         except Exception:
             pass
 

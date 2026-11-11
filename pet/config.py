@@ -181,6 +181,13 @@ DEFAULT_CFG = {
     "aiShellTimeout": 15,
     "aiLocalFetch": True,
     "aiDshEnabled": False,
+    # ---- 聊天面板外观（背景纯色/图片 + 可记尺寸）----
+    # 登记进 DEFAULT_CFG 才能被 save_config 落盘：背景是主人随时要换的，
+    # 尺寸是主人随手拖的，落不了盘就等于「每次打开都还原」
+    "chatBgColor": "#e7ecf7",
+    "chatBgImage": "",
+    "chatW": 380,
+    "chatH": 520,
     "watchDirs": [],
     "sandbox_dirs": [],
 }

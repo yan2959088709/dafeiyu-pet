@@ -141,7 +141,77 @@ class SettingsDialog(QDialog):
         form.addRow("对话记忆轮数", self.spin_rounds)
         form.addRow("配图候选上限", self.spin_img_limit)
         form.addRow("记忆检索条数", self.spin_recall_k)
+        form.addRow(self._chat_look_group())
         return page
+
+    # ---------------------------------------------------------- 聊天外观
+    def _chat_look_group(self):
+        """聊天背景：纯色 + 本地图片，保存后即时生效。
+
+        原来是写死的 #f5f7fc，白色气泡压在上面几乎看不出来；这里让主人自己挑，
+        气泡配色在 pet/chat_theme.py 里已经按「任何背景都读得清」调过。
+        """
+        from pet import chat_theme
+        box = QGroupBox("聊天背景")
+        lay = QVBoxLayout(box)
+
+        row = QHBoxLayout()
+        self.btn_bg_color = QPushButton()
+        self.btn_bg_color.setToolTip("选择聊天背景纯色")
+        self.btn_bg_color.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bg_color.setFixedSize(96, 26)
+        self._bg_color = chat_theme.bg_color(self.cfg)
+        self._paint_bg_color()
+        self.btn_bg_color.clicked.connect(self._pick_bg_color)
+        row.addWidget(QLabel("背景颜色"))
+        row.addWidget(self.btn_bg_color)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        row2 = QHBoxLayout()
+        self.edit_bg_image = QLineEdit(
+            str(self.cfg.get("chatBgImage") or ""))
+        self.edit_bg_image.setPlaceholderText("留空 = 只用上面的纯色")
+        self.edit_bg_image.setReadOnly(True)
+        btn_pick = QPushButton("选择图片…")
+        btn_pick.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_pick.clicked.connect(self._pick_bg_image)
+        btn_clear = QPushButton("清除")
+        btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear.clicked.connect(lambda: self.edit_bg_image.setText(""))
+        row2.addWidget(self.edit_bg_image, 1)
+        row2.addWidget(btn_pick)
+        row2.addWidget(btn_clear)
+        lay.addLayout(row2)
+        lay.addWidget(QLabel(
+            "图片会铺满聊天消息区；气泡仍用高对比底色，文字读得清。\n"
+            "聊天框大小：拖动面板右下角 ⤡ 或四边即可调整，尺寸会自动记住。"))
+        return box
+
+    def _paint_bg_color(self):
+        self.btn_bg_color.setStyleSheet(
+            "QPushButton{background:%s;border:1px solid #c9d2e6;border-radius:6px;"
+            "color:%s;font-size:12px;}" % (self._bg_color, "#26303e"))
+        self.btn_bg_color.setText(self._bg_color)
+
+    def _pick_bg_color(self):
+        from PySide6.QtGui import QColor
+        from PySide6.QtWidgets import QColorDialog
+        cur = QColor(self._bg_color)
+        if not cur.isValid():
+            cur = QColor("#e7ecf7")
+        picked = QColorDialog.getColor(cur, self, "聊天背景颜色")
+        if picked.isValid():
+            self._bg_color = picked.name()
+            self._paint_bg_color()
+
+    def _pick_bg_image(self):
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择聊天背景图片", "",
+            "图片 (*.png *.jpg *.jpeg *.webp *.bmp)")
+        if path:
+            self.edit_bg_image.setText(path)
 
     # ---------------------------------------------------------- 自主与AI
     def _tab_autonomy(self):
@@ -554,6 +624,8 @@ class SettingsDialog(QDialog):
         cfg["chatMemoryRounds"] = int(self.spin_rounds.value())
         cfg["chatImageLimit"] = int(self.spin_img_limit.value())
         cfg["memoryRecallK"] = int(self.spin_recall_k.value())
+        cfg["chatBgColor"] = self._bg_color
+        cfg["chatBgImage"] = self.edit_bg_image.text().strip()
         # 自主与AI：心跳段只改 enabled/interval，其余代谢键原样保留
         seg = dict(cfg.get("heartbeat") or {})
         seg["enabled"] = self.cb_hb.isChecked()
@@ -670,6 +742,13 @@ class SettingsDialog(QDialog):
         wins = mgr.windows() if mgr is not None else [self.owner]
         for win in wins:
             font_ui.apply_to_window(win)
+            # 聊天面板热更新：背景色/背景图改完立刻看到，不用重开面板
+            panel = getattr(win, "chat_panel", None)
+            if panel is not None:
+                try:
+                    panel._apply_chat_theme()
+                except Exception:
+                    pass
             # 心跳热更新：活配置/引擎/身体段快照三处同步（与内容调度页同一条路），
             # 否则保存后 AI 的自我描述还停在旧间隔上
             apply_hb = getattr(win, "_apply_heartbeat_cfg", None)

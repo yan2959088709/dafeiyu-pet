@@ -16,8 +16,9 @@ FRAME_MS = 16
 
 
 class ScorePopup(QWidget):
-    def __init__(self, score, center_x, center_y, size=462, rng=None):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint
+    def __init__(self, score, center_x, center_y, size=462, rng=None,
+                 parent=None):
+        super().__init__(parent, Qt.WindowType.FramelessWindowHint
                          | Qt.WindowType.Tool
                          | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)

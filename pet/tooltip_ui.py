@@ -12,8 +12,8 @@ from pet import overlay
 
 
 class PetTooltip(QWidget):
-    def __init__(self):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.FramelessWindowHint
                          | Qt.WindowType.Tool
                          | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)

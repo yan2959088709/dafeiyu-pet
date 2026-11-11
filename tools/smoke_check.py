@@ -2606,11 +2606,14 @@ def _():
     panel = w.chat_panel
 
     # 结构：AI=logo 头像+左尖角+白气泡；用户=右尖角+蓝气泡+「主」头像+整体右对齐
-    pet_html = mod.chat_bubble_html("你好", "pet")
-    user_html = mod.chat_bubble_html("你好", "user")
-    assert mod._file_url(mod.LOGO_PATH) in pet_html, "AI 气泡缺 logo 头像"
+    theme = mod.chat_theme
+    pet_html = theme.bubble_html("你好", "pet", panel._inner_w)
+    user_html = theme.bubble_html("你好", "user", panel._inner_w)
+    assert theme._file_url(mod.LOGO_PATH) in pet_html, "AI 气泡缺 logo 头像"
     assert "tail_left.png" in pet_html and "tail_right.png" in user_html, "缺 PNG 尖角"
-    assert "#ffffff" in pet_html and "#5b8cff" in user_html
+    assert "rgba(255,255,255" in pet_html and "#4a7df0" in user_html
+    assert "border-radius:16px" in pet_html and "border-radius:16px" in user_html, \
+        "气泡应改成大圆角（旧值是 12px）"
     assert 'align="right"' in user_html, "用户气泡应整体右对齐"
 
     # 时间分隔：间隔 > 300s 才插，且与消息同块（「一块=一条」契约不能破）
@@ -2618,12 +2621,13 @@ def _():
     now = time.time()
     panel.append_msg("pet", "早", ts=now - 4000)
     assert len(panel._msg_blocks) == 1, "分隔行不能单独成块"
-    assert "border-top:1px solid #e6eaf2" in panel._msg_blocks[-1], "跨时段缺时间分隔"
+    assert "border-top:1px solid %s" % theme.DIVIDER_COLOR in panel._msg_blocks[-1], \
+        "跨时段缺时间分隔"
     assert "早" in panel._msg_blocks[-1]
     panel.append_msg("user", "接着聊", ts=now - 4000 + 30)
     assert len(panel._msg_blocks) == 2
-    assert "border-top:1px solid #e6eaf2" not in panel._msg_blocks[-1], \
-        "5 分钟内不该再插分隔（注意别用 border-top 裸串断言：气泡圆角里也有）"
+    assert "border-top:1px solid %s" % theme.DIVIDER_COLOR not in panel._msg_blocks[-1], \
+        "5 分钟内不该再插分隔"
 
     # 媒体内嵌：表情/图片 <img> 与文字同一个块；纯媒体消息不留占位文字
     sticker = "_smoke_sticker.png"
@@ -2697,23 +2701,27 @@ def _():
         assert out.pixelColor(avatars.SIZE // 2, avatars.SIZE // 2).alpha() == 255
 
         # 气泡渲染使用自定义头像；AI 侧未设置时回退项目 logo
-        assert m._file_url(path) in m.chat_bubble_html("hi", "user")
-        assert m._file_url(path) not in m.chat_bubble_html("hi", "pet")
-        assert m._file_url(m.LOGO_PATH) in m.chat_bubble_html("hi", "pet")
+        assert m.chat_theme._file_url(path) in \
+            m.chat_theme.bubble_html("hi", "user", panel._inner_w)
+        assert m.chat_theme._file_url(path) not in \
+            m.chat_theme.bubble_html("hi", "pet", panel._inner_w)
+        assert m.chat_theme._file_url(m.LOGO_PATH) in \
+            m.chat_theme.bubble_html("hi", "pet", panel._inner_w)
         assert avatars.effective("pet") == m.LOGO_PATH
         assert avatars.effective("user") == path
 
         # 改头像后历史消息整体重绘（旧块里烧的是旧路径，不清掉会拖旧图）
         panel.clear_view()
         panel.append_msg("user", "旧消息")
-        assert m._file_url(path) in panel._msg_blocks[0]
+        assert m.chat_theme._file_url(path) in panel._msg_blocks[0]
         avatars.clear("user")
         assert avatars.custom_path("user") is None
         assert not avatars.clear("user"), "重复清除应返回 False"
         assert avatars.effective("user") is None
-        assert "主</div>" in m.chat_bubble_html("hi", "user"), "默认应回退「主」占位"
+        assert "主</div>" in m.chat_theme.bubble_html("hi", "user", panel._inner_w), \
+            "默认应回退「主」占位"
         panel._on_avatar_changed()
-        assert m._file_url(path) not in "".join(panel._msg_blocks), \
+        assert m.chat_theme._file_url(path) not in "".join(panel._msg_blocks), \
             "改头像后应重绘历史气泡"
         panel.clear_view()
     finally:
@@ -2944,6 +2952,127 @@ def _():
         w.isVisible = old_vis
         w.raise_ = old_raise
     w.snap_into_screen()
+
+
+@check("layers: 二级面板开着时看门狗让路 + 弹窗挂宿主名下")
+def _():
+    """置顶看门狗每 5s raise 一次，会把无父级的浮层埋到面板底下——用户侧
+    表现就是「点了表情，聊天页面点不动、表情页又看不见」的锁死。这里钉住
+    「有二级面板就不 raise」和「浮层挂宿主名下」两条结构性保证。
+    """
+    from pet import layers as L
+    w = CTX["win"]
+    panel = w.chat_panel
+
+    # LayerStack：空转不忙、开面板才忙、关掉就恢复
+    st = L.LayerStack(panel)
+    assert not st.busy(), "没有二级面板时不该判定忙碌"
+    probe = getattr(panel, "sticker_panel", None)
+    if probe is None:
+        probe = CTX["mod"].StickerPanel(lambda _t: None, panel)
+    st.add(probe)
+    assert not st.busy(), "面板还没显示不该算忙碌"
+    probe.popup_at(0, 0)
+    assert st.busy(), "二级面板可见时应判定忙碌"
+    st.restack()          # 顺序不能抛异常
+    probe.close()
+    assert not st.busy(), "面板关掉后应恢复"
+    st.remove(probe)
+    assert probe.parent() is panel, "表情浮层必须挂在聊天面板名下（owned window）"
+
+    # 看门狗：聊天面板开着时不 raise
+    w.isVisible = lambda: True
+    w.cfg["topmost"] = True
+    w._last_topmost_at = 0.0
+    raised = []
+    old_raise = w.raise_
+    w.raise_ = lambda: raised.append(1)
+    old_vis = panel.isVisible
+    panel.isVisible = lambda: True
+    try:
+        w._topmost_tick()
+        assert not raised, "二级面板开着时看门狗不许 raise（会把浮层埋掉）"
+        panel.isVisible = lambda: False
+        w._last_topmost_at = 0.0
+        w._topmost_tick()
+        assert raised, "面板都关了应恢复重申置顶"
+    finally:
+        panel.isVisible = old_vis
+        w.raise_ = old_raise
+        w.isVisible = old_vis
+
+    # 喂食面板 / token 悬浮窗同样挂在宠物名下
+    assert w.food_panel.parent() is w
+    assert w.token_window.parent() is w
+
+
+@check("chat_theme: 气泡大圆角/可读配色 + 背景纯色与图片 + 面板可缩放")
+def _():
+    """气泡原来是 12px 圆角、9px/12px 内边距、白色气泡压 #f5f7fc 背景几乎
+    看不出来；面板又是 setFixedSize(360,480) 完全不能改大小。这里钉住新值。
+    """
+    import os
+    import tempfile
+    from pet import chat_theme as T
+    w = CTX["win"]
+    panel = w.chat_panel
+
+    # 气泡：大圆角 + 足够内边距 + 两侧都不是「和背景同色」
+    assert T.BUBBLE_RADIUS == 16 and T.BUBBLE_TAIL_RADIUS == 5
+    assert T.BUBBLE_PAD_X >= 14 and T.BUBBLE_PAD_Y >= 10
+    assert T.BUBBLE_GAP >= 8, "相邻气泡间距太小会挤成一片"
+    pet_html = T.bubble_html("你好", "pet", 344)
+    user_html = T.bubble_html("你好", "user", 344)
+    assert "border-radius:16px" in pet_html and "border-radius:16px" in user_html
+    assert "padding:11px 15px" in pet_html and "padding:11px 15px" in user_html
+    assert T.PET_BUBBLE_BORDER != T.DEFAULT_BG_COLOR, "宠物气泡不能和背景同色"
+    assert T.USER_BUBBLE_BG.startswith("#"), "用户气泡用实色，任何背景都读得清"
+
+    # 背景：默认色 / 非法值回退 / 图片铺满
+    assert T.bg_color({}) == T.DEFAULT_BG_COLOR
+    assert T.bg_color({"chatBgColor": "red"}) == T.DEFAULT_BG_COLOR
+    assert T.bg_color({"chatBgColor": "#abc"}) == "#aabbcc"
+    img = os.path.join(tempfile.gettempdir(), "_smoke_chat_bg.png")
+    with open(img, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+    try:
+        css = T.chat_css({"chatBgColor": "#112233", "chatBgImage": img})
+        assert "#112233" in css and "background-image" in css, css
+        assert T.bg_image({"chatBgImage": img}) == img
+        assert T.bg_image({"chatBgImage": os.path.join(tempfile.gettempdir(),
+                                                      "_no_such.png")}) is None
+    finally:
+        os.remove(img)
+
+    # 面板：可缩放 + 有最小值 + 抓角真实接事件 + 尺寸落盘
+    assert not panel.minimumWidth() > 320 and panel.minimumWidth() >= 300
+    assert panel.minimumHeight() >= 380
+    grip = panel._grip
+    assert grip.parent() is panel, "缩放手抓必须是面板的子控件"
+    assert grip._panel is panel, "手抓要把拖动转嫁给面板"
+    was_visible = panel.isVisible()
+    if not was_visible:
+        panel.show()
+    try:
+        panel.resize(420, 560)
+        assert panel._container.width() == panel.width(), "容器要跟着面板走"
+        assert panel._grip.x() == panel.width() - panel._grip.width() - 4, \
+            "缩放手抓要贴在右下角"
+        from PySide6.QtCore import QPoint
+        panel._begin_resize("right-bottom", QPoint(0, 0))
+        panel._drag_resize(QPoint(60, 80))
+        assert panel.width() == 480 and panel.height() == 640, (panel.width(), panel.height())
+        assert panel._container.height() == panel.height(), "拖动中容器也要跟着走"
+        panel._end_resize()
+    finally:
+        if not was_visible:
+            panel.hide()
+    from pet import config as C
+    saved = C.load_config()
+    assert saved.get("chatW") == 480 and saved.get("chatH") == 640, \
+        "尺寸必须落盘，否则下次打开又变回去"
+    panel.resize(380, 520)
+    panel._save_size()
 
 
 @check("packaging: spec 可编译 + edge-tts 依赖 + 构建自检")

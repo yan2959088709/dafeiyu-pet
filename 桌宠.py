@@ -57,6 +57,7 @@ from pet.apiserver import ApiServer, PREFIX as API_PREFIX           # noqa: E402
 from pet import runtime_state as pet_runtime                        # noqa: E402
 from pet.service_hooks import ServiceHooksMixin, UiBridge           # noqa: E402
 from pet.desktop import DesktopMixin                                 # noqa: E402
+from pet.layers import LayerStack, autoclose                         # noqa: E402
 from pet.pointmove import PointPickMixin                              # noqa: E402
 from pet import lunar_table as pet_lunar                           # noqa: E402
 from pet import time_context as pet_time                           # noqa: E402
@@ -70,6 +71,7 @@ from pet import font_ui                                            # noqa: E402
 from pet import overlay                                            # noqa: E402
 from pet import stickers                                            # noqa: E402
 from pet import avatars                                             # noqa: E402
+from pet import chat_theme                                          # noqa: E402
 from pet.chat import ChatMixin                                      # noqa: E402
 from pet.motion import MotionMixin, TICK, MARGIN                    # noqa: E402
 from pet.gadget import GadgetMixin                                  # noqa: E402
@@ -186,24 +188,27 @@ class _PasteCatcher(QObject):
 class StickerPanel(QWidget):
     """表情选择浮层：可搜索的网格表情选择器。
 
-    点选后回调 on_pick(标签)，由调用方决定插入位置；ESC 或失焦关闭。
+    点选后回调 on_pick(标签)，由调用方决定插入位置；ESC / 点外面关闭。
+
+    窗口类型必须是 `Qt.Popup` 且**挂在聊天面板名下**：PopUp 天生压在属主之上、
+    点外面自动关闭、自带 ESC，不会出现「浮层被埋到面板底下点不到」的死局；
+    早先它是无父级的独立 stays-on-top 窗口，宠物每 5s 重申置顶时会被
+    SetWindowPos(HWND_TOP) 连owned 窗口一起压到聊天面板下面（详见 pet/layers.py）。
     """
 
-    def __init__(self, on_pick):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-                         | Qt.WindowType.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    def __init__(self, on_pick, parent=None):
+        super().__init__(parent, Qt.WindowType.Popup
+                         | Qt.WindowType.FramelessWindowHint)
+        self.setObjectName("stickerPopup")
+        self.setStyleSheet(
+            "#stickerPopup{background:#ffffff;border:1px solid #d5ddef;"
+            "border-radius:12px;}"
+            "QLineEdit{border:1px solid #c9d4e5;border-radius:8px;padding:4px 8px;"
+            "font-size:13px;background:#ffffff;color:#26303e;}"
+            "QLineEdit:focus{border:1px solid #5b8cff;outline:none;}")
         self._on_pick = on_pick
         self.setFixedSize(332, 396)
-        outer = QWidget(self)
-        outer.setObjectName("outer")
-        outer.setStyleSheet(
-            "#outer{background:#ffffff;border:1px solid #d5ddef;border-radius:12px;}"
-            "QLineEdit{border:1px solid #c9d4e5;border-radius:8px;padding:4px 8px;"
-            "font-size:13px;background:#ffffff;}"
-            "QLineEdit:focus{border:1px solid #5b8cff;outline:none;}")
-        outer.setGeometry(0, 0, self.width(), self.height())
-        v = QVBoxLayout(outer)
+        v = QVBoxLayout(self)
         v.setContentsMargins(10, 10, 10, 8)
         v.setSpacing(8)
         self.search = QLineEdit()
@@ -213,7 +218,10 @@ class StickerPanel(QWidget):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}"
+                                  "QScrollArea>QWidget>QWidget{background:transparent;}")
         self.grid_wrap = QWidget()
+        self.grid_wrap.setStyleSheet("background:transparent;")
         self.grid = QGridLayout(self.grid_wrap)
         self.grid.setContentsMargins(2, 2, 2, 2)
         self.grid.setSpacing(6)
@@ -238,6 +246,9 @@ class StickerPanel(QWidget):
             btn.setFixedSize(44, 44)
             btn.setToolTip(tag)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet("QPushButton{background:transparent;border:none;"
+                              "border-radius:8px;}"
+                              "QPushButton:hover{background:#eef1f8;}")
             pix = QPixmap(path)
             if not pix.isNull():
                 btn.setIcon(QIcon(pix))
@@ -250,43 +261,29 @@ class StickerPanel(QWidget):
                 row += 1
         if self.grid.count() == 0:
             tip = QLabel("没有匹配的表情")
-            tip.setStyleSheet("color:#98a2b8;font-size:12px;")
+            tip.setStyleSheet("color:#98a2b8;font-size:12px;background:transparent;")
             tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.grid.addWidget(tip, 0, 0, 1, cols)
 
     def _pick(self, tag):
-        self.hide()
+        self.close()
         if self._on_pick:
             self._on_pick(tag)
 
     def popup_at(self, x, y):
         """在屏幕坐标 (x, y) 处弹出；超界时回收到屏幕内。"""
-        geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-        x = max(geo.left(), min(x, geo.right() - self.width()))
-        y = max(geo.top(), min(y, geo.bottom() - self.height()))
+        scr = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        x = max(scr.left(), min(x, scr.right() - self.width()))
+        y = max(scr.top(), min(y, scr.bottom() - self.height()))
         self.move(x, y)
         self.show()
         self.raise_()
         self.search.setFocus()
         self.search.selectAll()
 
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
-        super().mousePressEvent(e)
-
-    def mouseMoveEvent(self, e):
-        if self._drag_pos is not None and e.buttons() & Qt.MouseButton.LeftButton:
-            self.move(e.globalPosition().toPoint() - self._drag_pos)
-        super().mouseMoveEvent(e)
-
-    def mouseReleaseEvent(self, e):
-        self._drag_pos = None
-        super().mouseReleaseEvent(e)
-
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
-            self.hide()
+            self.close()
         else:
             super().keyPressEvent(e)
 
@@ -295,10 +292,12 @@ class TokenStatsWindow(QWidget):
     """token 统计悬浮窗：半透明、不穿透、可拖动。
 
     显示 本轮/今日/累计 金额（数据来自 usage_ledger 记账与 calc_turn_cost）。
+    挂在 PetWindow 名下（owned window）：Windows 保证它恒在宠物之上，不会在
+    宠物每 5s 重申置顶时被压到底下去（详见 pet/layers.py）。
     """
 
-    def __init__(self):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
                          | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._drag_pos = None
@@ -332,108 +331,97 @@ class TokenStatsWindow(QWidget):
         super().mouseReleaseEvent(e)
 
 
-# ===== QQ 风格聊天气泡（HTML 常量与构建器；改视觉只需动这里）=====
+# ===== QQ 风格聊天气泡（视觉集中在 pet/chat_theme.py；改样式只需动那里）=====
 # 布局：一条消息 = 时间分隔（可选）+ 表格行（头像 / 尖角 / 圆角气泡）。
 # 限宽用「气泡格 auto + 尾部 spacer 格固定」实现：短消息气泡随内容收窄，
 # 长消息在 spacer 处换行，Qt 富文本不支持 max-width，这是等效替代。
-CHAT_CSS = """
-body{background:#f5f7fc;font-family:'Microsoft YaHei';font-size:14px;
-line-height:1.45;}
-table{margin-bottom:2px;}
-td{vertical-align:top;}
-.av{font-size:15px;font-weight:bold;color:#ffffff;text-align:center;}
-"""
-CHAT_AVATAR_W = 40       # 头像格宽（36px 图 + 4px 间距）
-CHAT_TAIL_W = 8          # 尖角格宽
-CHAT_BUBBLE_MAX = 236    # 气泡最大宽度（344 版心 − 头像 − 尖角 − 余量）
 CHAT_DIV_GAP = 300       # 时间分隔阈值（秒）：间隔超过它才插一行
 CHAT_INPUT_MIN_H = 40    # 输入框单行高度（56 会多出半行空白）
 CHAT_INPUT_MAX_H = 132   # 输入框展开上限（再长就出滚动条）
-_TAIL_DIR = os.path.join(SPRITE_DIR, "dsh-pet", "chat")
-
-
-def _file_url(path):
-    return "file:///" + str(path).replace("\\", "/")
-
-
-def _avatar_img(kind):
-    """当前头像的 <img>；返回 None 时调用方回退文字占位。"""
-    path = avatars.effective(kind)
-    if not path or not os.path.exists(path):
-        return None
-    return ('<img src="%s" width="36" height="36">'
-            % _file_url(path))
+CHAT_MIN_W = 320         # 面板可缩放下限（再窄气泡就剩一线天）
+CHAT_MIN_H = 400
+CHAT_DEFAULT_W = 380     # 首次启动的默认尺寸（旧版是固定的 360×480）
+CHAT_DEFAULT_H = 520
 
 
 def chat_time_divider(ts):
-    """居中的时间分隔行（细线 + 灰字），间隔过大时由 append_msg 插入。"""
     label = time.strftime("%H:%M", time.localtime(ts))
-    return ('<table width="100%%" cellspacing="0" cellpadding="0" '
-            'style="margin:6px 0 8px 0;"><tr>'
-            '<td><div style="border-top:1px solid #e6eaf2;"></div></td>'
-            '<td width="76" style="text-align:center;color:#98a2b8;'
-            'font-size:11px;">%s</td>'
-            '<td><div style="border-top:1px solid #e6eaf2;"></div></td>'
-            '</tr></table>' % label)
+    return chat_theme.divider_html(label)
 
 
-def chat_bubble_html(text, who):
-    """一条 QQ 风格气泡：who="pet" 左侧白气泡（logo 头像），"user" 右侧蓝气泡。
+class _ResizeGrip(QLabel):
+    """右下角缩放手抓：把拖动转嫁给面板的 resize 逻辑。
 
-    text 必须是已转义、<br> 已就绪的气泡内容（表情/图片 <img> 由调用方拼入）。
-    尖角是 PNG 资源：Qt 富文本既没有尖角字形（微软雅黑无 U+25C0），
-    也不支持 CSS 边框三角技巧，两者都实测渲染不出来。
+    光画一个图标是不够的——它盖住了面板右/下 6px 热区的一部分，不接事件
+    就会出现「光标变成缩放、拖起来却没反应」。
     """
-    if who == "user":
-        user_av = _avatar_img("user") or (
-            '<div class="av" style="background:#8fa3c8;border-radius:8px;'
-            'height:36px;line-height:36px;">主</div>')
-        return ('<table cellspacing="0" cellpadding="0" align="right"><tr>'
-                '<td width="%d"></td>'
-                '<td><div style="background:#5b8cff;'
-                'border-radius:12px;border-top-right-radius:3px;'
-                'padding:9px 12px;color:#ffffff;">%s</div></td>'
-                '<td width="%d" style="padding-top:11px;">'
-                '<img src="%s" width="8" height="11"></td>'
-                '<td width="%d" style="padding-left:8px;">%s</td>'
-                '</tr></table>'
-                % (344 - CHAT_AVATAR_W - CHAT_TAIL_W - CHAT_BUBBLE_MAX, text,
-                   CHAT_TAIL_W, _file_url(os.path.join(_TAIL_DIR, "tail_right.png")),
-                   CHAT_AVATAR_W, user_av))
-    pet_av = _avatar_img("pet") or (
-        '<img src="%s" width="36" height="36">' % _file_url(LOGO_PATH))
-    return ('<table cellspacing="0" cellpadding="0"><tr>'
-            '<td width="%d" style="padding-right:8px;">%s</td>'
-            '<td width="%d" style="padding-top:11px;">'
-            '<img src="%s" width="8" height="11"></td>'
-            '<td><div style="background:#ffffff;border:1px solid #e6eaf2;'
-            'border-radius:12px;border-top-left-radius:3px;'
-            'padding:9px 12px;color:#2a3140;">%s</div></td>'
-            '<td width="%d"></td>'
-            '</tr></table>'
-            % (CHAT_AVATAR_W, pet_av, CHAT_TAIL_W,
-               _file_url(os.path.join(_TAIL_DIR, "tail_left.png")), text,
-               344 - CHAT_AVATAR_W - CHAT_TAIL_W - CHAT_BUBBLE_MAX))
+
+    def __init__(self, panel):
+        super().__init__("⤡", panel)
+        self._panel = panel
+        self.setFixedSize(20, 20)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setToolTip("拖动改变聊天框大小")
+        self.setStyleSheet("background:transparent;color:#aab6d0;font-size:14px;")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._panel._begin_resize("right-bottom",
+                                      e.globalPosition().toPoint())
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.MouseButton.LeftButton:
+            self._panel._drag_resize(e.globalPosition().toPoint())
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._panel._end_resize()
+        super().mouseReleaseEvent(e)
 
 
 class ChatPanel(QDialog):
-    """聊天面板：气泡消息流 + 输入框 + 记忆管理（🧠 查看 / 🧹 清空）"""
+    """聊天面板：气泡消息流 + 输入框 + 记忆管理（🧠 查看 / 🧹 清空）
+
+    尺寸可调：右下角抓手 + 四边拖拽，宽高落盘到 config（chatW/chatH）。
+    图层：自带 LayerStack，所有二级浮层挂在自己名下并登记，宠物那边的
+    置顶看门狗看到 busy 就不会再 raise，不会把浮层埋掉（见 pet/layers.py）。
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
                             | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(360, 480)
+        cfg = pet_config.load_config()
+        self._chat_w = self._clamp_w(int(cfg.get("chatW") or CHAT_DEFAULT_W))
+        self._chat_h = self._clamp_h(int(cfg.get("chatH") or CHAT_DEFAULT_H))
         self._drag_pos = None
+        self._resize_edge = None
+        self._resize_geo = None
+        self.resize(self._chat_w, self._chat_h)
+        self.setMinimumSize(CHAT_MIN_W, CHAT_MIN_H)
         icon_path = avatars.effective("pet")
         if icon_path and os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
         container = QFrame(self)
-        container.setGeometry(0, 0, 360, 480)
+        container.setObjectName("chatRoot")
         container.setStyleSheet(
-            "QFrame{background:#ffffff;border-radius:18px;border:1px solid #e3e6ee;}")
+            "#chatRoot{background:#ffffff;border-radius:18px;border:1px solid #e3e6ee;}")
+        self._container = container
+
+        # 容器进布局：缩放时由 Qt 负责跟着走。不能只靠 resizeEvent——未 show 的
+        # 窗口 resize() 不派发 resizeEvent，第一次就漏了。
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(container)
 
         root = QVBoxLayout(container)
         root.setContentsMargins(0, 0, 0, 0)
@@ -736,10 +724,115 @@ class ChatPanel(QDialog):
         self._sess_item_btns = {}            # sid -> (重命名btn, 删除btn)
         self._set_view(True)                 # 默认进入聊天视图
 
+        # ---- 右下角缩放手抓 ----
+        self._grip = _ResizeGrip(self)
+        self._grip.raise_()
+        self._move_grip()
+
+        # ---- 图层保镖：二级浮层挂在本面板名下并登记 ----
+        self._layers = LayerStack(self)
+
         # 双保险：面板内所有按钮都不是“默认按钮”，杜绝 Enter 误触关闭
         for b in self.findChildren(QPushButton):
             b.setAutoDefault(False)
             b.setDefault(False)
+
+        self._apply_chat_theme()
+        # 未 show 的窗口 resize() 既不派发 resizeEvent 也不激活布局，
+        # 这里显式同步一次，保证容器在第一次显示前就是对的
+        self._sync_frame()
+
+    # ---- 尺寸 ----
+    @staticmethod
+    def _clamp_w(w):
+        scr = QApplication.primaryScreen().availableGeometry()
+        return max(CHAT_MIN_W, min(int(w), max(CHAT_MIN_W, scr.width() - 40)))
+
+    @staticmethod
+    def _clamp_h(h):
+        scr = QApplication.primaryScreen().availableGeometry()
+        return max(CHAT_MIN_H, min(int(h), max(CHAT_MIN_H, scr.height() - 80)))
+
+    def _sync_frame(self):
+        """容器与手抓跟着面板走。
+
+        布局负责「已显示」时的自动跟随；隐藏期间的 resize 两条路都不走，
+        所以 resizeEvent / showEvent / 拖拽缩放都要显式补这一下。
+        """
+        self._container.setGeometry(0, 0, self.width(), self.height())
+        self._move_grip()
+
+    def _move_grip(self):
+        self._grip.move(self.width() - self._grip.width() - 4,
+                        self.height() - self._grip.height() - 4)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._sync_frame()
+        self._apply_chat_theme(reload_cfg=False)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._sync_frame()
+        self._apply_chat_theme()
+
+    def _save_size(self):
+        """宽高落盘：下次打开还是主人调好的大小。"""
+        self._chat_w, self._chat_h = self.width(), self.height()
+        try:
+            cfg = pet_config.load_config()
+            cfg["chatW"], cfg["chatH"] = self._chat_w, self._chat_h
+            pet_config.save_config(cfg)
+        except Exception:
+            pass
+
+    def hideEvent(self, e):
+        # 收起时把大小记下来，并收掉所有二级浮层（不留点不到的孤儿窗）
+        self._save_size()
+        layers = getattr(self, "_layers", None)
+        if layers is not None:
+            layers.close_all()
+        super().hideEvent(e)
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        # 面板被拖动时表情浮层跟着走；跟不上就收掉，绝不留在原地挡屏幕
+        panel = getattr(self, "sticker_panel", None)
+        if panel is not None and panel.isVisible():
+            panel.close()
+
+    # ---- 主题 ----
+    def _apply_chat_theme(self, reload_cfg=True):
+        """背景/气泡配色跟随配置（设置页改完即时生效）。
+
+        拖拽缩放时 resizeEvent 会连着调进来：那时不重读配置、宽高没变也不
+        重绘，否则每移动一像素就整页 setHtml 一次。
+        """
+        if reload_cfg or not hasattr(self, "_theme_cfg"):
+            try:
+                self._theme_cfg = pet_config.load_config()
+            except Exception:
+                self._theme_cfg = {}
+        cfg = self._theme_cfg
+        bg = chat_theme.bg_color(cfg)
+        self.view.setStyleSheet(
+            "QTextBrowser{background:%s;border:none;padding:8px;"
+            "font-family:'Microsoft YaHei';font-size:14px;"
+            "selection-background-color:#c9d8ff;}"
+            "QScrollBar:vertical{background:transparent;width:8px;margin:2px;}"
+            "QScrollBar::handle:vertical{background:rgba(120,135,165,0.45);"
+            "border-radius:3px;min-height:24px;}"
+            "QScrollBar::handle:vertical:hover{background:rgba(120,135,165,0.75);}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical"
+            "{background:transparent;}" % bg)
+        self.typing.setStyleSheet(
+            "color:#98a2b8;font-size:12px;background:%s;padding:0 16px 4px;" % bg)
+        inner = max(200, self.view.width() - 16)
+        if inner != getattr(self, "_inner_w", None):
+            self._inner_w = inner
+            if self._msg_blocks:
+                self._render_view()
 
     # ---- 会话列表视图 ----
     @staticmethod
@@ -947,10 +1040,10 @@ class ChatPanel(QDialog):
             if not at_bottom:
                 self._scroll_keep = self.view.verticalScrollBar().value()
         body = "".join(self._msg_blocks) if self._msg_blocks else (
-            '<div style="margin-top:110px;text-align:center;color:#aab3c6;'
+            '<div style="margin-top:110px;text-align:center;color:#8f9ab2;'
             'font-size:13px;">还没有聊天记录<br>跟她说点什么吧～</div>')
         self.view.setHtml("<html><head><style>%s</style></head><body>%s</body></html>"
-                          % (CHAT_CSS, body))
+                          % (chat_theme.chat_css(pet_config.load_config()), body))
         if at_bottom:
             QTimer.singleShot(0, self._scroll_to_bottom)
         else:
@@ -987,11 +1080,13 @@ class ChatPanel(QDialog):
             if safe in ("", "[表情]"):
                 safe = ""
             parts.append('<img src="%s" width="%d">'
-                         % (_file_url(stickers.path_for(sticker)), stickers.THUMB_W))
+                         % (chat_theme._file_url(stickers.path_for(sticker)),
+                            stickers.THUMB_W))
         if image and os.path.exists(image):
             if safe in ("", "[图片]"):
                 safe = ""
-            parts.append('<img src="%s" width="140">' % _file_url(image))
+            parts.append('<img src="%s" width="140">'
+                         % chat_theme._file_url(image))
         if not safe and not parts:
             safe = "…"
         body = ("<br>".join([safe] + parts)) if safe else "".join(parts)
@@ -1009,7 +1104,8 @@ class ChatPanel(QDialog):
             if last is None or ts - last > CHAT_DIV_GAP:
                 blk += chat_time_divider(ts)
             self._last_div_ts = ts
-        blk += chat_bubble_html(self._bubble_content(text, sticker, image), who)
+        blk += chat_theme.bubble_html(self._bubble_content(text, sticker, image),
+                                        who, self._inner_w)
         self._msg_blocks.append(blk)
         self._render_view()
 
@@ -1040,7 +1136,8 @@ class ChatPanel(QDialog):
             return
         safe = html.escape(str(self._stream_pending)).replace("\n", "<br>")
         self._stream_pending = None
-        self._msg_blocks[self._stream_block_idx] = chat_bubble_html(safe, "pet")
+        self._msg_blocks[self._stream_block_idx] = chat_theme.bubble_html(
+            safe, "pet", self._inner_w)
         self._render_view()
 
     def stream_finalize(self, text, sticker=None):
@@ -1049,8 +1146,8 @@ class ChatPanel(QDialog):
             return
         self._stream_timer.stop()
         self._stream_pending = None
-        self._msg_blocks[self._stream_block_idx] = chat_bubble_html(
-            self._bubble_content(text, sticker, None), "pet")
+        self._msg_blocks[self._stream_block_idx] = chat_theme.bubble_html(
+            self._bubble_content(text, sticker, None), "pet", self._inner_w)
         self._render_view()
 
     def stream_end(self):
@@ -1080,9 +1177,14 @@ class ChatPanel(QDialog):
 
     # ---- 交互 ----
     def _open_sticker_panel(self):
-        """打开表情选择浮层（惰性创建），定位在输入框上方。"""
+        """打开表情选择浮层（惰性创建），定位在输入框上方。
+
+        浮层以本面板为父窗口创建（owned window），Windows 保证它恒在面板之上；
+        同时登记进 LayerStack，宠物那边的置顶看门狗看到 busy 就不再 raise。
+        """
         if getattr(self, "sticker_panel", None) is None:
-            self.sticker_panel = StickerPanel(self._on_sticker_pick)
+            self.sticker_panel = StickerPanel(self._on_sticker_pick, self)
+            self._layers.add(self.sticker_panel)
         anchor = self.sticker_btn.mapToGlobal(self.sticker_btn.rect().topRight())
         self.sticker_panel.popup_at(anchor.x() - self.sticker_panel.width() + 6,
                                     anchor.y() - self.sticker_panel.height() - 6)
@@ -1317,6 +1419,10 @@ class ChatPanel(QDialog):
         px = int(x - self.width() / 2)
         py = int(y - self.height() - 10)
         scr = QApplication.primaryScreen().availableGeometry()
+    def popup_at(self, x, y):
+        px = int(x - self.width() / 2)
+        py = int(y - self.height() - 10)
+        scr = QApplication.primaryScreen().availableGeometry()
         px = max(scr.left(), min(px, scr.right() - self.width()))
         py = max(scr.top(), min(py, scr.bottom() - self.height()))
         self.move(px, py)
@@ -1324,21 +1430,80 @@ class ChatPanel(QDialog):
         self.raise_()
         self._set_view(True)   # 打开面板默认进入聊天视图
         self._adjust_input_height()
+        self._apply_chat_theme()
         self.input.setFocus()
 
-    # ---- 拖动头部移动 ----
+    # ---- 拖动头部移动 / 拖边缘与抓角缩放 ----
+    _EDGE = 6      # 边缘热区宽度
+
+    def _edge_at(self, pos):
+        """命中哪条边/角：返回 'left'/'right'/'top'/'bottom' 组合或 None。"""
+        x, y = int(pos.x()), int(pos.y())
+        w, h = self.width(), self.height()
+        e = self._EDGE
+        left = x <= e
+        right = x >= w - e
+        top = y <= e
+        bottom = y >= h - e
+        if not (left or right or top or bottom):
+            return None
+        return (("left" if left else "right" if right else "")
+                + ("-top" if top else "-bottom" if bottom else ""))
+
+    def _begin_resize(self, edge, global_pos):
+        self._resize_edge = edge
+        self._resize_geo = (self.frameGeometry(), global_pos)
+
+    def _drag_resize(self, global_pos):
+        if not self._resize_edge or not self._resize_geo:
+            return
+        geo, start = self._resize_geo
+        d = global_pos - start
+        x, y, w, h = geo.x(), geo.y(), geo.width(), geo.height()
+        edge = self._resize_edge
+        if "left" in edge:
+            w = max(CHAT_MIN_W, w - d.x())
+            x = geo.right() - w
+        elif "right" in edge:
+            w = max(CHAT_MIN_W, w + d.x())
+        if "top" in edge:
+            h = max(CHAT_MIN_H, h - d.y())
+            y = geo.bottom() - h
+        elif "bottom" in edge:
+            h = max(CHAT_MIN_H, h + d.y())
+        self.setGeometry(x, y, w, h)
+        self._sync_frame()
+
+    def _end_resize(self):
+        if self._resize_edge:
+            self._resize_edge = None
+            self._resize_geo = None
+            self._save_size()
+
     def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= 52:
-            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        if e.button() == Qt.MouseButton.LeftButton:
+            edge = self._edge_at(e.position())
+            # 头部（≤52px）留给拖动；边缘与抓角走缩放
+            if edge and e.position().y() > 52:
+                self._begin_resize(edge, e.globalPosition().toPoint())
+                e.accept()
+                return
+            if e.position().y() <= 52:
+                self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
+        if self._resize_edge:
+            self._drag_resize(e.globalPosition().toPoint())
+            e.accept()
+            return
         if self._drag_pos is not None and e.buttons() & Qt.MouseButton.LeftButton:
             self.move(e.globalPosition().toPoint() - self._drag_pos)
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
         self._drag_pos = None
+        self._end_resize()
         super().mouseReleaseEvent(e)
 
     def keyPressEvent(self, e):
@@ -1349,10 +1514,10 @@ class ChatPanel(QDialog):
 
 
 class FoodPanel(QWidget):
-    """双击弹出的喂食面板"""
+    """双击弹出的喂食面板（挂在 PetWindow 名下，恒在宠物之上）"""
 
-    def __init__(self, on_pick):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+    def __init__(self, on_pick, parent=None):
+        super().__init__(parent, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
                          | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(310, 64)
@@ -1554,11 +1719,18 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         self._ledger_lock = threading.Lock()  # 今日已用账本线程锁
 
         # ---- 面板 ----
-        self.food_panel = FoodPanel(self.on_food)
+        # 全部挂在 self 名下成为 owned window：Windows 保证它们恒在宠物之上，
+        # 且宠物重申置顶时不会把它们单独甩到 Z 序外面去（见 pet/layers.py）
+        self.food_panel = FoodPanel(self.on_food, self)
         stickers.ensure()                      # 首次启动解压表情包并装载标签映射
         self.chat_panel = ChatPanel(self)
-        self.token_window = TokenStatsWindow() # token 统计悬浮窗（默认隐藏，右键开关）
+        self.token_window = TokenStatsWindow(self)  # token 统计悬浮窗（默认隐藏，右键开关）
         self.token_window.hide()
+        # 登记进图层保镖：这些**临时**面板开着时，_topmost_tick 不再 raise 宠物
+        # （宠物一 raise 就可能把浮层的 Z 序打翻）。token_window 是常驻侧栏，
+        # 登记它会让看门狗永久失效，所以只挂父级、不登记。
+        for _p in (self.chat_panel, self.food_panel):
+            self._layers.add(_p)
         # 点击音效（三个音高的 Q弹 boing，随机播放；引用需常驻防 GC）
         self._sfx_cache = []
         if WINSOUND_OK:
@@ -2303,7 +2475,7 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
         try:
             if getattr(self, "_tooltip", None) is None:
                 from pet.tooltip_ui import PetTooltip
-                self._tooltip = PetTooltip()
+                self._tooltip = PetTooltip(self)
             box = self._body_box()      # 气泡贴本体头顶，不贴容器顶部
             self._tooltip.show_for(self._pet_display_name(), box,
                                    self.pet_size or self.win_w, self._api_area())
@@ -2337,7 +2509,7 @@ class PetWindow(LedgerMixin, MemoryMixin, SessionMixin, ChatMixin, MotionMixin,
             from pet.score_ui import ScorePopup
             popup = ScorePopup(score, self.x() + self.width() // 2,
                                self.y() + self.height() // 2,
-                               self.pet_size or self.win_w)
+                               self.pet_size or self.win_w, parent=self)
             popup.show()
             self._score_popup = popup
         except Exception:
