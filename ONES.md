@@ -373,6 +373,7 @@
   4. smoke 新增用例（假 runtime 注入：正常/门禁关闭/预算超限/进行中）
 - **Handoff log**:
   > claude [x] 2026-11-10: 交付，commit b3e3aaf。runtime_manager.start_task（新）：门禁→构建→记账→daemon 线程→回调封送的核心抽取，runtime_ui._runtime_start 改薄成 GUI 表现层，AI 工具与设置页/右键同一条路；harness delegate_task 工具三层门禁（aiDshEnabled 默认关 + 既有 RuntimeGate + 运行中拒第二次），结果经既有 _runtime_finish 回屏记账；goal/context 进 ARG_LONG_KEYS。冒烟 234→236。注：测试发现真实 RuntimeGate 在 key 检查前会先因 Node 路径未配返回——门禁顺序保留原样，测试用钉住门禁隔离。
+  > claude [x] 2026-11-11: 缺口回填（用户追问「桌宠自己能否自行使用」发现）——aiDshEnabled 此前只有配置键没有设置页开关，等于「开关不在她手里也不在主人手里」。已在「自主与AI」页 AI 工具开关组补复选框（与另外五个同款，附贵/依赖执行内核的说明），_collect 落键+落盘断言补上；修 settings 用例恢复键列表漏 aiDshEnabled 导致的跨用例污染。冒烟 242/242 双平台。
 
 ### TASK-024: 文件系统事件感知
 - **Executor**: claude

@@ -1407,7 +1407,8 @@ def _():
     from pet import config as C
     w = CTX["win"]
     keys = ("heartbeat", "aiFileEnabled", "aiWebEnabled", "aiScreenEnabled",
-            "aiShellEnabled", "aiLocalFetch", "aiShellAllow", "aiShellTimeout")
+            "aiShellEnabled", "aiLocalFetch", "aiShellAllow", "aiShellTimeout",
+            "aiDshEnabled", "autostart", "autoRecoverEnabled")
     old = {k: (copy.deepcopy(w.cfg.get(k)) if k in w.cfg else None)
            for k in keys}
     old_hb = copy.deepcopy(getattr(w._heartbeat, "cfg", {}) or {})
@@ -1419,11 +1420,13 @@ def _():
         assert "自主与AI" in titles, titles
         assert hasattr(dlg, "cb_hb") and hasattr(dlg, "spin_hb_interval")
         assert hasattr(dlg, "cb_ai_shell") and hasattr(dlg, "edit_shell_allow")
+        assert hasattr(dlg, "cb_ai_dsh") and hasattr(dlg, "cb_autostart")
         dlg.cb_hb.setChecked(False)
         dlg.spin_hb_interval.setValue(600)
         dlg.cb_ai_shell.setChecked(False)
         dlg.cb_ai_local.setChecked(False)
         dlg.cb_ai_file.setChecked(True)
+        dlg.cb_ai_dsh.setChecked(True)
         dlg.edit_shell_allow.setText("git、python, ipconfig")
         dlg.spin_shell_timeout.setValue(20)
         dlg._on_save()
@@ -1434,6 +1437,7 @@ def _():
         assert w.cfg["aiShellEnabled"] is False
         assert w.cfg["aiLocalFetch"] is False
         assert w.cfg["aiFileEnabled"] is True
+        assert w.cfg["aiDshEnabled"] is True, w.cfg.get("aiDshEnabled")
         assert w.cfg["aiShellAllow"] == ["git", "python", "ipconfig"], \
             w.cfg["aiShellAllow"]
         assert w.cfg["aiShellTimeout"] == 20
@@ -1444,6 +1448,7 @@ def _():
         saved = C.read_jsonc(C.P.config)
         assert saved["heartbeat"]["interval_secs"] == 600, saved.get("heartbeat")
         assert saved["aiShellEnabled"] is False
+        assert saved["aiDshEnabled"] is True, saved.get("aiDshEnabled")
     finally:
         for k, v in old.items():
             if v is None:

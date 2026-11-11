@@ -194,9 +194,16 @@ class SettingsDialog(QDialog):
                                   self.cfg.get("aiShellEnabled", True))
         self.cb_ai_local = _check("本机抓取（允许 localhost/内网）",
                                   self.cfg.get("aiLocalFetch", True))
+        self.cb_ai_dsh = _check(
+            "重型任务外包（delegate_task：复杂重活交给执行内核，很贵）",
+            self.cfg.get("aiDshEnabled", False))
         for cb in (self.cb_ai_file, self.cb_ai_web, self.cb_ai_screen,
-                   self.cb_ai_shell, self.cb_ai_local):
+                   self.cb_ai_shell, self.cb_ai_local, self.cb_ai_dsh):
             tool_form.addRow(cb)
+        tool_form.addRow(QLabel(
+            "外包默认关闭：单次约一万五千 token，且执行内核本身要在"
+            "「执行内核」页启用并配好 Node 路径。打开后她可以自己决定"
+            "什么时候把重活派出去。"))
         root.addWidget(tools)
 
         shell = QGroupBox("命令执行白名单")
@@ -557,6 +564,7 @@ class SettingsDialog(QDialog):
         cfg["aiScreenEnabled"] = self.cb_ai_screen.isChecked()
         cfg["aiShellEnabled"] = self.cb_ai_shell.isChecked()
         cfg["aiLocalFetch"] = self.cb_ai_local.isChecked()
+        cfg["aiDshEnabled"] = self.cb_ai_dsh.isChecked()
         allow_text = self.edit_shell_allow.text().replace(
             "，", "、").replace(",", "、").replace(" ", "、")
         allow_list = [a.strip() for a in allow_text.split("、") if a.strip()]
