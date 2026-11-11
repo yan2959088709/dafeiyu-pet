@@ -13,9 +13,11 @@ import urllib.parse
 import requests
 
 PROTOCOLS = ("openai", "anthropic")
-DEFAULT_MAX_TOKENS = 1024
-DEFAULT_TIMEOUT_MS = 30000
-MAX_TIMEOUT_MS = 60000
+# 与 config.DEFAULT_CFG / harness 同口径：aiMaxTokens/aiTimeoutMs 是主聊天
+# loop 与独立通道共用的键，两边上限必须一致，否则独立通道会被 validate 拒掉
+DEFAULT_MAX_TOKENS = 8192
+DEFAULT_TIMEOUT_MS = 120000
+MAX_TIMEOUT_MS = 300000
 MAX_BASE_URL = 2048
 MAX_MODEL = 200
 MAX_KEY = 4096
@@ -61,8 +63,8 @@ def validate(settings):
     if len(settings.get("apiKey") or "") > MAX_KEY:
         errors.append("API Key 过长（上限 %d）" % MAX_KEY)
     tokens = settings.get("maxTokens")
-    if not isinstance(tokens, int) or not (128 <= tokens <= 4096):
-        errors.append("输出上限必须在 128~4096")
+    if not isinstance(tokens, int) or not (128 <= tokens <= 8192):
+        errors.append("输出上限必须在 128~8192")
     timeout = settings.get("timeoutMs")
     if not isinstance(timeout, int) or not (1000 <= timeout <= MAX_TIMEOUT_MS):
         errors.append("超时必须在 1000~%d 毫秒" % MAX_TIMEOUT_MS)

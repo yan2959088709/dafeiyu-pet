@@ -143,8 +143,8 @@ DEFAULT_CFG = {
     "aiBaseUrl": "",
     "aiModel": "",
     "aiApiKey": "",
-    "aiMaxTokens": 1024,
-    "aiTimeoutMs": 30000,
+    "aiMaxTokens": 8192,
+    "aiTimeoutMs": 120000,
     # ---- 上游同名字段（键名与默认值逐条对齐 dsh-pet 0.3.8）----
     "whisperPrompt": DEFAULT_WHISPER_PROMPT,
     "chatMemoryRounds": 5,
@@ -400,14 +400,21 @@ def validate(cfg):
     recall_k = cfg.get("memoryRecallK")
     if isinstance(recall_k, bool) or not isinstance(recall_k, int) \
             or not (1 <= recall_k <= 20):
-        bad("memoryRecallK", "记忆召回条数必须是 1-20 的整数", 8)
+        bad("memoryRecallK", "记忆检索条数必须是 1-20 的整数", 8)
 
-    # Harness 主聊天输出上限：手改 config / PUT /config 绕过 UI 的 _spin(128,4096)
-    # 会直接放大每跳成本（ thinking 开启时按 completion 计费），这里兜底校验
+    # Harness 主聊天输出上限：agent loop（思考+工具+多跳）1024 会被思考吃光，
+    # 拉到 8192；手改 config / PUT /config 绕过 UI 时这里兜底
     tokens = cfg.get("aiMaxTokens")
     if isinstance(tokens, bool) or not isinstance(tokens, int) \
-            or not (128 <= tokens <= 4096):
-        bad("aiMaxTokens", "单次输出上限必须是 128-4096 的整数", 1024)
+            or not (128 <= tokens <= 8192):
+        bad("aiMaxTokens", "单次输出上限必须是 128-8192 的整数", 8192)
+
+    # 每跳请求超时（毫秒）：思考模型首 token 延迟 + 长输出，30s 会切掉正常
+    # 深度思考；harness.run_turn 读它当单跳超时，整轮预算 = 它 × 跳数
+    timeout_ms = cfg.get("aiTimeoutMs")
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) \
+            or not (5000 <= timeout_ms <= 300000):
+        bad("aiTimeoutMs", "请求超时必须是 5000-300000 的毫秒数", 120000)
 
     # AI 工具开关（文件/联网/截图）：缺失=默认开启（不写盘不告警），写了非布尔才纠正。
     # 写权限由 harness 的路径沙箱兜底（根目录/运行期数据文件），这里只校验类型。

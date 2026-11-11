@@ -34,6 +34,7 @@ from . import log as pet_log
 from . import memes as pet_memes
 from . import memory as pet_memory
 from . import memory_maintain
+from . import memory_recall
 from . import persona as pet_persona
 from . import runtime_manager
 from . import self_prompt as pet_self_prompt
@@ -45,8 +46,14 @@ from .storage import P
 MAX_HOPS = 4                 # 工具跳数上限；用尽后不带工具逼一句正文
 SEARCH_TOP_K = 5             # 检索返回条数上限
 MEMORY_REVIEW_MAX = 80       # manage_memory review 单次展示条数（序号仍覆盖全量）
-DEFAULT_MAX_TOKENS = 1024
-TIMEOUT_SEC = 30             # 单次请求超时（不是整轮预算，整轮见 deadline）
+DEFAULT_MAX_TOKENS = 8192
+# 单跳请求超时（秒）：cfg.aiTimeoutMs 缺失时的兜底。agent loop 开了思考，
+# 首 token 延迟 + 长输出动辄几十秒，30s 会把正常深度思考齐齐切掉
+TIMEOUT_SEC = 60
+# 每跳超时的线程级传参：transport 签名不能加 kwargs（假 transport 们不认），
+# 用线程局部把 cfg.aiTimeoutMs 送进去。桌宠每轮对话/心跳/日记都是独立
+# daemon 线程跑 run_turn，天然按轮隔离
+_HOP_TIMEOUT = threading.local()
 ARG_MAX_CHARS = 64           # 工具参数字符串截断（防回灌放大）
 # 长文参数白名单：不走 64 字符通用截断，由下游各自的上限管
 # （write_file 64K / manage_self_prompt 1500 / schedule 800 / run_shell 500 /
@@ -75,6 +82,7 @@ PROTECTED_WRITE_NAMES = {
     "life_log.jsonl", "schedule.json", "dsh-runtime.patch.yml",
     "memory_archive.jsonl", "life_state.json", "goals.json", "episodes.jsonl",
     "pet-watchdog.bat", "quit.flag", "桌宠.py", "启动桌宠.bat",
+    "tool_usage.json",
 }
 # 可执行/脚本类扩展名禁写：AI 没有正当理由产出可执行物（解释器本就不在
 # shell 白名单——同款理由：写了就能绕开全部沙盒）。登录期自启的看门狗 bat
@@ -138,8 +146,9 @@ TOOLS = [
             "required": ["keyword"]}}},
     {"type": "function", "function": {
         "name": "search_memories",
-        "description": ("检索你记住的关于主人的事实（含记录时间与长期/临时标记）。"
-                        "keyword 留空返回全部。记新记忆前先用它查重。"),
+        "description": ("检索你记住的关于主人的事实（含记录时间与长期/临时标记，"
+                        "按相关度排序）。提示词里只有记忆摘要，细节全靠这里搜；"
+                        "keyword 留空返回最近几条。记新记忆前先用它查重。"),
         "parameters": {"type": "object", "properties": {
             "keyword": {"type": "string", "description": "检索关键词，可留空"}}}}},
     {"type": "function", "function": {
@@ -346,6 +355,135 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {}}}},
 ]
 
+# ------------------------------------------------------------ 工具分层
+# 三十多份 schema 每跳全量发，光清单就几千 token，而多数轮次根本用不到文件/
+# 截图/外包。拆成常驻核心 + 按需两层：核心（激活入口 + 记忆三件套 + 表情表达）
+# 每跳都发；其余模型想要就先 activate_tools，下一跳才带 schema。
+# 常用的按需工具靠热度环自动常驻（hot_tools），不必反复激活。
+CORE_NAMES = ("activate_tools", "search_memories", "remember_fact",
+              "forget_fact", "search_memes", "send_meme",
+              "search_stickers", "send_sticker")
+_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
+
+
+def _tool_brief(desc):
+    """工具目录的一句话简介：取描述首句，过长截断。"""
+    head = str(desc or "").split("。")[0].split("；")[0].replace("\n", " ").strip()
+    return head[:44] + ("…" if len(head) > 44 else "")
+
+
+EXTENDED_TOOLS = [t for t in TOOLS
+                  if t["function"]["name"] not in set(CORE_NAMES)]
+EXTENDED_INDEX = {t["function"]["name"]: t for t in EXTENDED_TOOLS}
+ON_DEMAND_HINT = "；".join(
+    "%s（%s）" % (n, _tool_brief(EXTENDED_INDEX[n]["function"]["description"]))
+    for n in EXTENDED_INDEX)
+
+ACTIVATE_TOOL = {"type": "function", "function": {
+    "name": "activate_tools",
+    "description": ("激活这一轮要用的按需工具，下一跳起即可调用（一次可激活多个）。"
+                    "可激活：" + ON_DEMAND_HINT),
+    "parameters": {"type": "object", "properties": {
+        "names": {"type": "array", "items": {"type": "string"},
+                  "description": "要激活的工具名列表"}},
+        "required": ["names"]}}}
+
+CORE_TOOLS = [ACTIVATE_TOOL] + [_BY_NAME[n] for n in CORE_NAMES[1:]]
+
+
+# ------------------------------------------------------------ 按需工具热度
+USAGE_RING_LEN = 50   # 热度环长度：最近这么多次按需工具调用
+HOT_MIN_HITS = 3      # 环内出现这么多次 → 之后每轮自动常驻
+HOT_TOP = 4           # 自动常驻上限（核心 + 热度仍然有界）
+
+
+def _load_usage_ring():
+    """读热度环（tool_usage.json）：常用按需工具重启后仍然热。"""
+    try:
+        with open(P.tool_usage, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ring = data.get("ring") if isinstance(data, dict) else data
+        return [str(x) for x in (ring or [])
+                if str(x) in EXTENDED_INDEX][-USAGE_RING_LEN:]
+    except Exception:
+        return []
+
+
+def _save_usage_ring(ring):
+    try:
+        tmp = P.tool_usage + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"ring": list(ring)[-USAGE_RING_LEN:]}, f,
+                      ensure_ascii=False)
+        os.replace(tmp, P.tool_usage)
+    except Exception:
+        pass  # 热度只是优化：写失败就当没有，不影响工具可用性
+
+
+def hot_tools(ring=None):
+    """环内高频的按需工具：之后每轮自动带着，省一次激活跳。"""
+    ring = _load_usage_ring() if ring is None else ring
+    counts = {}
+    for name in ring:
+        counts[name] = counts.get(name, 0) + 1
+    return [n for n, c in sorted(counts.items(), key=lambda x: -x[1])
+            if c >= HOT_MIN_HITS][:HOT_TOP]
+
+
+def _tools_for(active):
+    """本跳请求的工具清单：核心常驻 + 本轮激活（含热度常驻）。"""
+    return CORE_TOOLS + [EXTENDED_INDEX[n] for n in EXTENDED_INDEX
+                         if n in active]
+
+
+def _active_gate(name, state):
+    """未激活按需工具的拒绝文案。
+
+    真实回合里未激活工具的 schema 没随请求发出去，模型凭空调用的参数多半
+    是编的；直接 execute_tool 的内部调用（测试等）不带 active 键，放行。
+    """
+    if name in EXTENDED_INDEX and isinstance(state, dict) \
+            and "active" in state and name not in (state.get("active") or ()):
+        return ("%s 这一轮还没有激活。先调用 activate_tools 激活它，"
+                "下一跳就能用。" % name)
+    return None
+
+
+def _tool_activate(args, state):
+    """激活本轮按需工具：写进 state["active"]，下一跳请求才带 schema。"""
+    names = args.get("names")
+    if isinstance(names, str):
+        names = [x for x in re.split(r"[,，\s]+", names) if x]
+    if not isinstance(names, list):
+        names = []
+    active = state.setdefault("active", set(CORE_NAMES)) \
+        if isinstance(state, dict) else set(CORE_NAMES)
+    if not isinstance(active, set):
+        active = set(active)
+        if isinstance(state, dict):
+            state["active"] = active
+    ok, dup, bad = [], [], []
+    for raw in names[:12]:
+        n = str(raw or "").strip()
+        if not n:
+            continue
+        if n in CORE_NAMES:
+            dup.append(n)
+        elif n in EXTENDED_INDEX:
+            (dup if n in active else ok).append(n)
+            active.add(n)
+        else:
+            bad.append(n)
+    parts = []
+    if ok:
+        parts.append("已激活：%s（下一跳起可调用）" % "、".join(ok))
+    if dup:
+        parts.append("本来就在用：%s" % "、".join(dup))
+    if bad:
+        parts.append("没有这些工具：%s。可激活的只有：%s"
+                     % ("、".join(bad), "、".join(EXTENDED_INDEX)))
+    return "；".join(parts) or "想激活什么？把工具名列表传给 names。"
+
 
 # ------------------------------------------------------------ 本地检索
 def _clip(text, max_chars=DESC_MAX_CHARS):
@@ -460,20 +598,52 @@ def _tool_forget(win, args):
 def _tool_search_mem(win, args):
     kw = _clip(args.get("keyword") or "", 40).strip()
     with _mem_lock_ctx(win):
-        facts = list(getattr(win, "facts", []) or [])
+        facts = [str(f).strip() for f in (getattr(win, "facts", []) or [])
+                 if str(f).strip()]
         meta = dict(getattr(win, "_fact_meta", {}) or {})
     if not facts:
         return "还没有记住任何事"
-    hits = [f for f in facts if kw in f] if kw else facts
+    hits = [f for f in facts if kw in f] if kw else list(facts)
     if not hits:
         return "没有找到含「%s」的记忆（共记住 %d 条）" % (kw, len(facts))
+
+    def _m(f):
+        item = meta.get(f)
+        return item if isinstance(item, dict) else {}
+
+    if kw:
+        # 关键词检索按相关度排序（二元组重叠×时间衰减×命中），不是入库顺序
+        ranked = memory_recall.score_facts(
+            [memory_recall.Fact(f, float(_m(f).get("ts") or 0.0),
+                                float(_m(f).get("last_access") or 0.0),
+                                int(_m(f).get("hits") or 0)) for f in hits],
+            kw, k=memory_recall.MAX_K)
+        order = {fact.text: i for i, fact in enumerate(ranked)}
+        hits.sort(key=lambda f: order.get(f, len(hits)))
+    try:
+        cap = int((win.cfg or {}).get("memoryRecallK") or 8)
+    except (TypeError, ValueError):
+        cap = 8
+    shown = hits[:max(1, min(memory_recall.MAX_K, cap))]
     lines = []
-    for f in hits[:50]:
-        item = meta.get(f) if isinstance(meta.get(f), dict) else {}
-        kind = "临时" if item.get("kind") == pet_memory.KIND_TEMP else "长期"
-        ts = float(item.get("ts") or 0.0)
+    for f in shown:
+        kind = "临时" if _m(f).get("kind") == pet_memory.KIND_TEMP else "长期"
+        ts = float(_m(f).get("ts") or 0.0)
         stamp = time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts > 0 else "时间未知"
         lines.append("- [%s·%s] %s" % (kind, stamp, _clip(f, FACT_MAX_CHARS)))
+    # 检索就是一次真实的「想起」：回写 hits/last_access。临时事实晋升长期
+    # 的证据源以前靠每轮注入白拿，现在提示词只放摘要，改由这里主动记
+    now = time.time()
+    with _mem_lock_ctx(win):
+        for f in shown:
+            item = getattr(win, "_fact_meta", {}).get(f)
+            if not isinstance(item, dict):
+                item = {"ts": 0.0, "last_access": 0.0, "hits": 0,
+                        "kind": pet_memory.KIND_LONG}
+                win._fact_meta[f] = item
+            item["hits"] = int(item.get("hits") or 0) + 1
+            item["last_access"] = now
+        win._save_mem()
     return DATA_HEADER + "\n我记得：\n" + "\n".join(lines)
 
 
@@ -1676,7 +1846,10 @@ def _tool_capabilities(win):
         "你的能力清单：",
         "1. 表情包：search_memes / send_meme（每轮最多发一个）",
         "2. 小表情：search_stickers / send_sticker（每轮最多发一个）",
-        "3. 记忆：remember_fact / forget_fact / search_memories —— 当前长期事实 %d 条" % facts,
+        ("3. 记忆：remember_fact / forget_fact / search_memories —— 当前事实 %d 条"
+         "（提示词只放摘要，细节用 search_memories 按关键词搜）；"
+         "manage_memory 可 review 全部 / consolidate 巩固 / forget 淡忘"
+         % facts),
         "4. 动作：list_actions / play_animation —— 当前形象 %d 个动作" % len(_anim_names(win)),
         ("5. 文件：list_dir / read_file / write_file —— 根目录 %s（%s；"
          "config/会话/记忆等运行期数据文件禁写）"
@@ -1705,7 +1878,8 @@ def _tool_capabilities(win):
         "17. 外包：delegate_task —— 复杂重活外包给执行内核（默认关；一次一个，很贵）"
         if delegate_enabled(win) else
         "17. 外包：已关闭（config.aiDshEnabled = false，主人没给你开）",
-        "18. 自知：list_capabilities（本清单）",
+        "18. 工具机制：activate_tools 激活这一轮要用的按需工具（目录在它的描述里，"
+        "常用的会自动常驻）；list_capabilities（本清单）",
         "另外，用户直接输入「查余额 / 查天气 / 记住… / 忘记… / 你记得什么」会由本地技能处理，不经过你。",
     ]
     return "\n".join(lines)
@@ -1715,6 +1889,9 @@ def execute_tool(win, name, raw_args, state):
     """执行一个工具调用，返回给模型的文本结果。永不抛异常（错误也是结果）。"""
     name = str(name or "")[:ARG_MAX_CHARS]
     try:
+        gate = _active_gate(name, state)
+        if gate:
+            return gate
         args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
         if not isinstance(args, dict):
             args = {}
@@ -1790,6 +1967,8 @@ def execute_tool(win, name, raw_args, state):
             return _tool_self_prompt(args)
         if name == "list_capabilities":
             return _tool_capabilities(win)
+        if name == "activate_tools":
+            return _tool_activate(args, state)
     except Exception as e:  # noqa: BLE001 - 分类文案回喂，细节只进日志
         pet_log.debug("工具 %s 执行失败: %s" % (name, e))
         return "工具执行失败，换个参数或用 search_* 重新检索再试"
@@ -1797,22 +1976,36 @@ def execute_tool(win, name, raw_args, state):
 
 
 # ------------------------------------------------------------ Transport
+def _hop_timeout(win):
+    """每跳请求超时（秒）：优先设置页可调的 aiTimeoutMs，缺失才用兜底常量。"""
+    try:
+        ms = int((getattr(win, "cfg", None) or {}).get("aiTimeoutMs") or 0)
+    except (TypeError, ValueError):
+        ms = 0
+    return max(5.0, min(300.0, ms / 1000.0)) if ms > 0 else float(TIMEOUT_SEC)
+
+
 def deepseek_transport(messages, key, model=DS_MODEL, max_tokens=DEFAULT_MAX_TOKENS,
                        tools=TOOLS):
-    """默认 transport：非流式请求 DeepSeek（thinking=enabled + 工具）。
+    """默认 transport：非流式请求 DeepSeek（thinking=adaptive + 工具）。
 
     返回 (message, usage, finish_reason)。非流式是刻意的：thinking + tool_calls
     + 流式三特性叠加的解析风险不值当，正文由调用方分段重放实现打字机。
+
+    thinking=adaptive 是探针实测的选择：该网关只认 adaptive/enabled/disabled
+    （没有 light），adaptive 在闲聊时思考量极小（实测 61 字符）、难任务才深想
+    ——比 enabled 每跳全量思考省一大截 output token。
     """
     body = {"model": model, "messages": messages, "max_tokens": int(max_tokens),
-            "temperature": 0.9, "thinking": {"type": "enabled"}, "stream": False}
+            "temperature": 0.9, "thinking": {"type": "adaptive"}, "stream": False}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
     resp = requests.post(DS_BASE_URL + "/chat/completions",
                          headers={"Authorization": "Bearer %s" % key,
                                   "Content-Type": "application/json"},
-                         json=body, timeout=TIMEOUT_SEC)
+                         json=body,
+                         timeout=getattr(_HOP_TIMEOUT, "value", None) or TIMEOUT_SEC)
     resp.raise_for_status()
     data = resp.json()
     choice = (data.get("choices") or [{}])[0]
@@ -1849,19 +2042,24 @@ def _sum_usage(total, usage):
 # 思考模型偶尔不走结构化 tool_calls，而把工具调用以文本 DSL 写进 content：
 #   <|DSML| calls> <|DSML| invoke name="send meme"> <|DSML| parameter ...>死掉了
 # （线上实测：标记内常带空格，正则必须容忍空白，否则线上失守、测试假绿）
+# 竖线容错 [|｜]+：2026-11-11 真机复现一次双竖线 <||DSML|| 变体漏到用户
+# 眼前（全角｜同理），一律按单竖线对待。
 # 不接住这条路，用户就会在对话里看到这段原始标记。
 _DSML_INVOKE_RE = re.compile(
-    r"<\|\s*DSML\s*\|\s*invoke\s+name=\"([^\"]+)\"[^>]*>(.*?)"
-    r"</\|\s*DSML\s*\|\s*invoke", re.S)
+    r"<[|｜]+\s*DSML\s*[|｜]+\s*invoke\s+name=\"([^\"]+)\"[^>]*>(.*?)"
+    r"</[|｜]+\s*DSML\s*[|｜]+\s*invoke", re.S)
 _DSML_PARAM_RE = re.compile(
-    r"<\|\s*DSML\s*\|\s*parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)"
-    r"</\|\s*DSML\s*\|\s*parameter", re.S)
-_DSML_TAG_RE = re.compile(r"</?\|\s*DSML\s*\|[^>]*>")
+    r"<[|｜]+\s*DSML\s*[|｜]+\s*parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)"
+    r"</[|｜]+\s*DSML\s*[|｜]+\s*parameter", re.S)
+_DSML_TAG_RE = re.compile(r"</?[|｜]+\s*DSML\s*[|｜]+[^>]*>")
 # 未闭合 invoke（max_tokens 截断）匹配到结尾：整段丢，别把参数正文当回复
 _DSML_INVOKE_OPEN_RE = re.compile(
-    r"<\|\s*DSML\s*\|\s*invoke\b.*?(?:</\|\s*DSML\s*\|\s*invoke>|\Z)", re.S)
+    r"<[|｜]+\s*DSML\s*[|｜]+\s*invoke\b.*?"
+    r"(?:</[|｜]+\s*DSML\s*[|｜]+\s*invoke>|\Z)", re.S)
 _DSML_CALLS_RE = re.compile(
-    r"<\|\s*DSML\s*\|\s*calls>.*?</\|\s*DSML\s*\|\s*calls>", re.S)
+    r"</[|｜]+\s*DSML\s*[|｜]+\s*calls>.*?"
+    r"</[|｜]+\s*DSML\s*[|｜]+\s*calls>", re.S)
+_DSML_CUT_RE = re.compile(r"<[|｜]+\s*DSML\s*[|｜]+\s*(?:invoke|parameter)\b")
 
 
 def _dsml_to_tool_calls(text):
@@ -1889,7 +2087,7 @@ def _strip_dsml(text):
     if _DSML_TAG_RE.search(text):
         text = _DSML_INVOKE_OPEN_RE.sub("", text)
         text = _DSML_CALLS_RE.sub("", text)
-        cut = re.search(r"<\|\s*DSML\s*\|\s*(?:invoke|parameter)\b", text)
+        cut = _DSML_CUT_RE.search(text)
         if cut:
             text = text[:cut.start()]
         else:
@@ -1912,11 +2110,20 @@ def run_turn(win, messages, key, state=None, *, model=DS_MODEL, max_tokens=None,
             max_tokens = int(win.cfg.get("aiMaxTokens") or DEFAULT_MAX_TOKENS)
         except Exception:
             max_tokens = DEFAULT_MAX_TOKENS
+    hop_timeout = _hop_timeout(win)
+    _HOP_TIMEOUT.value = hop_timeout   # 不清零：每轮开头必重设，线程按轮新建
     if deadline is None:
-        deadline = time.monotonic() + TIMEOUT_SEC * (MAX_HOPS + 1)
+        # 整轮预算 = 每跳超时 × 跳数上限（+1 是最后逼正文那一跳）
+        deadline = time.monotonic() + hop_timeout * (MAX_HOPS + 1)
     if state is None:
         state = {"meme": None, "sticker": None, "anim": None,
                  "screenshot": None, "pending_image": None}
+    active = state.get("active")
+    if active is None:
+        # 每轮起点：核心常驻 + 热度自动常驻（调用方新建的 state 没有 active）
+        active = set(CORE_NAMES) | set(hot_tools())
+        state["active"] = active
+    usage_ring = None
     total_usage = None
     finish = ""
     img_idx = None        # 注入截图的 messages 下标；被模型看过一次就降级为文字
@@ -1930,7 +2137,8 @@ def run_turn(win, messages, key, state=None, *, model=DS_MODEL, max_tokens=None,
             messages[img_idx]["content"] = "（屏幕画面已看过，不再重复上传）"
             img_idx = None
         msg, usage, finish = transport(messages, key=key, model=model,
-                                       max_tokens=max_tokens)
+                                       max_tokens=max_tokens,
+                                       tools=_tools_for(active))
         total_usage = _sum_usage(total_usage, usage)
         content = _strip_dsml(msg.get("content") or "")
         tool_calls = msg.get("tool_calls") or []
@@ -1947,8 +2155,15 @@ def run_turn(win, messages, key, state=None, *, model=DS_MODEL, max_tokens=None,
             _drop_image_payloads(messages)   # 附件不随多跳重复上传
         for idx, tc in enumerate(tool_calls):
             fn = tc.get("function") or {}
-            result = execute_tool(win, fn.get("name") or "",
+            fname = str(fn.get("name") or "")
+            result = execute_tool(win, fname,
                                   fn.get("arguments") or "{}", state)
+            if fname in EXTENDED_INDEX:
+                # 按需工具真的被用了：进热度环，够热的以后每轮自动带着
+                if usage_ring is None:
+                    usage_ring = _load_usage_ring()
+                usage_ring.append(fname)
+                _save_usage_ring(usage_ring)
             messages.append({"role": "tool",
                              "tool_call_id": tc.get("id") or ("call_%d" % idx),
                              "content": result})

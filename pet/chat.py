@@ -32,11 +32,16 @@ from .pricing import DS_BASE_URL, DS_MODEL, calc_turn_cost
 from .storage import P
 
 # Harness 时代的表达规范：目录不再进提示词，改由 FC 工具按需检索发送。
-# 工具清单写进提示词，模型才知道自己能做什么（list_capabilities 供运行时自查）。
+# 工具分两层：核心（记忆三件套 + 表情表达 + 激活入口）每轮常驻，其余按需
+# activate_tools 激活后才带 schema——三十多份全量 schema 每跳都发太贵。
 HARNESS_HINT = (
-    "【能力工具】你可以自主调用这些工具：\n"
+    "【能力工具】核心工具每轮都在：activate_tools、search_memories、"
+    "remember_fact、forget_fact、search_memes / send_meme、"
+    "search_stickers / send_sticker。其余按需调用：先 activate_tools 激活"
+    "（一次可激活多个，可激活目录在它的描述里；常用的会自动常驻），"
+    "下一跳就能用。\n"
     "- 表情：search_memes / send_meme（表情包），search_stickers / send_sticker（小表情），每轮各限一个；\n"
-    "- 记忆：remember_fact / forget_fact / search_memories / manage_memory（关于主人的长期事实，最多 200 条；manage_memory 可 review 全部、consolidate 巩固合并、forget 按序号淡忘）；\n"
+    "- 记忆：remember_fact / forget_fact / search_memories（关于主人的长期事实，最多 200 条；提示词里只有摘要，细节用 search_memories 按关键词搜）；manage_memory 可 review 全部、consolidate 巩固合并、forget 按序号淡忘；\n"
     "- 文件：list_dir / read_file / write_file（只能访问白名单目录；config、会话、记忆等运行期数据文件禁止写入）；\n"
     "- 联网：web_search / web_fetch（主动搜索和抓取网页；本机/内网地址默认拒绝）；\n"
     "- 动作：list_actions / play_animation（用身体动作表达情绪，每轮最多一个）；\n"
@@ -123,14 +128,14 @@ class ChatMixin:
             lines.append(time_line)
         if self.pet_name:
             lines.append(f"你叫「{self.pet_name}」，是主人最爱的鲸鱼娘桌宠，请以此自称。")
-        recall = []
         try:
-            recall = self._recall_facts(context_text)
+            summary = self._memory_summary()
         except Exception:
-            recall = list(self.facts[:20])
-        if recall:
-            lines.append("【你对主人的记忆】" + "；".join(recall)
-                         + "（记忆可能有先后矛盾，以更新、更具体的说法为准）")
+            summary = ""
+        if summary:
+            lines.append("【你对主人的记忆】" + summary
+                         + "。只是线索不是全文——需要细节就用 search_memories "
+                         "按关键词搜，别猜；有矛盾以更新、更具体的说法为准。")
         city = self.cfg.get("city")
         if city:
             lines.append(f"主人所在城市：{city}。")

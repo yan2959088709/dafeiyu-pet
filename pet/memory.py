@@ -12,13 +12,13 @@ import requests
 
 from . import log as pet_log
 from . import memory_maintain
-from . import memory_recall
 from .pricing import DS_BASE_URL, DS_MODEL
 from .storage import P, load_json
 
-# 长期事实存储上限。提示词注入走 memory_recall 的 top-K 召回（默认 8 条），
-# 存储放大不推高每轮 token；改这个数字要同步 harness 里 remember_fact 的
-# 描述与 chat.py HARNESS_HINT 的文案（smoke 有断言钉住三者一致）。
+# 长期事实存储上限。提示词只注入摘要（summarize），细节由 search_memories
+# 按需搜（memoryRecallK 条），存储放大不推高每轮 token；改这个数字要同步
+# harness 里 remember_fact 的描述与 chat.py HARNESS_HINT 的文案（smoke 有
+# 断言钉住三者一致）。
 MAX_FACTS = 200
 # 临时事实（「正在做更新」这类当下状态）的存活期：隔天自动淡出，
 # 不占长期记忆的坑，也不会过时了还压在提示词里
@@ -66,6 +66,38 @@ def parse_facts(data):
                       "hits": int(_num(item.get("hits"), 0)),
                       "kind": _kind_of(item.get("kind"))}
     return norm, meta
+
+
+def _meta_of(meta, fact):
+    item = meta.get(fact) if isinstance(meta, dict) else None
+    return item if isinstance(item, dict) else {}
+
+
+def summarize(facts, meta, top=3, recent=3):
+    """记忆摘要：只给线索（总量/分类/最常想起/最近记下），不灌全文。
+
+    提示词注入从 top-K 全文改为摘要：200 条事实时每轮省下 8 条事实的固定
+    token，且开销不随记忆增长而膨胀；摘要里写明「只是线索」，细节由她自己
+    调 search_memories 按关键词搜。纯函数：facts + meta 进，一行文本出。
+    """
+    items = [str(f).strip() for f in (facts or []) if str(f).strip()]
+    if not items:
+        return ""
+    longs = sum(1 for f in items if _meta_of(meta, f).get("kind") != KIND_TEMP)
+    temps = len(items) - longs
+    parts = ["长期 %d" % longs]
+    if temps:
+        parts.append("临时 %d" % temps)
+    line = "共 %d 条（%s）" % (len(items), "，".join(parts))
+    hot = [f for f in sorted(items,
+                             key=lambda x: -_num(_meta_of(meta, x).get("hits")))
+           if _num(_meta_of(meta, f).get("hits")) > 0][:top]
+    if hot:
+        line += "；最常想起：" + "、".join(f[:18] for f in hot)
+    new = sorted(items, key=lambda x: -_num(_meta_of(meta, x).get("ts")))[:recent]
+    if new:
+        line += "；最近记下：" + "、".join(f[:18] for f in new)
+    return line
 
 
 class MemoryMixin:
@@ -136,15 +168,6 @@ class MemoryMixin:
         self._fact_meta = out
         return out
 
-    def _recent_context_text(self, limit=6):
-        try:
-            with self._mem_lock:
-                msgs = list(self.chat_history or [])[-limit:]
-            return "\n".join(str(m.get("content") or "") for m in msgs
-                             if m.get("role") in ("user", "assistant"))
-        except Exception:
-            return ""
-
     def _archive_facts(self, items, reason):
         """软遗忘：被淘汰的事实写 memory_archive.jsonl，不硬删。
 
@@ -203,43 +226,13 @@ class MemoryMixin:
             self._save_mem()
         return True
 
-    def _recall_facts(self, context_text="", k=None):
-        """按当前语境召回 top-K facts，并回写命中元数据。"""
-        if not self.facts:
-            return []
-        try:
-            k = int(k if k is not None else
-                    (self.cfg or {}).get("memoryRecallK", memory_recall.DEFAULT_K))
-        except (TypeError, ValueError):
-            k = memory_recall.DEFAULT_K
-        k = max(1, min(memory_recall.MAX_K, k))
+    def _memory_summary(self):
+        """提示词用的记忆摘要；顺带跑一次临时条目过期（每轮一次的节奏）。"""
         self._expire_temp_facts()
-        if not self.facts:
-            return []
-        recent = self._recent_context_text()
-        ctx = (str(context_text or "") + "\n" + recent).strip()
-        now = time.time()
         with self._mem_lock:
             facts = [str(f).strip() for f in self.facts if str(f).strip()]
             meta = self._sync_fact_meta(facts)
-            items = [memory_recall.Fact(
-                text=text, ts=meta[text]["ts"],
-                last_access=meta[text]["last_access"],
-                hits=meta[text]["hits"]) for text in facts]
-            picked = memory_recall.score_facts(items, ctx, now, k=k)
-            for fact in picked:
-                item = self._fact_meta.setdefault(
-                    fact.text, {"ts": 0.0, "last_access": 0.0, "hits": 0,
-                                "kind": KIND_LONG})
-                item["hits"] = int(item.get("hits") or 0) + 1
-                item["last_access"] = now
-            if picked:
-                self._save_mem()
-            # 临时条目带标记进提示词：AI 分得清「长期喜好」和「当下状态」
-            return [fact.text + ("（临时）"
-                                 if meta.get(fact.text, {}).get("kind") == KIND_TEMP
-                                 else "")
-                    for fact in picked]
+        return summarize(facts, meta)
 
     def _fact_extract(self, key, user_msg, reply):
         """从对话中静默提取关于主人的事实（失败忽略）

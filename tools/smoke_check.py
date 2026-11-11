@@ -173,6 +173,7 @@ def build_sandbox(mod, tmpdir):
     p.memory = os.path.join(tmpdir, "pet_memory.json")
     p.memory_archive = os.path.join(tmpdir, "memory_archive.jsonl")
     p.life_state = os.path.join(tmpdir, "life_state.json")
+    p.tool_usage = os.path.join(tmpdir, "tool_usage.json")
     p.ledger = os.path.join(tmpdir, "usage_ledger.json")
     p.session = os.path.join(tmpdir, "pet_sessions.json")
     p.ui_layout = os.path.join(tmpdir, "ui_layout.json")
@@ -386,7 +387,8 @@ def _():
     assert "汕头" in sp, "城市未注入"
     assert "【能力工具】" in sp, "Harness 工具提示丢失"
     for tool in ("search_memes", "send_sticker", "remember_fact", "write_file",
-                 "web_search", "play_animation", "list_capabilities"):
+                 "web_search", "play_animation", "list_capabilities",
+                 "activate_tools"):
         assert tool in sp, "提示词缺少工具 %s" % tool
     # 回归护栏：表情目录不再整份注入（改 FC 按需召回）
     assert "【表情使用规范】" not in sp, "旧表情规范又回到提示词了"
@@ -3554,6 +3556,18 @@ def _():
     # 解析失败的残留标记也必须被剥掉（不许到达用户界面）
     assert H._strip_dsml("前奏 <|DSML| calls> 后奏") == "前奏 后奏"
     assert H._strip_dsml("紧贴 <|DSML|calls> 形态") == "紧贴 形态"
+    # 竖线变体（2026-11-11 真机复现过双竖线漏到用户眼前）：也必须剥干净
+    assert H._strip_dsml("双竖线 <||DSML|| calls> 后奏") == "双竖线 后奏"
+    assert H._strip_dsml("全角 <｜DSML｜ calls> 后奏") == "全角 后奏"
+    assert H._strip_dsml("双竖线调用 <||DSML|| invoke name=\"send meme\">"
+                         "<||DSML|| parameter name=\"name\">死掉了"
+                         "</||DSML|| parameter> </||DSML|| invoke>") == "双竖线调用"
+    # 变体也要能解析成 tool_calls（不只剥标记）
+    calls = H._dsml_to_tool_calls(
+        "<||DSML|| invoke name=\"send meme\">"
+        "<||DSML|| parameter name=\"name\">死掉了</||DSML|| parameter>"
+        "</||DSML|| invoke>")
+    assert len(calls) == 1 and calls[0]["function"]["name"] == "send_meme", calls
 
 
 @check("harness: 记忆工具（remember/forget/search）")
@@ -4128,6 +4142,32 @@ def _():
     assert any("aiShellEnabled" in x for x in warns), warns
 
 
+@check("config: 模型参数拉满登记（8192 输出 / 120s 超时 + 校验兜底）")
+def _():
+    from pet import config as C
+    from pet import ai_provider as A
+    # 必须进 DEFAULT_CFG：否则 save_config 落盘时整键丢弃（MANAGED_KEYS 教训）
+    assert C.DEFAULT_CFG["aiMaxTokens"] == 8192
+    assert C.DEFAULT_CFG["aiTimeoutMs"] == 120000
+    assert "aiMaxTokens" in C.MANAGED_KEYS
+    assert "aiTimeoutMs" in C.MANAGED_KEYS
+    # 独立通道与主 loop 共用这两个键：上限必须同口径，否则通道被 validate 拒
+    assert A.MAX_TIMEOUT_MS >= C.DEFAULT_CFG["aiTimeoutMs"]
+    assert A.validate({"enabled": True, "protocol": "openai",
+                       "baseUrl": "https://api.x/v1", "model": "m",
+                       "apiKey": "k", "maxTokens": 8192,
+                       "timeoutMs": 120000}) == []
+    # 非法值原地纠正并告警
+    cfg = dict(C.DEFAULT_CFG)
+    cfg["aiMaxTokens"] = 99999
+    cfg["aiTimeoutMs"] = 999
+    warns = C.validate(cfg)
+    assert cfg["aiMaxTokens"] == 8192, cfg["aiMaxTokens"]
+    assert cfg["aiTimeoutMs"] == 120000, cfg["aiTimeoutMs"]
+    assert any("aiMaxTokens" in x for x in warns), warns
+    assert any("aiTimeoutMs" in x for x in warns), warns
+
+
 @check("harness: run_shell 三层闸（总关/白名单/denylist）与执行")
 def _():
     import json as _json
@@ -4339,15 +4379,15 @@ def _():
         w._fact_meta["主人是汕头人"]["ts"] = _t.time() - 99 * 24 * 3600
         w._expire_temp_facts()
         assert "主人是汕头人" in w.facts, w.facts
-        # 召回输出给临时条目带（临时）标记，长期不带
+        # 摘要按长期/临时分类计数，不把事实文本整条带进提示词
         w.facts = ["临时状态xyz", "长期喜好xyz"]
         w._fact_meta = {"临时状态xyz": {"ts": _t.time(), "last_access": 0.0,
                                        "hits": 0, "kind": "temp"},
                         "长期喜好xyz": {"ts": _t.time() - 10, "last_access": 0.0,
                                       "hits": 0, "kind": "long"}}
-        out = w._recall_facts("无关上下文zzz")
-        assert "临时状态xyz（临时）" in out, out
-        assert "长期喜好xyz" in out and "长期喜好xyz（临时）" not in out, out
+        line = w._memory_summary()
+        assert "共 2 条（长期 1，临时 1）" in line, line
+        assert "最近记下：临时状态xyz" in line, line
         # 旧磁盘数据（无 kind）按长期解析
         norm, meta2 = pet_memory.parse_facts(
             {"facts": ["老条目"], "fact_meta": {"老条目": {"ts": 1.0}}})
@@ -4461,8 +4501,9 @@ def _():
         w.cfg["aiWebEnabled"] = True
         out = H.execute_tool(w, "list_capabilities", "{}", {})
         for kw in ("表情包", "记忆", "文件", "联网", "动作", "定时", "命令",
-                   "截图", "自知"):
+                   "截图", "工具机制"):
             assert kw in out, (kw, out)
+        assert "activate_tools" in out, out
         assert "文件：已关闭" not in out and "联网：已关闭" not in out, out
         # 命令执行默认开（白名单才是真闸门），本机抓取默认开
         assert "命令：已关闭" not in out, out
@@ -6372,11 +6413,12 @@ def _():
     from pet.heartbeat_prompt import build_heartbeat_system as build
     st = D.DrivesState(mood="happy", mood_intensity=1.0, energy=80.0,
                        affinity=12.0, last_user_message_time=0.0)
-    sp = build(st, "你是桌宠", "现在是下午 3 点", ["喜欢喝奶茶"], {"city": "汕头"},
-               "昨天也说过类似的话")
+    sp = build(st, "你是桌宠", "现在是下午 3 点", "共 12 条（长期 12）",
+               {"city": "汕头"}, "昨天也说过类似的话")
     assert "【人设】你是桌宠" in sp
     assert "现在是下午 3 点" in sp
-    assert "喜欢喝奶茶" in sp
+    assert "共 12 条（长期 12）" in sp
+    assert "search_memories" in sp, "摘要必须指引细节靠搜"
     assert "汕头" in sp
     assert "【当前状态：情绪开心｜精力80/100｜亲密度12/100" in sp, sp
     assert "只回复「（静默）」" in sp
@@ -6384,13 +6426,14 @@ def _():
     assert "上次你主动说过：「昨天也说过类似的话」，这次换个话题" in sp
     assert "沉默超过 2 小时" in sp
     # 最近对话给自主判断提供上下文；空串不产生空段
-    sp3 = build(st, "", "", [], {}, "", "主人：今天加班\n你：别太累")
+    sp3 = build(st, "", "", "", {}, "", "主人：今天加班\n你：别太累")
     assert "【最近的对话】主人：今天加班" in sp3, sp3
-    assert "【最近的对话】" not in build(st, "", "", [], {}, "", "")
+    assert "【最近的对话】" not in build(st, "", "", "", {}, "", "")
     # 空段自动过滤 + proactive_hint 可关
-    sp2 = build(st, "", "", [], {"proactive_hint": False}, "")
+    sp2 = build(st, "", "", "", {"proactive_hint": False}, "")
     assert "【主动搭话提示】" not in sp2
-    assert "【人设】" not in sp2 and "记忆" not in sp2 and "城市" not in sp2
+    assert "【人设】" not in sp2 and "【你对主人的记忆】" not in sp2 \
+        and "城市" not in sp2
     assert "【当前状态：" in sp2, "状态段任何情况下都要在"
 
 
@@ -7145,7 +7188,7 @@ def _():
     # 死代码已删除（heartbeat_prompt 用的是模块级 state_segments）
     assert not hasattr(D.DrivesEngine, "state_segments")
     from pet.heartbeat_prompt import build_heartbeat_system as build
-    assert ("精力%.0f/100" % back.energy) in build(back, "", "", [], {}, "")
+    assert ("精力%.0f/100" % back.energy) in build(back, "", "", "", {}, "")
 
 
 @check("heartbeat: 多宠状态文件按 pet_id 分份（状态互不占用）")
@@ -8962,56 +9005,82 @@ def _():
     assert parse_facts({}) == ([], {})
 
 
-@check("memory: 召回命中回写 hits/last_access 落盘")
+@check("memory: _memory_summary 摘要注入 + 顺带过期临时条目")
 def _():
-    import json
+    import time as _t
+    from pet import memory as pet_memory
     from pet.storage import P
     w = CTX["win"]
     old_facts = list(getattr(w, "facts", []) or [])
-    old_meta = dict(getattr(w, "_fact_meta", {}) or {})
-    old_k = w.cfg.get("memoryRecallK", 8)
+    old_meta = {k: dict(v) for k, v in (getattr(w, "_fact_meta", {}) or {}).items()}
     old_hist = w.chat_history
+    mem_path = P.memory
+    old_disk = open(mem_path, "rb").read() if os.path.exists(mem_path) else None
     try:
-        w.facts = ["喜欢喝奶茶", "在汕头上班", "喜欢猫"]
-        w._fact_meta = {}
-        w.cfg["memoryRecallK"] = 2
+        # 5 条事实、ts 递增、无命中：最近 3 条上摘要，最早 2 条不上
+        w.facts = ["最早条目甲", "次早条目乙", "中间条目丙", "较新条目丁",
+                   "最新条目戊"]
+        w._fact_meta = {f: {"ts": 100.0 + i, "last_access": 0.0, "hits": 0,
+                            "kind": "long"}
+                        for i, f in enumerate(w.facts)}
         w.chat_history = []
-        picked = w._recall_facts("今天想喝奶茶")
-        assert picked[0] == "喜欢喝奶茶", picked
-        assert len(picked) == 2, picked
-        assert w._fact_meta["喜欢喝奶茶"]["hits"] == 1
-        assert w._fact_meta["喜欢喝奶茶"]["last_access"] > 0
-        data = json.load(open(P.memory, encoding="utf-8"))
-        assert data["fact_meta"]["喜欢喝奶茶"]["hits"] == 1, data.get("fact_meta")
+        line = w._memory_summary()
+        assert "共 5 条（长期 5）" in line, line
+        assert "最新条目戊" in line and "中间条目丙" in line, line
+        # 摘要只给线索：够旧的 fact 文本不整条进提示词（细节靠 search_memories）
+        assert "最早条目甲" not in line and "次早条目乙" not in line, line
+        # 顺带跑临时过期（沿用以前 _recall_facts 每轮一次的节奏）
+        w.facts = ["长期条目xyz", "过期临时xyz"]
+        w._fact_meta = {"长期条目xyz": {"ts": _t.time(), "last_access": 0.0,
+                                       "hits": 0, "kind": "long"},
+                        "过期临时xyz": {"ts": _t.time() - 25 * 3600,
+                                      "last_access": 0.0, "hits": 0,
+                                      "kind": "temp"}}
+        line2 = w._memory_summary()
+        assert "过期临时xyz" not in w.facts, w.facts
+        assert "共 1 条（长期 1）" in line2, line2
     finally:
-        w.facts = old_facts
+        w.facts[:] = old_facts
         w._fact_meta = old_meta
-        w.cfg["memoryRecallK"] = old_k
+        w._sync_fact_meta()
         w.chat_history = old_hist
-        with w._mem_lock:
-            w._save_mem()
+        if old_disk is not None:
+            open(mem_path, "wb").write(old_disk)
 
 
-@check("chat: 提示词记忆段按相关度 top-K")
+@check("chat: 提示词记忆段只放摘要（细节靠 search_memories 搜）")
 def _():
     w = CTX["win"]
     old_facts = list(getattr(w, "facts", []) or [])
     old_meta = dict(getattr(w, "_fact_meta", {}) or {})
-    old_k = w.cfg.get("memoryRecallK", 8)
     old_hist = w.chat_history
     try:
-        w.facts = ["喜欢喝奶茶", "在汕头上班", "喜欢猫", "害怕打雷"]
-        w._fact_meta = {}
-        w.cfg["memoryRecallK"] = 1
+        # 8 条：3 条有命中（上「最常想起」）、3 条最新（上「最近记下」），
+        # 剩下 2 条既不该进提示词——摘要只给线索，全文注入的时代过去了
+        names = ["条目%d" % i for i in range(8)]
+        w.facts = list(names)
+        w._fact_meta = {f: {"ts": 100.0 + i, "last_access": 0.0, "hits": 0,
+                            "kind": "long"} for i, f in enumerate(names)}
+        for i, f in enumerate(names[:3]):
+            w._fact_meta[f]["hits"] = 5 - i
         w.chat_history = []
         sp = w._build_system_prompt("今天想喝奶茶")
-        assert "喜欢喝奶茶" in sp, sp
-        assert "在汕头上班" not in sp, sp
-        assert "喜欢猫" not in sp, sp
+        assert "共 8 条（长期 8）" in sp, sp
+        assert "最常想起：条目0" in sp, sp
+        assert "最近记下：条目7" in sp, sp
+        assert "条目3" not in sp and "条目4" not in sp, sp
+        # 摘要必须把「细节靠搜」说给她听
+        assert "search_memories 按关键词搜" in sp, sp
+        # 按需加载入口写进提示词
+        assert "activate_tools" in sp, sp
+        # 空记忆不出段
+        w.facts = []
+        w._fact_meta = {}
+        sp2 = w._build_system_prompt("你好")
+        assert "【你对主人的记忆】" not in sp2, sp2
     finally:
         w.facts = old_facts
         w._fact_meta = old_meta
-        w.cfg["memoryRecallK"] = old_k
         w.chat_history = old_hist
         with w._mem_lock:
             w._save_mem()
@@ -9914,7 +9983,8 @@ def _():
         screen_cap.capture = lambda app=None: MINI_PNG
         reply, _usage, state = H.run_turn(
             w, [{"role": "user", "content": "看我屏幕在干嘛"}], "k",
-            state={"meme": None, "sticker": None, "anim": None}, transport=fake)
+            state={"meme": None, "sticker": None, "anim": None,
+                   "active": {"screenshot"}}, transport=fake)
         assert reply == "看到主人在写代码呢", reply
         assert len(seen) == 2, len(seen)
         imgs = [m for m in seen[1] if m.get("role") == "user"
@@ -9963,7 +10033,8 @@ def _():
         screen_cap.capture = lambda app=None: MINI_PNG
         reply, _usage, _state = H.run_turn(
             w, [{"role": "user", "content": "看我屏幕在干嘛"}], "k",
-            state={"meme": None, "sticker": None, "anim": None}, transport=fake)
+            state={"meme": None, "sticker": None, "anim": None,
+                   "active": {"screenshot", "feel_heartbeat"}}, transport=fake)
         assert reply == "看完了，你在忙", reply
         assert len(seen) == 3, len(seen)
         # 第二跳带着图，第三跳已降级：任何消息里都不再有 image_url
@@ -10027,6 +10098,252 @@ def _():
     finally:
         w._ui_call = old_ui
         screen_cap.capture = old_cap
+
+
+@check("harness: 工具按需加载（分层/activate_tools/未激活门禁/目录）")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    core_names = {t["function"]["name"] for t in H.CORE_TOOLS}
+    ext_names = set(H.EXTENDED_INDEX)
+    # 分层：核心（激活入口+记忆+表情）常驻，其余按需
+    assert {"activate_tools", "search_memories", "remember_fact",
+            "search_memes", "send_sticker"} <= core_names, core_names
+    assert "screenshot" in ext_names and "manage_schedule" in ext_names, ext_names
+    assert not (core_names & ext_names), "两层不能重叠"
+    assert len(H.CORE_TOOLS) * 2 <= len(H.TOOLS), (len(H.CORE_TOOLS),
+                                                  len(H.TOOLS))
+    # 目录由 extended 工具派生（不会与实现脱节），且带一句话简介
+    assert "manage_schedule（" in H.ON_DEMAND_HINT, H.ON_DEMAND_HINT[:200]
+    assert "screenshot（" in H.ON_DEMAND_HINT
+    # 激活链路：第一跳激活 → 第二跳请求才带 schema → 第三跳才可真调用
+    seen = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        seen.append([t["function"]["name"] for t in (tools or [])])
+        if len(seen) == 1:
+            return ({"content": "", "tool_calls": [
+                {"id": "a1", "type": "function", "function": {
+                    "name": "activate_tools",
+                    "arguments": '{"names": ["manage_schedule", "screenshot"]}'}}]},
+                None, "tool_calls")
+        if len(seen) == 2:
+            return ({"content": "", "tool_calls": [
+                {"id": "a2", "type": "function", "function": {
+                    "name": "manage_schedule",
+                    "arguments": '{"action": "list"}'}}]},
+                None, "tool_calls")
+        return ({"content": "好了"}, None, "stop")
+
+    state = {"meme": None, "sticker": None, "anim": None}
+    reply, _u, state = H.run_turn(
+        w, [{"role": "user", "content": "每天晚上提醒我"}], "k",
+        state=state, transport=fake)
+    assert reply == "好了", reply
+    assert "activate_tools" in seen[0] and "manage_schedule" not in seen[0], seen[0]
+    assert {"manage_schedule", "screenshot"} <= set(seen[1]), seen[1]
+    # 未激活的按需工具：可读拒绝（schema 没发出去，参数多半是编的）
+    gate = H.execute_tool(w, "manage_schedule", '{"action": "list"}',
+                          {"meme": None, "active": {"search_memories"}})
+    assert "activate_tools" in gate, gate
+    # 不带 active 键的内部调用放行（测试/非回合路径）
+    r = H.execute_tool(w, "manage_schedule", '{"action": "list"}', {})
+    assert "activate_tools" not in r, r
+    # 激活回执：坏名字列目录、核心工具名提示已在用、空列表要 names
+    r = H.execute_tool(w, "activate_tools", '{"names": ["不存在的工具"]}',
+                       {"active": set()})
+    assert "没有这些工具" in r and "manage_schedule" in r, r
+    r = H.execute_tool(w, "activate_tools", '{"names": ["search_memories"]}',
+                       {"active": set()})
+    assert "本来就在用" in r, r
+    r = H.execute_tool(w, "activate_tools", '{"names": []}', {"active": set()})
+    assert "想激活什么" in r, r
+
+
+@check("harness: 热度环——常用按需工具自动常驻并落盘（重启仍热）")
+def _():
+    from pet import harness as H
+    from pet.storage import P
+    w = CTX["win"]
+    ring = ["screenshot"] * 4 + ["check_time"]
+    H._save_usage_ring(ring)
+    assert H._load_usage_ring() == ring, H._load_usage_ring()
+    # 只有环内 ≥3 次的进热度；1 次的不算
+    assert H.hot_tools() == ["screenshot"], H.hot_tools()
+    # 下一轮起点：热度工具自动进 active，请求直接带它的 schema
+    seen = []
+
+    def fake(messages, key=None, model=None, max_tokens=None, tools=H.TOOLS):
+        seen.append([t["function"]["name"] for t in (tools or [])])
+        return ({"content": "嗯"}, None, "stop")
+
+    _r, _u, state = H.run_turn(w, [{"role": "user", "content": "hi"}], "k",
+                               state={"meme": None}, transport=fake)
+    assert "screenshot" in state["active"], state["active"]
+    assert "screenshot" in seen[0] and "check_time" not in seen[0], seen[0]
+    # 热度上限有界：核心 + 热度不超过 CORE+HOT_TOP
+    assert len(seen[0]) <= len(H.CORE_TOOLS) + H.HOT_TOP, seen[0]
+    # 坏文件/不存在 → 空环不崩
+    with open(P.tool_usage, "w", encoding="utf-8") as f:
+        f.write("不是json")
+    assert H._load_usage_ring() == [] and H.hot_tools() == []
+
+
+@check("memory: summarize 摘要（分类/高频/最近/空库/脏 meta）")
+def _():
+    from pet import memory as M
+    assert M.summarize([], {}) == ""
+    facts = ["主人喜欢喝美式咖啡", "主人正在改bug", "主人怕猫", "主人周三加班"]
+    meta = {
+        "主人喜欢喝美式咖啡": {"ts": 10.0, "last_access": 0.0, "hits": 5,
+                              "kind": "long"},
+        "主人正在改bug": {"ts": 30.0, "last_access": 0.0, "hits": 0,
+                         "kind": "temp"},
+        "主人怕猫": {"ts": 20.0, "last_access": 0.0, "hits": 2, "kind": "long"},
+        "主人周三加班": {"ts": 40.0, "last_access": 0.0, "hits": 0,
+                        "kind": "long"},
+    }
+    line = M.summarize(facts, meta)
+    assert "共 4 条（长期 3，临时 1）" in line, line
+    assert "最常想起：主人喜欢喝美式咖啡、主人怕猫" in line, line
+    assert "最近记下：主人周三加班" in line, line
+    # meta 脏数据（非 dict / 缺键）不抛，按长期计
+    line2 = M.summarize(["x"], {"x": "坏数据"})
+    assert "共 1 条（长期 1）" in line2, line2
+
+
+@check("memory: search_memories 相关度排序 + 命中回写 hits（晋升信号不断档）")
+def _():
+    import json
+    from pet import harness as H
+    from pet.storage import P
+    w = CTX["win"]
+    old_facts = list(getattr(w, "facts", []) or [])
+    old_meta = {k: dict(v) for k, v in (getattr(w, "_fact_meta", {}) or {}).items()}
+    old_hist = w.chat_history
+    old_k = w.cfg.get("memoryRecallK", 8)
+    mem_path = P.memory
+    old_disk = open(mem_path, "rb").read() if os.path.exists(mem_path) else None
+    try:
+        w.facts = ["主人喜欢喝美式咖啡加奶不加糖", "买咖啡豆", "主人怕猫"]
+        w._fact_meta = {"主人喜欢喝美式咖啡加奶不加糖": {"ts": 50.0,
+                                                "last_access": 0.0, "hits": 0,
+                                                "kind": "long"},
+                        "买咖啡豆": {"ts": 60.0, "last_access": 0.0, "hits": 0,
+                                   "kind": "long"},
+                        "主人怕猫": {"ts": 70.0, "last_access": 0.0, "hits": 0,
+                                   "kind": "long"}}
+        w.chat_history = []
+        out = H.execute_tool(w, "search_memories", '{"keyword": "咖啡"}', {})
+        # 相关度 = 关键词二元组占事实比例：短事实「买咖啡豆」排在前，
+        # 不是入库顺序（长的那条先入库）
+        assert out.index("买咖啡豆") < out.index("美式咖啡"), out
+        # 没命中的不出现、不回写
+        assert "怕猫" not in out, out
+        # 命中回写 hits/last_access：临时→长期晋升的证据源以前靠每轮注入
+        # 白拿，现在摘要不灌全文了，改由检索主动记
+        assert w._fact_meta["买咖啡豆"]["hits"] == 1
+        assert w._fact_meta["主人喜欢喝美式咖啡加奶不加糖"]["hits"] == 1
+        assert w._fact_meta["买咖啡豆"]["last_access"] > 0
+        assert w._fact_meta["主人怕猫"]["hits"] == 0
+        data = json.load(open(P.memory, encoding="utf-8"))
+        assert data["fact_meta"]["买咖啡豆"]["hits"] == 1, \
+            data.get("fact_meta")
+        # 返回条数走 memoryRecallK（设置页「记忆检索条数」）
+        w.cfg["memoryRecallK"] = 1
+        out2 = H.execute_tool(w, "search_memories", '{"keyword": "咖啡"}', {})
+        assert "买咖啡豆" in out2 and "美式咖啡" not in out2, out2
+    finally:
+        w.facts[:] = old_facts
+        w._fact_meta = old_meta
+        w._sync_fact_meta()
+        w.chat_history = old_hist
+        w.cfg["memoryRecallK"] = old_k
+        if old_disk is not None:
+            open(mem_path, "wb").write(old_disk)
+
+
+@check("harness: transport 按 loop 标准（adaptive 思考 / cfg 超时 / 8192）")
+def _():
+    from pet import harness as H
+    w = CTX["win"]
+    seen = {}
+
+    class R:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "嗯"},
+                                 "finish_reason": "stop"}], "usage": {}}
+
+        def raise_for_status(self):
+            pass
+
+    old_post = H.requests.post
+    old_tokens = w.cfg.get("aiMaxTokens")
+    old_timeout = w.cfg.get("aiTimeoutMs")
+    try:
+        H.requests.post = lambda url, headers=None, json=None, timeout=None: (
+            seen.update(url=url, body=json, timeout=timeout), R())[1]
+        w.cfg["aiMaxTokens"] = 8192
+        w.cfg["aiTimeoutMs"] = 120000
+        reply, _u, _s = H.run_turn(w, [{"role": "user", "content": "hi"}], "k",
+                                   transport=H.deepseek_transport)
+        assert reply == "嗯", reply
+        # 思考只到 adaptive：网关没有 light，adaptive 闲聊时思考量极小
+        assert seen["body"]["thinking"] == {"type": "adaptive"}, seen["body"]
+        assert seen["body"]["max_tokens"] == 8192, seen["body"]
+        # cfg.aiTimeoutMs 经线程局部送到 transport（假 transport 们不用改签名）
+        assert seen["timeout"] == 120.0, seen["timeout"]
+        assert H._HOP_TIMEOUT.value == 120.0
+        # 缺 cfg 回退常量；越界值钳在 300s
+        w.cfg.pop("aiTimeoutMs", None)
+        H.run_turn(w, [{"role": "user", "content": "hi"}], "k",
+                   transport=H.deepseek_transport)
+        assert seen["timeout"] == float(H.TIMEOUT_SEC), seen["timeout"]
+        w.cfg["aiTimeoutMs"] = 999999
+        assert H._hop_timeout(w) == 300.0, H._hop_timeout(w)
+    finally:
+        H.requests.post = old_post
+        if old_tokens is None:
+            w.cfg.pop("aiMaxTokens", None)
+        else:
+            w.cfg["aiMaxTokens"] = old_tokens
+        if old_timeout is None:
+            w.cfg.pop("aiTimeoutMs", None)
+        else:
+            w.cfg["aiTimeoutMs"] = old_timeout
+        H._HOP_TIMEOUT.value = None
+
+
+@check("settings: 模型页输出上限 8192 + 请求超时（秒）落盘")
+def _():
+    import copy
+    from pet.settings_ui import SettingsDialog
+    from pet import config as C
+    w = CTX["win"]
+    keys = ("aiMaxTokens", "aiTimeoutMs")
+    old = {k: copy.deepcopy(w.cfg.get(k)) for k in keys}
+    dlg = SettingsDialog(w)
+    try:
+        assert dlg.spin_ai_tokens.maximum() == 8192, dlg.spin_ai_tokens.maximum()
+        assert hasattr(dlg, "spin_ai_timeout")
+        assert dlg.spin_ai_timeout.minimum() == 10
+        assert dlg.spin_ai_timeout.maximum() == 300
+        dlg.spin_ai_tokens.setValue(4096)
+        dlg.spin_ai_timeout.setValue(90)
+        dlg._on_save()
+        assert w.cfg["aiMaxTokens"] == 4096, w.cfg.get("aiMaxTokens")
+        assert w.cfg["aiTimeoutMs"] == 90000, w.cfg.get("aiTimeoutMs")
+        saved = C.read_jsonc(C.P.config)
+        assert saved["aiMaxTokens"] == 4096, saved.get("aiMaxTokens")
+        assert saved["aiTimeoutMs"] == 90000, saved.get("aiTimeoutMs")
+    finally:
+        for k, v in old.items():
+            if v is None:
+                w.cfg.pop(k, None)
+            else:
+                w.cfg[k] = v
 
 
 # ---------------------------------------------------------------- 运行器

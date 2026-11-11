@@ -46,6 +46,7 @@ class RuntimePaths:
         self.memory = os.path.join(app_dir, "pet_memory.json")
         self.memory_archive = os.path.join(app_dir, "memory_archive.jsonl")
         self.life_state = os.path.join(app_dir, "life_state.json")
+        self.tool_usage = os.path.join(app_dir, "tool_usage.json")
         self.ledger = os.path.join(app_dir, "usage_ledger.json")
         self.session = os.path.join(app_dir, "pet_sessions.json")
         self.ui_layout = os.path.join(app_dir, "ui_layout.json")

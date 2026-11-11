@@ -140,7 +140,7 @@ class SettingsDialog(QDialog):
         self.spin_recall_k = _spin(1, 20, self.cfg.get("memoryRecallK", 8))
         form.addRow("对话记忆轮数", self.spin_rounds)
         form.addRow("配图候选上限", self.spin_img_limit)
-        form.addRow("记忆召回条数", self.spin_recall_k)
+        form.addRow("记忆检索条数", self.spin_recall_k)
         return page
 
     # ---------------------------------------------------------- 自主与AI
@@ -266,13 +266,18 @@ class SettingsDialog(QDialog):
         self.edit_ai_model = QLineEdit(str(self.cfg.get("aiModel") or ""))
         self.edit_ai_key = QLineEdit(str(self.cfg.get("aiApiKey") or ""))
         self.edit_ai_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.spin_ai_tokens = _spin(128, 4096, self.cfg.get("aiMaxTokens", 1024))
+        self.spin_ai_tokens = _spin(128, 8192, self.cfg.get("aiMaxTokens", 8192))
+        self.spin_ai_timeout = _spin(
+            10, 300, int(self.cfg.get("aiTimeoutMs", 120000) or 120000) // 1000)
         form.addRow(self.cb_ai)
         form.addRow("独立协议", self.combo_ai_proto)
         form.addRow("Base URL", self.edit_ai_base)
         form.addRow("独立模型", self.edit_ai_model)
         form.addRow("独立 Key", self.edit_ai_key)
         form.addRow("输出上限", self.spin_ai_tokens)
+        form.addRow("请求超时（秒）", self.spin_ai_timeout)
+        form.addRow(QLabel("输出上限是单次请求的 token 天花板（思考也算在内），"
+                           "不是每轮都写这么长；超时是单次请求的等待上限。"))
         return page
 
     # ---------------------------------------------------------- 执行内核
@@ -589,6 +594,7 @@ class SettingsDialog(QDialog):
         cfg["aiModel"] = self.edit_ai_model.text().strip()
         cfg["aiApiKey"] = self.edit_ai_key.text()
         cfg["aiMaxTokens"] = int(self.spin_ai_tokens.value())
+        cfg["aiTimeoutMs"] = int(self.spin_ai_timeout.value()) * 1000
         cfg["runtime"] = {
             "enabled": self.cb_rt_enabled.isChecked(),
             "nodePath": self.edit_rt_node.text().strip(),

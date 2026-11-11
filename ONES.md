@@ -421,6 +421,24 @@
 
 > claude [x] 2026-11-10: 门禁代理全部返回并处置完毕（commit 37684ab，冒烟 240→242 双平台绿）。安全审计 1 High + 6 中低级、终审 2 High + 6 Medium + 若干 Low 全部修复：①写保护扩面（看门狗 bat/quit.flag/桌宠.py/启动桌宠.bat + 可执行脚本扩展名禁写 + config/api-runtime 禁读）②PowerShell .lnk 改环境变量传值（单引号注入面归零）③文件名进提示词剥控制字符+限长+数据声明 ④delegate_task 拒 - 开头 goal ⑤监看目录 TOCTOU 复核 + junction 剪除 + 噪声目录排除 ⑥start_task 门禁原子化 + UI busy 前置 ⑦**H1 看门狗 bat 改 mbcs 编码**（cmd 按 ANSI/OEM 解析，UTF-8 会让中文路径静默失败——自启等于瘫痪，真 cmd 探针用例钉住）⑧**H2 托盘退出也写 quit.flag**（漏了这条主人关不掉桌宠）。审计遗留（自觉力小/设计层）登记 TASK-026。
 
+### TASK-028: 模型参数按 agent loop 标准拉满（8192 输出 / 120s 超时 / adaptive 思考）
+- **Executor**: claude
+- **Status**: [x]
+- **Dependencies**: none
+- **Contract**: 用户 2026-11-11 指令「模型不变，所有参数拉满，实现也拉满，思考只开到轻量」
+- **Acceptance**: 真机 API 探针确认参数被网关接受；全链路 run_turn 真机跑通；冒烟双平台无新增失败
+- **Handoff log**:
+  > claude [x] 2026-11-11: 交付（未提交，待用户确认提交范围）。**探针先行**（项目 key 走 DPAPI 解密、只进子进程环境、绝不打印）：`thinking: light` 被网关 422 拒——只认 `adaptive/enabled/disabled`；按用户「轻量思考」意图选 **adaptive**（真机实测闲聊思考量 61 字符、简单问答 86 字符，1 秒级返回）；`max_tokens=8192` 被接受。改动：①`aiMaxTokens` 1024→**8192**（DEFAULT_CFG + config 校验 128-8192 + 设置页 spin 上限 + 真 config.json 已改，备份 config.json.bak）；②`aiTimeoutMs` 30000→**120000**（新增校验 5s-300s + 设置页「请求超时（秒）」新项），harness 单跳超时从硬编码 30s 改为读它——线程局部 `_HOP_TIMEOUT` 传参（transport 签名不能加 kwargs，假 transport 们不认；每轮独立 daemon 线程天然隔离），整轮预算 = 每跳超时 × 跳数；③`DEFAULT_MAX_TOKENS`/`TIMEOUT_SEC` 兜底常量同步 8192/60；④`ai_provider`（独立通道共用这两个键）上限同口径拉到 8192/300s，否则通道被 validate 拒；⑤**顺带修一个真机复现的泄漏**：DSML 正则只认单竖线，模型一次输出 `<||DSML||` 双竖线变体直接漏到用户眼前——5 个正则 + cut 全部加 `[|｜]+` 容错并补 3 条断言（全角｜同理）。真机验证：全链路 run_turn 实跑 2 种 prompt × 多次，adaptive + 工具清单同送正常，check_time 工具跳真实执行；冒烟 242→249（+3 新检查：config 登记与兜底、transport 请求体三要素、设置页落盘），offscreen 249/249 绿（isolation 一次 flake 已复跑确认=活桌宠写 logs.txt 与检查赛跑）；windows 247/249，2 个失败仍是既有基线漂移（motion 指纹 still 尺寸、point 取点坐标，stash 复现过）。遗留：桌宠需重启加载新代码（重启前若它自己存过配置可能覆盖我刚改的 config.json，需重跑一次本类改动或重启后从设置页确认）；DSML 双竖线变体复现率低（5 次 live 仅 1 次），已防御但根因在模型侧。
+
+### TASK-027: 上下文瘦身——工具按需加载 + 记忆只留摘要
+- **Executor**: claude
+- **Status**: [x]
+- **Dependencies**: none
+- **Contract**: 用户 2026-11-11 指令「工具做成按需调用，工具清单占得太多了。核心留几个常驻，其余按需加载。记忆只留摘要，细节靠搜」
+- **Acceptance**: 每跳工具 schema 数 33→核心 8（热度满配 12）；提示词记忆段由 top-K 全文改一行摘要；冒烟 offscreen 全绿
+- **Handoff log**:
+  > claude [x] 2026-11-11: 交付（未提交，待用户确认提交范围）。①harness 工具分两层：CORE_TOOLS 常驻 8 个（activate_tools/search_memories/remember_fact/forget_fact/表情四件套），EXTENDED_TOOLS 按需 25 个；新 activate_tools 元工具（描述目录由 EXTENDED 描述首句自动派生，不与实现脱节），激活后下一跳请求才带 schema；execute_tool 对未激活扩展工具返回可读拒绝（不带 active 键的内部调用放行不误伤测试）；TOOLS 保留为并集。②热度环 tool_usage.json（app_dir，gitignore+写保护名单）：最近 50 次按需调用，≥3 次取 top-4 自动常驻，写失败静默——常用工具不必每轮花一跳激活。③记忆：memory.summarize 纯函数（总数/长期临时分类/最常想起 top3/最近记下 top3 一行）+ _memory_summary 方法（顺带跑 _expire_temp_facts 保住每轮过期节奏）；chat._build_system_prompt 与 heartbeat_prompt.build_heartbeat_system（第 4 参 facts 列表→memory_line 字符串）改注摘要；_recall_facts/_recent_context_text 下线。④search_memories 升级为细节通道：memory_recall 相关度排序（模块复活为检索服务）+ memoryRecallK 条数（设置页标签改「记忆检索条数」）+ 命中回写 hits/last_access——临时→长期晋升信号从「注入白拿」变「检索主动记」不断档。⑤HARNESS_HINT/TOOLS_HINT/capabilities 清单同步按需机制文案。冒烟 242→246（+4 新检查，3 旧检查改写），offscreen 246/246 绿；windows 244/246——2 个失败（motion 指纹 still 尺寸、point 取点坐标）经 git stash 在改动前代码上完全复现，判定为基线随显示环境漂移，非本次引入，未rebaseline（留给用户裁决）。ADR: docs/decisions/2026-11-11-on-demand-tools-memory-summary.md。遗留：桌宠需重启加载新代码；激活花一跳，热度环只缓解不消除，后续按真实激活频率调 HOT_TOP。
+
 ### TASK-026: 门禁审计遗留项（外泄链硬化/看门狗握手/边角）
 - **Executor**: claude
 - **Status**: [ ]

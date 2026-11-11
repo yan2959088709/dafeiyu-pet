@@ -26,6 +26,7 @@ __pycache__/
 pet_memory.json
 pet_sessions.json
 usage_ledger.json
+tool_usage.json
 pet_drives*.json
 heartbeat_state*.json
 heartbeat_journal*.json

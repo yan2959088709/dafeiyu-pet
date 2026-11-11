@@ -15,15 +15,18 @@ PROACTIVE_SCENE = ("这是你自己的心跳：没有任何门禁在替你决定
 HINT_SCENE = ("【主动搭话提示】沉默超过 2 小时可以关心一下主人；"
               "早晨（7-9 点）可以自然地问候；同一话题不要重复。")
 
-TOOLS_HINT = ("【工具】你有表情、长期事实、文件、联网、动作和情绪工具可自主调用"
-              "（不确定能做什么就调 list_capabilities）；正文只写字，不要带标记。"
+TOOLS_HINT = ("【工具】核心工具每轮都在（记忆/表情/activate_tools），其余按需："
+              "先 activate_tools 激活，下一跳就能用（常用的会自动常驻；不确定"
+              "自己能做什么就调 list_capabilities）。正文只写字，不要带标记。"
               "情绪由你自己决定，想换心情就调用 set_mood。")
 
 
-def build_heartbeat_system(drives_st, persona_text, time_line, facts, cfg,
+def build_heartbeat_system(drives_st, persona_text, time_line, memory_line, cfg,
                            last_speak_content="", recent_text=""):
     """装配主动搭话用的 system prompt。
 
+    memory_line：记忆摘要一行（chat._memory_summary 的产物）——只给线索，
+    细节由她自己调 search_memories 搜。
     last_speak_content：上次主动发言的摘要，用于避复述（同一话题不重复）。
     recent_text：最近几条对话，给她自主判断“现在插话合不合适”的上下文。
     """
@@ -37,10 +40,10 @@ def build_heartbeat_system(drives_st, persona_text, time_line, facts, cfg,
     recent = str(recent_text or "").strip()
     if recent:
         lines.append("【最近的对话】" + recent)
-    items = [str(f).strip() for f in (facts or []) if str(f).strip()]
-    if items:
-        lines.append("【你对主人的记忆】" + "；".join(items[:20])
-                     + "（记忆可能有先后矛盾，以更新、更具体的说法为准）")
+    memory = str(memory_line or "").strip()
+    if memory:
+        lines.append("【你对主人的记忆】" + memory
+                     + "。只是线索不是全文，想了解细节就调 search_memories 搜。")
     city = str((cfg or {}).get("city") or "").strip()
     if city:
         lines.append("主人所在城市：%s。" % city)

@@ -316,13 +316,10 @@ class HeartbeatEngine:
         # 被动回复，拿它填「上次你主动说过」就是让提示词说谎（ASE 同款：
         # 发言成功时落 last_speak_content，没有就留空）
         last_content = str(self._hb.get("last_speak_content") or "").strip()[:50]
-        facts = list(chat.facts or [])
-        recall = getattr(chat, "_recall_facts", None)
-        if callable(recall):
-            try:
-                facts = recall("")
-            except Exception:
-                facts = list(chat.facts or [])
+        try:
+            memory_line = chat._memory_summary()
+        except Exception:
+            memory_line = ""
         recent = []
         for item in hist[-6:]:
             text = str(item.get("content") or "").strip()
@@ -335,7 +332,7 @@ class HeartbeatEngine:
             pet_persona.persona_text((chat.pet_conf or {}).get("whisperPrompt"),
                                      chat.cfg.get("whisperPrompt"), ""),
             pet_time.time_line(),
-            facts,
+            memory_line,
             chat.cfg,
             last_content,
             "\n".join(recent))
@@ -373,7 +370,7 @@ class HeartbeatEngine:
                                       0.0) or 0.0)
             suggestion, reason = pet_life_loop.select_intention(
                 self._drives_st,
-                {"facts": len(facts),
+                {"facts": len(chat.facts or []),
                  "since_user_hours": ((now - last_user) / 3600.0
                                       if last_user > 0 else 99.0),
                  "consecutive_rests": life_state.get("consecutive_rests", 0),
